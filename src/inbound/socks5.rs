@@ -26,7 +26,7 @@ pub async fn run_socks5_inbound(listen_addr: String, pool: BackendPool) -> anyho
             Ok((stream, client_addr)) => {
                 let pool = pool.clone();
                 tokio::spawn(async move {
-                    // let _ = stream.set_nodelay(true);
+                    let _ = stream.set_nodelay(true);
                     if let Err(e) = handle_socks5_connection(stream, pool).await {
                         tracing::debug!(
                             client = %client_addr,

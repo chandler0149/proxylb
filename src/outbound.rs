@@ -62,7 +62,7 @@ pub async fn socks5h_connect(
         })?;
 
     // Disable Nagle's algorithm for lower latency.
-    // stream.set_nodelay(true)?;
+    stream.set_nodelay(true)?;
 
     socks5h_handshake(stream, backend, target).await
 }

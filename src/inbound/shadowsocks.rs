@@ -54,7 +54,7 @@ pub async fn run_shadowsocks_inbound(
                 let key = key.clone();
 
                 tokio::spawn(async move {
-                    // let _ = stream.set_nodelay(true);
+                    let _ = stream.set_nodelay(true);
 
                     if let Err(e) =
                         handle_ss_connection(stream, client_addr, context, method, &key, pool).await
