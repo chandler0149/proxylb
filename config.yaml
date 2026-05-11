@@ -1,0 +1,44 @@
+# ProxyLB Configuration
+# ---------------------
+# A SOCKS5 proxy load balancer with Shadowsocks inbound support.
+
+inbound:
+  # SOCKS5 inbound listener
+  socks5:
+    listen: "0.0.0.0:1080"
+
+  # Shadowsocks inbound listener
+  shadowsocks:
+    listen: "0.0.0.0:8388"
+    password: "my-secret-password"
+    method: "aes-256-gcm"
+    # Supported methods:
+    #   aes-128-gcm
+    #   aes-256-gcm
+    #   chacha20-ietf-poly1305
+
+# Ordered list of SOCKS5h backends (first = highest priority).
+# The load balancer will try each backend in order, falling back to
+# the next one if the current backend is unhealthy.
+backends:
+  - address: "127.0.0.1:10800"
+    name: "backend-1"
+    # username: "user1"
+    # password: "pass1"
+
+  - address: "127.0.0.1:10801"
+    name: "backend-2"
+
+  - address: "127.0.0.1:10802"
+    name: "backend-3"
+
+# Health check settings
+health_check:
+  interval_secs: 10
+  timeout_secs: 5
+  check_target: "www.google.com:80"
+
+# Web status dashboard
+web:
+  enabled: true
+  listen: "0.0.0.0:9090"
