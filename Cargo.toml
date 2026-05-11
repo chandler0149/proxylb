@@ -12,7 +12,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 shadowsocks = { version = "1.24", features = ["aead-cipher-extra"] }
 
 # SOCKS5 server
-fast-socks5 = "0.9"
+fast-socks5 = "1.0.0"
 
 # Web dashboard
 axum = "0.8"
@@ -39,6 +39,6 @@ chrono = { version = "0.4.44", features = ["serde"] }
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1
 strip = true
