@@ -379,11 +379,11 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                     </div>
                     <div class="traffic-row">
                         <div class="traffic-item">
-                            <span class="traffic-label">↑ Upload</span>
+                            <span class="traffic-label">Upload</span>
                             <span class="traffic-value upload">${{formatBytes(b.bytes_up)}}</span>
                         </div>
                         <div class="traffic-item">
-                            <span class="traffic-label">↓ Download</span>
+                            <span class="traffic-label">Download</span>
                             <span class="traffic-value download">${{formatBytes(b.bytes_down)}}</span>
                         </div>
                         <div class="traffic-item">
@@ -391,7 +391,7 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                             <span class="traffic-value active">${{Math.max(0, b.active_connections)}}</span>
                         </div>
                         <div class="traffic-item">
-                            <span class="traffic-label">Total Conn</span>
+                            <span class="traffic-label">History Conn</span>
                             <span class="traffic-value">${{b.total_connections}}</span>
                         </div>
                     </div>
