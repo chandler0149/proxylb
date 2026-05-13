@@ -282,6 +282,41 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             font-style: italic;
         }}
 
+        .traffic-row {{
+            display: flex;
+            gap: 1.5rem;
+            margin-bottom: 1rem;
+            padding: 0.75rem;
+            background: rgba(255,255,255,0.04);
+            border-radius: 8px;
+            border: 1px solid var(--border-subtle);
+        }}
+
+        .traffic-item {{
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+        }}
+
+        .traffic-label {{
+            color: var(--text-secondary);
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 2px;
+        }}
+
+        .traffic-value {{
+            font-size: 0.95rem;
+            font-weight: 600;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent-blue);
+        }}
+
+        .traffic-value.upload {{ color: #ff9800; }}
+        .traffic-value.download {{ color: var(--accent-green); }}
+        .traffic-value.active {{ color: var(--accent-yellow); }}
+
         @media (max-width: 600px) {{
             body {{ padding: 1rem; }}
             .grid {{ grid-template-columns: 1fr; }}
@@ -303,6 +338,14 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
         function formatTime(ts) {{
             const d = new Date(ts);
             return d.toLocaleTimeString();
+        }}
+
+        function formatBytes(n) {{
+            if (n === 0) return '0 B';
+            const units = ['B','KB','MB','GB','TB'];
+            const i = Math.min(Math.floor(Math.log2(n) / 10), units.length - 1);
+            const val = n / Math.pow(1024, i);
+            return (i === 0 ? val : val.toFixed(2)) + ' ' + units[i];
         }}
 
         function render(backends) {{
@@ -332,6 +375,24 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                         <div class="metric">
                             <span class="metric-label">Failures</span>
                             <span class="metric-value" style="color: ${{b.consecutive_failures > 0 ? 'var(--accent-red)' : 'var(--accent-green)'}}">${{b.consecutive_failures}}</span>
+                        </div>
+                    </div>
+                    <div class="traffic-row">
+                        <div class="traffic-item">
+                            <span class="traffic-label">↑ Upload</span>
+                            <span class="traffic-value upload">${{formatBytes(b.bytes_up)}}</span>
+                        </div>
+                        <div class="traffic-item">
+                            <span class="traffic-label">↓ Download</span>
+                            <span class="traffic-value download">${{formatBytes(b.bytes_down)}}</span>
+                        </div>
+                        <div class="traffic-item">
+                            <span class="traffic-label">Active</span>
+                            <span class="traffic-value active">${{Math.max(0, b.active_connections)}}</span>
+                        </div>
+                        <div class="traffic-item">
+                            <span class="traffic-label">Total Conn</span>
+                            <span class="traffic-value">${{b.total_connections}}</span>
                         </div>
                     </div>
                     <div class="history-title">Recent Health Checks</div>

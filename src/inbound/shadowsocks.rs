@@ -18,6 +18,8 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::backend::BackendPool;
 use crate::outbound::{socks5h_connect, TargetAddr};
 use crate::relay;
+use std::sync::atomic::Ordering;
+
 
 /// Run the Shadowsocks inbound listener.
 pub async fn run_shadowsocks_inbound(
@@ -105,6 +107,7 @@ async fn handle_ss_connection(
     let backends = pool.get_backends_in_order().await;
 
     let mut backend_stream: Option<TcpStream> = None;
+    let mut chosen_index: Option<usize> = None;
 
     // First pass: try healthy backends.
     for (index, info, healthy) in &backends {
@@ -115,6 +118,7 @@ async fn handle_ss_connection(
             Ok(stream) => {
                 tracing::debug!(backend = %info.name, target = %target, "connected through backend");
                 backend_stream = Some(stream);
+                chosen_index = Some(*index);
                 break;
             }
             Err(e) => {
@@ -127,13 +131,14 @@ async fn handle_ss_connection(
 
     // Fallback: try unhealthy backends as last resort.
     if backend_stream.is_none() {
-        for (_index, info, healthy) in &backends {
+        for (index, info, healthy) in &backends {
             if *healthy {
                 continue;
             }
             if let Ok(stream) = socks5h_connect(info, &target, backend_timeout).await {
                 tracing::debug!(backend = %info.name, target = %target, "connected through unhealthy backend (fallback)");
                 backend_stream = Some(stream);
+                chosen_index = Some(*index);
                 break;
             }
         }
@@ -151,7 +156,18 @@ async fn handle_ss_connection(
         }
     };
 
-    // Bidirectional relay: SS decrypted stream ←→ SOCKS5h backend.
+    // Fetch traffic counters for the chosen backend (lock-free thereafter).
+    let traffic = if let Some(idx) = chosen_index {
+        pool.get_traffic_counters(idx).await
+    } else {
+        None
+    };
+    if let Some(ref tc) = traffic {
+        tc.total_connections.fetch_add(1, Ordering::Relaxed);
+        tc.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Bidirectional relay: SS decrypted stream <-> SOCKS5h backend.
     match relay::relay(&mut ss_stream, &mut backend_stream).await {
         Ok((up, down)) => {
             tracing::debug!(
@@ -160,10 +176,17 @@ async fn handle_ss_connection(
                 down_bytes = down,
                 "Shadowsocks relay complete"
             );
+            if let Some(ref tc) = traffic {
+                tc.bytes_up.fetch_add(up, Ordering::Relaxed);
+                tc.bytes_down.fetch_add(down, Ordering::Relaxed);
+            }
         }
         Err(e) => {
             tracing::debug!(target = %target, error = %e, "Shadowsocks relay error");
         }
+    }
+    if let Some(ref tc) = traffic {
+        tc.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
     let _ = backend_stream.shutdown().await;

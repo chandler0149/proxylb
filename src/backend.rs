@@ -1,9 +1,11 @@
 //! Backend pool management with health state tracking.
 //!
 //! Maintains an ordered list of SOCKS5h backends, their health status,
-//! and a ring-buffer of recent health check results for the web dashboard.
+//! a ring-buffer of recent health check results, and cumulative traffic
+//! counters updated atomically by the relay tasks.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,6 +14,22 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 
 use crate::config::BackendConfig;
+
+/// Lock-free per-backend traffic counters.
+///
+/// Stored behind an `Arc` so inbound relay tasks can hold a clone without
+/// acquiring the pool's `RwLock` on every byte count update.
+#[derive(Debug, Default)]
+pub struct TrafficCounters {
+    /// Bytes relayed from client → backend (cumulative).
+    pub bytes_up: AtomicU64,
+    /// Bytes relayed from backend → client (cumulative).
+    pub bytes_down: AtomicU64,
+    /// Currently active relay sessions (signed so a race never wraps).
+    pub active_connections: AtomicI64,
+    /// Total connections ever accepted through this backend.
+    pub total_connections: AtomicU64,
+}
 
 /// Maximum number of health check history entries per backend.
 const MAX_HISTORY: usize = 10;
@@ -92,11 +110,12 @@ impl Default for BackendStatus {
     }
 }
 
-/// A single backend entry: info + status.
+/// A single backend entry: info + status + traffic counters.
 #[derive(Debug)]
 pub struct BackendEntry {
     pub info: BackendInfo,
     pub status: BackendStatus,
+    pub traffic: Arc<TrafficCounters>,
 }
 
 /// Serializable backend status for the web API.
@@ -108,6 +127,11 @@ pub struct BackendStatusView {
     pub last_latency_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub history: Vec<HealthCheckResult>,
+    // Traffic stats
+    pub bytes_up: u64,
+    pub bytes_down: u64,
+    pub active_connections: i64,
+    pub total_connections: u64,
 }
 
 /// Thread-safe backend pool.
@@ -125,11 +149,21 @@ impl BackendPool {
             entries.push(BackendEntry {
                 info,
                 status: BackendStatus::default(),
+                traffic: Arc::new(TrafficCounters::default()),
             });
         }
         Ok(Self {
             inner: Arc::new(RwLock::new(entries)),
         })
+    }
+
+    /// Return a clone of the `Arc<TrafficCounters>` for the given backend index.
+    ///
+    /// Callers hold this `Arc` across the relay lifetime and update it directly
+    /// without taking the pool lock again.
+    pub async fn get_traffic_counters(&self, index: usize) -> Option<Arc<TrafficCounters>> {
+        let guard = self.inner.read().await;
+        guard.get(index).map(|e| Arc::clone(&e.traffic))
     }
 
     /// Get the info of all backends with their index and current health.
@@ -210,6 +244,10 @@ impl BackendPool {
                 last_latency_ms: e.status.last_latency.map(|d| d.as_millis() as u64),
                 consecutive_failures: e.status.consecutive_failures,
                 history: e.status.history.iter().cloned().collect(),
+                bytes_up: e.traffic.bytes_up.load(Ordering::Relaxed),
+                bytes_down: e.traffic.bytes_down.load(Ordering::Relaxed),
+                active_connections: e.traffic.active_connections.load(Ordering::Relaxed),
+                total_connections: e.traffic.total_connections.load(Ordering::Relaxed),
             })
             .collect()
     }

@@ -15,6 +15,8 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::backend::BackendPool;
 use crate::outbound::{socks5h_connect, TargetAddr};
 use crate::relay;
+use std::sync::atomic::Ordering;
+
 
 /// Run the SOCKS5 inbound listener.
 pub async fn run_socks5_inbound(listen_addr: String, pool: BackendPool) -> anyhow::Result<()> {
@@ -88,6 +90,7 @@ async fn handle_socks5_connection(stream: TcpStream, pool: BackendPool) -> anyho
     let backends = pool.get_backends_in_order().await;
 
     let mut backend_stream: Option<TcpStream> = None;
+    let mut chosen_index: Option<usize> = None;
 
     // First pass: try healthy backends.
     for (index, info, healthy) in &backends {
@@ -98,6 +101,7 @@ async fn handle_socks5_connection(stream: TcpStream, pool: BackendPool) -> anyho
             Ok(stream) => {
                 tracing::debug!(backend = %info.name, target = %target, "connected through backend");
                 backend_stream = Some(stream);
+                chosen_index = Some(*index);
                 break;
             }
             Err(e) => {
@@ -110,13 +114,14 @@ async fn handle_socks5_connection(stream: TcpStream, pool: BackendPool) -> anyho
 
     // Second pass: try unhealthy backends as last resort.
     if backend_stream.is_none() {
-        for (_index, info, healthy) in &backends {
+        for (index, info, healthy) in &backends {
             if *healthy {
                 continue;
             }
             if let Ok(stream) = socks5h_connect(info, &target, backend_timeout).await {
                 tracing::debug!(backend = %info.name, target = %target, "connected through unhealthy backend (fallback)");
                 backend_stream = Some(stream);
+                chosen_index = Some(*index);
                 break;
             }
         }
@@ -138,14 +143,32 @@ async fn handle_socks5_connection(stream: TcpStream, pool: BackendPool) -> anyho
     client_stream.write_all(&reply).await?;
     client_stream.flush().await?;
 
+    // Fetch traffic counters for the chosen backend (lock-free thereafter).
+    let traffic = if let Some(idx) = chosen_index {
+        pool.get_traffic_counters(idx).await
+    } else {
+        None
+    };
+    if let Some(ref tc) = traffic {
+        tc.total_connections.fetch_add(1, Ordering::Relaxed);
+        tc.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
     // Bidirectional relay.
     match relay::relay(&mut client_stream, &mut backend_stream).await {
         Ok((up, down)) => {
             tracing::debug!(target = %target, up_bytes = up, down_bytes = down, "SOCKS5 relay complete");
+            if let Some(ref tc) = traffic {
+                tc.bytes_up.fetch_add(up, Ordering::Relaxed);
+                tc.bytes_down.fetch_add(down, Ordering::Relaxed);
+            }
         }
         Err(e) => {
             tracing::debug!(target = %target, error = %e, "SOCKS5 relay error");
         }
+    }
+    if let Some(ref tc) = traffic {
+        tc.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
     let _ = client_stream.shutdown().await;
