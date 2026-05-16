@@ -15,9 +15,10 @@ use shadowsocks::relay::tcprelay::proxy_stream::server::ProxyServerStream;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::backend::BackendPool;
-use crate::outbound::{socks5h_connect, TargetAddr};
+use crate::backend::{BackendPool, TrafficCounters};
+use crate::outbound::{socks5h_connect, socks5h_connect_target, TargetAddr};
 use crate::relay;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 
@@ -107,18 +108,57 @@ async fn handle_ss_connection(
     let backends = pool.get_backends_in_order().await;
 
     let mut backend_stream: Option<TcpStream> = None;
-    let mut chosen_index: Option<usize> = None;
+    // Traffic Arc carried from pool acquisition — zero additional RwLock reads on the hot path.
+    let mut chosen_traffic: Option<Arc<TrafficCounters>> = None;
 
     // First pass: try healthy backends.
     for (index, info, healthy) in &backends {
         if !healthy {
             continue;
         }
-        match socks5h_connect(info, &target, backend_timeout).await {
+        // Single RwLock read: yields both the pooled stream (if any) and the traffic Arc.
+        let pc = pool.get_pooled_connection(*index).await;
+        let (pool_stream, traffic) = match pc {
+            Some(pc) => (pc.stream, Some(pc.traffic)),
+            None => (None, None), // OOB — never happens
+        };
+
+        let conn_res = match pool_stream {
+            Some(stream) => {
+                tracing::debug!(backend = %info.name, "using pooled connection");
+                match socks5h_connect_target(stream, &target).await {
+                    Ok(s) => {
+                        if let Some(ref tc) = traffic {
+                            tc.pool_hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(s)
+                    }
+                    Err(e) => {
+                        if let Some(ref tc) = traffic {
+                            tc.pool_stale.fetch_add(1, Ordering::Relaxed);
+                        }
+                        tracing::debug!(
+                            backend = %info.name,
+                            error = %e,
+                            "pooled connection was stale, retrying with fresh connection"
+                        );
+                        socks5h_connect(info, &target, backend_timeout).await
+                    }
+                }
+            }
+            None => {
+                if let Some(ref tc) = traffic {
+                    tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+                }
+                socks5h_connect(info, &target, backend_timeout).await
+            }
+        };
+
+        match conn_res {
             Ok(stream) => {
                 tracing::debug!(backend = %info.name, target = %target, "connected through backend");
                 backend_stream = Some(stream);
-                chosen_index = Some(*index);
+                chosen_traffic = traffic;
                 break;
             }
             Err(e) => {
@@ -130,6 +170,7 @@ async fn handle_ss_connection(
     }
 
     // Fallback: try unhealthy backends as last resort.
+    // Rare slow-path: one extra get_traffic_counters call is acceptable here.
     if backend_stream.is_none() {
         for (index, info, healthy) in &backends {
             if *healthy {
@@ -138,7 +179,7 @@ async fn handle_ss_connection(
             if let Ok(stream) = socks5h_connect(info, &target, backend_timeout).await {
                 tracing::debug!(backend = %info.name, target = %target, "connected through unhealthy backend (fallback)");
                 backend_stream = Some(stream);
-                chosen_index = Some(*index);
+                chosen_traffic = pool.get_traffic_counters(*index).await;
                 break;
             }
         }
@@ -157,12 +198,7 @@ async fn handle_ss_connection(
     };
 
     // Fetch traffic counters for the chosen backend (lock-free thereafter).
-    let traffic = if let Some(idx) = chosen_index {
-        pool.get_traffic_counters(idx).await
-    } else {
-        None
-    };
-    if let Some(ref tc) = traffic {
+    if let Some(ref tc) = chosen_traffic {
         tc.total_connections.fetch_add(1, Ordering::Relaxed);
         tc.active_connections.fetch_add(1, Ordering::Relaxed);
     }
@@ -176,7 +212,7 @@ async fn handle_ss_connection(
                 down_bytes = down,
                 "Shadowsocks relay complete"
             );
-            if let Some(ref tc) = traffic {
+            if let Some(ref tc) = chosen_traffic {
                 tc.bytes_up.fetch_add(up, Ordering::Relaxed);
                 tc.bytes_down.fetch_add(down, Ordering::Relaxed);
             }
@@ -185,7 +221,7 @@ async fn handle_ss_connection(
             tracing::debug!(target = %target, error = %e, "Shadowsocks relay error");
         }
     }
-    if let Some(ref tc) = traffic {
+    if let Some(ref tc) = chosen_traffic {
         tc.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 

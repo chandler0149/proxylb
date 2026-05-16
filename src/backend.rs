@@ -11,9 +11,11 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 
 use crate::config::BackendConfig;
+use crate::outbound::socks5h_authenticate;
 
 /// Lock-free per-backend traffic counters.
 ///
@@ -29,6 +31,13 @@ pub struct TrafficCounters {
     pub active_connections: AtomicI64,
     /// Total connections ever accepted through this backend.
     pub total_connections: AtomicU64,
+    // --- Connection pool stats ---
+    /// Worker grabbed a pooled connection and it succeeded.
+    pub pool_hits: AtomicU64,
+    /// Pool was empty; worker fell back to a fresh on-demand connection.
+    pub pool_misses: AtomicU64,
+    /// Pooled connection was stale; worker transparently retried with a fresh one.
+    pub pool_stale: AtomicU64,
 }
 
 /// Maximum number of health check history entries per backend.
@@ -42,6 +51,7 @@ pub struct BackendInfo {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub pool_size: usize,
 }
 
 impl BackendInfo {
@@ -69,6 +79,7 @@ impl BackendInfo {
             port,
             username: cfg.username.clone(),
             password: cfg.password.clone(),
+            pool_size: cfg.pool_size,
         })
     }
 
@@ -116,6 +127,9 @@ pub struct BackendEntry {
     pub info: BackendInfo,
     pub status: BackendStatus,
     pub traffic: Arc<TrafficCounters>,
+    /// Pre-authenticated connection pool.
+    /// `flume::Receiver` is Clone + Send + Sync, so no Mutex is needed.
+    pub pool_rx: flume::Receiver<TcpStream>,
 }
 
 /// Serializable backend status for the web API.
@@ -132,6 +146,21 @@ pub struct BackendStatusView {
     pub bytes_down: u64,
     pub active_connections: i64,
     pub total_connections: u64,
+    // Connection pool stats
+    pub pool_hits: u64,
+    pub pool_misses: u64,
+    pub pool_stale: u64,
+}
+
+/// Result of a single pool acquisition attempt.
+///
+/// Returned by `BackendPool::get_pooled_connection` in a single RwLock read,
+/// so callers never need a separate `get_traffic_counters` call.
+pub struct PooledConn {
+    /// A pre-authenticated stream, or `None` if the pool was empty.
+    pub stream: Option<TcpStream>,
+    /// Traffic counters for this backend — cheap to clone (Arc).
+    pub traffic: Arc<TrafficCounters>,
 }
 
 /// Thread-safe backend pool.
@@ -146,14 +175,37 @@ impl BackendPool {
         let mut entries = Vec::with_capacity(configs.len());
         for (i, cfg) in configs.iter().enumerate() {
             let info = BackendInfo::from_config(cfg, i)?;
-            entries.push(BackendEntry {
-                info,
+            let (tx, rx) = flume::bounded(info.pool_size.max(1));
+
+            let entry = BackendEntry {
+                info: info.clone(),
                 status: BackendStatus::default(),
                 traffic: Arc::new(TrafficCounters::default()),
-            });
+                pool_rx: rx,
+            };
+            entries.push(entry);
+
+            // Spawn refill task for this backend.
+            tokio::spawn(refill_pool_task(info, tx));
         }
         Ok(Self {
             inner: Arc::new(RwLock::new(entries)),
+        })
+    }
+
+    /// Try to acquire a connection from the pre-authenticated pool.
+    ///
+    /// Returns a [`PooledConn`] containing:
+    /// - `stream`: the pooled `TcpStream` if one was available, or `None` if the pool was empty.
+    /// - `traffic`: an `Arc` to the backend's counters, obtained in the **same** lock acquisition.
+    ///
+    /// Callers must not call `get_traffic_counters` separately; use the returned `Arc` directly.
+    /// Returns `None` only if `index` is out of bounds (never happens in practice).
+    pub async fn get_pooled_connection(&self, index: usize) -> Option<PooledConn> {
+        let guard = self.inner.read().await;
+        guard.get(index).map(|e| PooledConn {
+            stream: e.pool_rx.try_recv().ok(),
+            traffic: Arc::clone(&e.traffic),
         })
     }
 
@@ -248,6 +300,9 @@ impl BackendPool {
                 bytes_down: e.traffic.bytes_down.load(Ordering::Relaxed),
                 active_connections: e.traffic.active_connections.load(Ordering::Relaxed),
                 total_connections: e.traffic.total_connections.load(Ordering::Relaxed),
+                pool_hits: e.traffic.pool_hits.load(Ordering::Relaxed),
+                pool_misses: e.traffic.pool_misses.load(Ordering::Relaxed),
+                pool_stale: e.traffic.pool_stale.load(Ordering::Relaxed),
             })
             .collect()
     }
@@ -258,4 +313,40 @@ fn push_history(history: &mut VecDeque<HealthCheckResult>, result: HealthCheckRe
         history.pop_front();
     }
     history.push_back(result);
+}
+
+/// Background task that keeps the SOCKS5 connection pool filled for a backend.
+async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<TcpStream>) {
+    let backend_addr = format!("{}:{}", info.host, info.port);
+    let retry_interval = Duration::from_secs(5);
+
+    loop {
+        // Attempt to establish and authenticate a new connection.
+        let result = async {
+            let stream = TcpStream::connect(&backend_addr).await?;
+            stream.set_nodelay(true)?;
+            socks5h_authenticate(stream, &info).await
+        }
+        .await;
+
+        match result {
+            Ok(stream) => {
+                // send_async blocks (async) until there is space in the channel,
+                // providing natural back-pressure without an explicit reserve step.
+                if tx.send_async(stream).await.is_err() {
+                    break; // Receiver dropped — pool is shutting down.
+                }
+                tracing::trace!(backend = %info.name, "pool refilled with new connection");
+            }
+            Err(e) => {
+                tracing::debug!(
+                    backend = %info.name,
+                    error = %e,
+                    "failed to refill connection pool; retrying in {}s",
+                    retry_interval.as_secs()
+                );
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+    }
 }

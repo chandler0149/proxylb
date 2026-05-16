@@ -64,14 +64,15 @@ pub async fn socks5h_connect(
     // Disable Nagle's algorithm for lower latency.
     stream.set_nodelay(true)?;
 
-    socks5h_handshake(stream, backend, target).await
+    // Perform handshake: Auth then Connect.
+    let stream = socks5h_authenticate(stream, backend).await?;
+    socks5h_connect_target(stream, target).await
 }
 
-/// Perform the SOCKS5 handshake + CONNECT on an already-connected stream.
-async fn socks5h_handshake(
+/// Phase 1: Perform the SOCKS5 authentication negotiation on an already-connected stream.
+pub async fn socks5h_authenticate(
     mut stream: TcpStream,
     backend: &BackendInfo,
-    target: &TargetAddr,
 ) -> io::Result<TcpStream> {
     // === Step 1: Auth negotiation ===
     if backend.requires_auth() {
@@ -137,6 +138,14 @@ async fn socks5h_handshake(
         }
     }
 
+    Ok(stream)
+}
+
+/// Phase 2: Issue a SOCKS5 CONNECT request to `target` on an already-authenticated stream.
+pub async fn socks5h_connect_target(
+    mut stream: TcpStream,
+    target: &TargetAddr,
+) -> io::Result<TcpStream> {
     // === Step 2: CONNECT request ===
     let connect_req = build_connect_request(target);
     stream.write_all(&connect_req).await?;

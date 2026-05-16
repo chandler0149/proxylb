@@ -13,9 +13,10 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
-use crate::backend::BackendPool;
+use crate::backend::{BackendPool, PooledConn};
 use crate::config::HealthCheckConfig;
-use crate::outbound::{socks5h_connect, TargetAddr};
+use crate::outbound::{socks5h_connect, socks5h_connect_target, TargetAddr};
+use std::sync::atomic::Ordering;
 
 /// Target for the health check probe.
 #[derive(Clone)]
@@ -84,7 +85,31 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
             let start = Instant::now();
 
             let result = async {
-                let stream = socks5h_connect(&info, &target.addr, timeout).await?;
+                // Try the pool first (same pattern as inbound handlers).
+                // This validates that pooled connections are still alive and
+                // contributes to the pool_hits/misses/stale stats.
+                let pc = pool.get_pooled_connection(index).await;
+                let stream = match pc {
+                    Some(PooledConn { stream: Some(pooled), ref traffic }) => {
+                        match socks5h_connect_target(pooled, &target.addr).await {
+                            Ok(s) => {
+                                traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
+                                s
+                            }
+                            Err(_) => {
+                                // Pooled connection was stale — retry fresh.
+                                traffic.pool_stale.fetch_add(1, Ordering::Relaxed);
+                                socks5h_connect(&info, &target.addr, timeout).await?
+                            }
+                        }
+                    }
+                    Some(PooledConn { stream: None, ref traffic }) => {
+                        traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
+                        socks5h_connect(&info, &target.addr, timeout).await?
+                    }
+                    None => socks5h_connect(&info, &target.addr, timeout).await?,
+                };
+
                 if let Some(config) = tls_config {
                     let connector = TlsConnector::from(config);
                     let domain = ServerName::try_from(target.host.clone())

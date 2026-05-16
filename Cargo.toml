@@ -39,6 +39,8 @@ chrono = { version = "0.4.44", features = ["serde"] }
 url = "2.5.8"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.7"
+# Lock-free MPMC channel for the connection pool
+flume = "0.12"
 
 
 

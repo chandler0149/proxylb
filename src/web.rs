@@ -317,6 +317,46 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
         .traffic-value.download {{ color: var(--accent-green); }}
         .traffic-value.active {{ color: var(--accent-yellow); }}
 
+        .pool-row {{
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+            padding: 0.6rem 0.75rem;
+            background: rgba(124, 77, 255, 0.07);
+            border-radius: 8px;
+            border: 1px solid rgba(124, 77, 255, 0.2);
+        }}
+
+        .pool-item {{
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+        }}
+
+        .pool-label {{
+            color: var(--text-secondary);
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 2px;
+        }}
+
+        .pool-value {{
+            font-size: 0.9rem;
+            font-weight: 600;
+            font-family: 'JetBrains Mono', monospace;
+        }}
+
+        .pool-value.hit  {{ color: var(--accent-green); }}
+        .pool-value.miss {{ color: var(--accent-blue); }}
+        .pool-value.stale {{ color: var(--accent-red); }}
+
+        .pool-hit-rate {{
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            margin-top: 1px;
+        }}
+
         @media (max-width: 600px) {{
             body {{ padding: 1rem; }}
             .grid {{ grid-template-columns: 1fr; }}
@@ -346,6 +386,27 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             const i = Math.min(Math.floor(Math.log2(n) / 10), units.length - 1);
             const val = n / Math.pow(1024, i);
             return (i === 0 ? val : val.toFixed(2)) + ' ' + units[i];
+        }}
+
+        function poolStats(b) {{
+            const total = b.pool_hits + b.pool_misses + b.pool_stale;
+            const hitRate = total > 0 ? ((b.pool_hits / total) * 100).toFixed(1) + '% hit rate' : 'no requests yet';
+            return `
+                <div class="pool-item">
+                    <span class="pool-label">Pool Hits</span>
+                    <span class="pool-value hit">${{b.pool_hits}}</span>
+                    <span class="pool-hit-rate">${{hitRate}}</span>
+                </div>
+                <div class="pool-item">
+                    <span class="pool-label">Pool Misses</span>
+                    <span class="pool-value miss">${{b.pool_misses}}</span>
+                    <span class="pool-hit-rate">pool empty \u2192 fresh conn</span>
+                </div>
+                <div class="pool-item">
+                    <span class="pool-label">Stale Evicted</span>
+                    <span class="pool-value stale">${{b.pool_stale}}</span>
+                    <span class="pool-hit-rate">dead conn \u2192 retried fresh</span>
+                </div>`;
         }}
 
         function render(backends) {{
@@ -394,6 +455,9 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                             <span class="traffic-label">History Conn</span>
                             <span class="traffic-value">${{b.total_connections}}</span>
                         </div>
+                    </div>
+                    <div class="pool-row">
+                        ${{poolStats(b)}}
                     </div>
                     <div class="history-title">Recent Health Checks</div>
                     <table class="history-table">

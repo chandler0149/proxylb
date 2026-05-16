@@ -53,6 +53,13 @@ pub struct BackendConfig {
     pub password: Option<String>,
     /// Human-readable name for the backend (auto-generated if not set).
     pub name: Option<String>,
+    /// Number of pre-authenticated connections to maintain (default: 5).
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
+}
+
+fn default_pool_size() -> usize {
+    10
 }
 
 /// Health check configuration.
