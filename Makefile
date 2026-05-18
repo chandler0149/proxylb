@@ -15,7 +15,10 @@ arm64:
 	@echo "Building for ARM64..."
 	$(CARGO) build --release
 
-## Build for AMD64 (Cross-compile/Release)
+box:
+	@echo "Building for ARM64 (box)..."
+	RUSTFLAGS="-C target-cpu=cortex-a53" $(CARGO) build --release
+	
 amd64:
 	@echo "Building for AMD64..."
 	$(CARGO) build --target=$(AMD64_TARGET) --release

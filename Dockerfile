@@ -4,8 +4,9 @@ WORKDIR /usr/src/app
 
 COPY Cargo.toml Cargo.lock* ./
 COPY src src
+COPY Makefile ./
 
-RUN cargo build --release
+RUN make box
 
 FROM debian:trixie-slim
 
