@@ -41,6 +41,8 @@ tokio-rustls = "0.26.4"
 webpki-roots = "1.0.7"
 # Lock-free MPMC channel for the connection pool
 flume = "0.12"
+# Task cancellation (CancellationToken) for hot reload
+tokio-util = { version = "0.7.18", features = ["rt"] }
 
 
 

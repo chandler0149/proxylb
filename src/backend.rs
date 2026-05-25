@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::BackendConfig;
 use crate::outbound::{socks5h_authenticate, BackendStream};
@@ -153,6 +154,8 @@ pub struct BackendEntry {
     /// Pre-authenticated connection pool.
     /// `flume::Receiver` is Clone + Send + Sync, so no Mutex is needed.
     pub pool_rx: flume::Receiver<BackendStream>,
+    /// Cancels this entry's `refill_pool_task` when the backend is removed.
+    pub cancel: CancellationToken,
 }
 
 /// Serializable backend status for the web API.
@@ -198,6 +201,7 @@ impl BackendPool {
         let mut entries = Vec::with_capacity(configs.len());
         for (i, cfg) in configs.iter().enumerate() {
             let info = BackendInfo::from_config(cfg, i)?;
+            let cancel = CancellationToken::new();
             let (tx, rx) = flume::bounded(info.pool_size.max(1));
 
             let entry = BackendEntry {
@@ -205,15 +209,75 @@ impl BackendPool {
                 status: BackendStatus::default(),
                 traffic: Arc::new(TrafficCounters::default()),
                 pool_rx: rx,
+                cancel: cancel.clone(),
             };
             entries.push(entry);
 
             // Spawn refill task for this backend.
-            tokio::spawn(refill_pool_task(info, tx));
+            tokio::spawn(refill_pool_task(info, tx, cancel));
         }
         Ok(Self {
             inner: Arc::new(RwLock::new(entries)),
         })
+    }
+
+    /// Hot-reload the backend list from new configs.
+    ///
+    /// - Backends whose endpoint + name match an existing entry keep their
+    ///   `Arc<TrafficCounters>` and pool channel (warm pool, preserved history).
+    /// - New backends are cold-started with fresh counters and a new pool.
+    /// - Removed backends have their `CancellationToken` cancelled, which causes
+    ///   `refill_pool_task` to exit cleanly after its current iteration.
+    ///
+    /// Returns `(added, removed, kept)` counts for logging.
+    pub async fn reload(&self, new_configs: &[BackendConfig]) -> anyhow::Result<(usize, usize, usize)> {
+        let mut guard = self.inner.write().await;
+
+        let mut new_entries: Vec<BackendEntry> = Vec::with_capacity(new_configs.len());
+        let mut added = 0usize;
+        let mut kept = 0usize;
+
+        for (i, cfg) in new_configs.iter().enumerate() {
+            let new_info = BackendInfo::from_config(cfg, i)?;
+
+            // Look for a matching existing entry (same endpoint + name).
+            let existing_pos = guard.iter().position(|e| {
+                e.info.name == new_info.name
+                    && e.info.endpoint.display() == new_info.endpoint.display()
+            });
+
+            if let Some(pos) = existing_pos {
+                // Reuse the existing entry — just update pool_size on the info.
+                // We swap it out of the vec to move it into new_entries.
+                let mut entry = guard.swap_remove(pos);
+                entry.info = new_info; // picks up any pool_size / auth changes
+                new_entries.push(entry);
+                kept += 1;
+            } else {
+                // Brand-new backend.
+                let cancel = CancellationToken::new();
+                let (tx, rx) = flume::bounded(new_info.pool_size.max(1));
+                let entry = BackendEntry {
+                    info: new_info.clone(),
+                    status: BackendStatus::default(),
+                    traffic: Arc::new(TrafficCounters::default()),
+                    pool_rx: rx,
+                    cancel: cancel.clone(),
+                };
+                new_entries.push(entry);
+                tokio::spawn(refill_pool_task(new_info, tx, cancel));
+                added += 1;
+            }
+        }
+
+        // Whatever remains in `guard` was not matched — cancel their refill tasks.
+        let removed = guard.len();
+        for old_entry in guard.drain(..) {
+            old_entry.cancel.cancel();
+        }
+
+        *guard = new_entries;
+        Ok((added, removed, kept))
     }
 
     /// Try to acquire a connection from the pre-authenticated pool.
@@ -339,7 +403,9 @@ fn push_history(history: &mut VecDeque<HealthCheckResult>, result: HealthCheckRe
 }
 
 /// Background task that keeps the SOCKS5 connection pool filled for a backend.
-async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>) {
+///
+/// Exits cleanly when `cancel` is cancelled (backend removed during hot reload).
+async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>, cancel: CancellationToken) {
     let retry_interval = Duration::from_secs(5);
 
     loop {
@@ -368,10 +434,21 @@ async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>) {
             Ok(stream) => {
                 // send_async blocks (async) until there is space in the channel,
                 // providing natural back-pressure without an explicit reserve step.
-                if tx.send_async(stream).await.is_err() {
-                    break; // Receiver dropped — pool is shutting down.
+                // We race it against cancellation so a removed backend doesn't
+                // keep a thread alive waiting for a full pool to drain.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        tracing::trace!(backend = %info.name, "refill task cancelled");
+                        return;
+                    }
+                    res = tx.send_async(stream) => {
+                        if res.is_err() {
+                            return; // Receiver dropped — pool is shutting down.
+                        }
+                        tracing::trace!(backend = %info.name, "pool refilled with new connection");
+                    }
                 }
-                tracing::trace!(backend = %info.name, "pool refilled with new connection");
             }
             Err(e) => {
                 tracing::debug!(
@@ -380,7 +457,14 @@ async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>) {
                     "failed to refill connection pool; retrying in {}s",
                     retry_interval.as_secs()
                 );
-                tokio::time::sleep(retry_interval).await;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        tracing::trace!(backend = %info.name, "refill task cancelled during retry backoff");
+                        return;
+                    }
+                    _ = tokio::time::sleep(retry_interval) => {}
+                }
             }
         }
     }

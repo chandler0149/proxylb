@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::backend::{BackendPool, PooledConn};
@@ -28,7 +29,13 @@ struct ProbeTarget {
 }
 
 /// Start the health checker background task.
-pub async fn run_health_checker(pool: BackendPool, config: HealthCheckConfig) {
+///
+/// Runs until `cancel` is cancelled (hot reload) or the process exits.
+pub async fn run_health_checker(
+    pool: BackendPool,
+    config: HealthCheckConfig,
+    cancel: CancellationToken,
+) {
     let interval = Duration::from_secs(config.interval_secs);
     let timeout = Duration::from_secs(config.timeout_secs);
 
@@ -49,11 +56,19 @@ pub async fn run_health_checker(pool: BackendPool, config: HealthCheckConfig) {
     );
 
     let mut ticker = time::interval(interval);
-    ticker.tick().await;
+    ticker.tick().await; // skip the immediate first tick
 
     loop {
-        ticker.tick().await;
-        check_all_backends(&pool, &check_target, timeout).await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::debug!("health checker cancelled");
+                return;
+            }
+            _ = ticker.tick() => {
+                check_all_backends(&pool, &check_target, timeout).await;
+            }
+        }
     }
 }
 

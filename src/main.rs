@@ -14,6 +14,7 @@ mod web;
 use std::path::PathBuf;
 
 use clap::Parser;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 /// ProxyLB — SOCKS5 Proxy Load Balancer with Shadowsocks support.
@@ -55,12 +56,16 @@ async fn main() -> anyhow::Result<()> {
     // Initialize backend pool.
     let pool = backend::BackendPool::new(&config.backends)?;
 
-    // Spawn health checker.
-    let health_pool = pool.clone();
-    let health_config = config.health_check.clone();
-    tokio::spawn(async move {
-        health::run_health_checker(health_pool, health_config).await;
-    });
+    // Spawn health checker with its own cancellation token.
+    let mut health_cancel = CancellationToken::new();
+    {
+        let health_pool = pool.clone();
+        let health_config = config.health_check.clone();
+        let token = health_cancel.clone();
+        tokio::spawn(async move {
+            health::run_health_checker(health_pool, health_config, token).await;
+        });
+    }
 
     // Spawn web dashboard.
     if config.web.enabled {
@@ -101,11 +106,35 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
-    tracing::info!("ProxyLB is running. Press Ctrl+C to stop.");
+    // Keep a snapshot of the initial inbound config to detect unsupported
+    // listener-address changes on reload (those require a restart).
+    let initial_inbound = config.inbound.clone();
 
-    // Wait for Ctrl+C.
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutting down...");
+    tracing::info!("ProxyLB is running. Send SIGHUP to reload config, Ctrl+C to stop.");
+
+    // Set up SIGHUP listener (Unix-only).
+    let mut sighup =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+
+    // Main event loop: wait for SIGHUP (reload) or SIGINT/Ctrl+C (shutdown).
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutting down...");
+                break;
+            }
+            _ = sighup.recv() => {
+                tracing::info!("SIGHUP received — hot reload triggered");
+                perform_hot_reload(
+                    &args.config,
+                    &pool,
+                    &mut health_cancel,
+                    &initial_inbound,
+                )
+                .await;
+            }
+        }
+    }
 
     // Abort all listener tasks.
     for handle in handles {
@@ -114,3 +143,91 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Reload the config file and apply live changes to the running pool.
+async fn perform_hot_reload(
+    config_path: &PathBuf,
+    pool: &backend::BackendPool,
+    health_cancel: &mut CancellationToken,
+    initial_inbound: &config::InboundConfig,
+) {
+    let new_config = match config::Config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "hot reload failed: could not parse config file");
+            return;
+        }
+    };
+
+    // Warn about inbound listener changes that require a restart.
+    warn_if_inbound_changed(initial_inbound, &new_config.inbound);
+
+    // Stop the health checker BEFORE swapping the pool so it cannot race
+    // mark_healthy / mark_unhealthy against indices that are mid-rewrite.
+    health_cancel.cancel();
+
+    // Swap the backend pool.
+    match pool.reload(&new_config.backends).await {
+        Ok((added, removed, kept)) => {
+            tracing::info!(
+                added,
+                removed,
+                kept,
+                total = added + kept,
+                "hot reload complete"
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "hot reload failed: could not apply new backend config");
+            // Even on failure the old checker is already gone — restart it with
+            // the old pool state so health checking continues.
+            *health_cancel = CancellationToken::new();
+            let health_pool = pool.clone();
+            let health_config = new_config.health_check.clone();
+            let token = health_cancel.clone();
+            tokio::spawn(async move {
+                health::run_health_checker(health_pool, health_config, token).await;
+            });
+            return;
+        }
+    }
+
+    // Start a fresh health checker against the now-consistent pool.
+    *health_cancel = CancellationToken::new();
+    {
+        let health_pool = pool.clone();
+        let health_config = new_config.health_check.clone();
+        let token = health_cancel.clone();
+        tokio::spawn(async move {
+            health::run_health_checker(health_pool, health_config, token).await;
+        });
+    }
+}
+
+/// Emit warnings for inbound config changes that can't be applied without a restart.
+fn warn_if_inbound_changed(old: &config::InboundConfig, new: &config::InboundConfig) {
+    let socks5_listen_changed = match (&old.socks5, &new.socks5) {
+        (Some(o), Some(n)) => o.listen != n.listen,
+        (None, Some(_)) | (Some(_), None) => true,
+        (None, None) => false,
+    };
+    if socks5_listen_changed {
+        tracing::warn!(
+            "hot reload: socks5.listen address changed \
+             — restart required for this change to take effect"
+        );
+    }
+
+    let ss_listen_changed = match (&old.shadowsocks, &new.shadowsocks) {
+        (Some(o), Some(n)) => o.listen != n.listen || o.method != n.method || o.password != n.password,
+        (None, Some(_)) | (Some(_), None) => true,
+        (None, None) => false,
+    };
+    if ss_listen_changed {
+        tracing::warn!(
+            "hot reload: shadowsocks config changed \
+             — restart required for this change to take effect"
+        );
+    }
+}
+
