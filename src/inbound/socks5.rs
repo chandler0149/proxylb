@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::backend::{BackendPool, TrafficCounters};
-use crate::outbound::{socks5h_connect, socks5h_connect_target, TargetAddr};
+use crate::outbound::{socks5h_connect, socks5h_connect_target, BackendStream, TargetAddr};
 use crate::relay;
 
 
@@ -90,7 +90,7 @@ async fn handle_socks5_connection(stream: TcpStream, pool: BackendPool) -> anyho
     let backend_timeout = Duration::from_secs(10);
     let backends = pool.get_backends_in_order().await;
 
-    let mut backend_stream: Option<TcpStream> = None;
+    let mut backend_stream: Option<BackendStream> = None;
     // Traffic Arc carried from pool acquisition — zero additional RwLock reads on the hot path.
     let mut chosen_traffic: Option<Arc<TrafficCounters>> = None;
 

@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::RwLock;
 
 use crate::config::BackendConfig;
-use crate::outbound::socks5h_authenticate;
+use crate::outbound::{socks5h_authenticate, BackendStream};
 
 /// Lock-free per-backend traffic counters.
 ///
@@ -43,12 +43,30 @@ pub struct TrafficCounters {
 /// Maximum number of health check history entries per backend.
 const MAX_HISTORY: usize = 10;
 
+/// How the load balancer connects to a SOCKS5 backend.
+#[derive(Debug, Clone)]
+pub enum BackendEndpoint {
+    /// Classic TCP connection to `host:port`.
+    Tcp { host: String, port: u16 },
+    /// Unix domain socket at the given filesystem path.
+    Unix { path: String },
+}
+
+impl BackendEndpoint {
+    /// Human-readable address string (used in the web dashboard).
+    pub fn display(&self) -> String {
+        match self {
+            BackendEndpoint::Tcp { host, port } => format!("{}:{}", host, port),
+            BackendEndpoint::Unix { path } => format!("unix:{}", path),
+        }
+    }
+}
+
 /// Parsed backend information.
 #[derive(Debug, Clone)]
 pub struct BackendInfo {
     pub name: String,
-    pub host: String,
-    pub port: u16,
+    pub endpoint: BackendEndpoint,
     pub username: Option<String>,
     pub password: Option<String>,
     pub pool_size: usize,
@@ -56,16 +74,22 @@ pub struct BackendInfo {
 
 impl BackendInfo {
     pub fn from_config(cfg: &BackendConfig, index: usize) -> anyhow::Result<Self> {
-        let addr = &cfg.address;
-        // Parse "host:port"
-        let (host, port) = if let Some(pos) = addr.rfind(':') {
-            let host = addr[..pos].to_string();
-            let port: u16 = addr[pos + 1..]
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid port in backend address: {}", addr))?;
-            (host, port)
-        } else {
-            anyhow::bail!("backend address must be in host:port format: {}", addr);
+        let endpoint = match (&cfg.address, &cfg.unix_socket) {
+            (Some(addr), None) => {
+                // Parse "host:port"
+                if let Some(pos) = addr.rfind(':') {
+                    let host = addr[..pos].to_string();
+                    let port: u16 = addr[pos + 1..].parse().map_err(|_| {
+                        anyhow::anyhow!("invalid port in backend address: {}", addr)
+                    })?;
+                    BackendEndpoint::Tcp { host, port }
+                } else {
+                    anyhow::bail!("backend address must be in host:port format: {}", addr);
+                }
+            }
+            (None, Some(path)) => BackendEndpoint::Unix { path: path.clone() },
+            // Both Some or both None are caught by config validation before we get here.
+            _ => unreachable!("config validation ensures exactly one of address/unix_socket"),
         };
 
         let name = cfg
@@ -75,8 +99,7 @@ impl BackendInfo {
 
         Ok(Self {
             name,
-            host,
-            port,
+            endpoint,
             username: cfg.username.clone(),
             password: cfg.password.clone(),
             pool_size: cfg.pool_size,
@@ -129,7 +152,7 @@ pub struct BackendEntry {
     pub traffic: Arc<TrafficCounters>,
     /// Pre-authenticated connection pool.
     /// `flume::Receiver` is Clone + Send + Sync, so no Mutex is needed.
-    pub pool_rx: flume::Receiver<TcpStream>,
+    pub pool_rx: flume::Receiver<BackendStream>,
 }
 
 /// Serializable backend status for the web API.
@@ -158,7 +181,7 @@ pub struct BackendStatusView {
 /// so callers never need a separate `get_traffic_counters` call.
 pub struct PooledConn {
     /// A pre-authenticated stream, or `None` if the pool was empty.
-    pub stream: Option<TcpStream>,
+    pub stream: Option<BackendStream>,
     /// Traffic counters for this backend — cheap to clone (Arc).
     pub traffic: Arc<TrafficCounters>,
 }
@@ -196,7 +219,7 @@ impl BackendPool {
     /// Try to acquire a connection from the pre-authenticated pool.
     ///
     /// Returns a [`PooledConn`] containing:
-    /// - `stream`: the pooled `TcpStream` if one was available, or `None` if the pool was empty.
+    /// - `stream`: the pooled `BackendStream` if one was available, or `None` if the pool was empty.
     /// - `traffic`: an `Arc` to the backend's counters, obtained in the **same** lock acquisition.
     ///
     /// Callers must not call `get_traffic_counters` separately; use the returned `Arc` directly.
@@ -291,7 +314,7 @@ impl BackendPool {
             .iter()
             .map(|e| BackendStatusView {
                 name: e.info.name.clone(),
-                address: format!("{}:{}", e.info.host, e.info.port),
+                address: e.info.endpoint.display(),
                 healthy: e.status.healthy,
                 last_latency_ms: e.status.last_latency.map(|d| d.as_millis() as u64),
                 consecutive_failures: e.status.consecutive_failures,
@@ -316,18 +339,30 @@ fn push_history(history: &mut VecDeque<HealthCheckResult>, result: HealthCheckRe
 }
 
 /// Background task that keeps the SOCKS5 connection pool filled for a backend.
-async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<TcpStream>) {
-    let backend_addr = format!("{}:{}", info.host, info.port);
+async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>) {
     let retry_interval = Duration::from_secs(5);
 
     loop {
         // Attempt to establish and authenticate a new connection.
-        let result = async {
-            let stream = TcpStream::connect(&backend_addr).await?;
-            stream.set_nodelay(true)?;
-            socks5h_authenticate(stream, &info).await
-        }
-        .await;
+        let result: std::io::Result<BackendStream> = match &info.endpoint {
+            BackendEndpoint::Tcp { host, port } => {
+                let addr = format!("{}:{}", host, port);
+                async {
+                    let stream = TcpStream::connect(&addr).await?;
+                    stream.set_nodelay(true)?;
+                    socks5h_authenticate(BackendStream::Tcp(stream), &info).await
+                }
+                .await
+            }
+            BackendEndpoint::Unix { path } => {
+                let path = path.clone();
+                async {
+                    let stream = UnixStream::connect(&path).await?;
+                    socks5h_authenticate(BackendStream::Unix(stream), &info).await
+                }
+                .await
+            }
+        };
 
         match result {
             Ok(stream) => {

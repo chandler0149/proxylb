@@ -1,8 +1,8 @@
 //! Configuration types for proxylb.
 //!
 //! Parsed from a YAML config file. Supports SOCKS5 and Shadowsocks inbound
-//! listeners, an ordered list of SOCKS5h backends, health check parameters,
-//! and an optional web status dashboard.
+//! listeners, an ordered list of SOCKS5h backends (TCP or Unix domain socket),
+//! health check parameters, and an optional web status dashboard.
 
 use std::path::Path;
 
@@ -43,17 +43,24 @@ pub struct ShadowsocksInboundConfig {
 }
 
 /// A SOCKS5h backend entry.
+///
+/// Exactly one of `address` (TCP) or `unix_socket` (Unix domain socket path)
+/// must be set. Setting both or neither is a configuration error.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BackendConfig {
-    /// Address in the form "host:port"
-    pub address: String,
+    /// TCP backend address in the form "host:port".
+    /// Mutually exclusive with `unix_socket`.
+    pub address: Option<String>,
+    /// Path to a Unix domain socket for the backend.
+    /// Mutually exclusive with `address`.
+    pub unix_socket: Option<String>,
     /// Optional SOCKS5 username for backend authentication.
     pub username: Option<String>,
     /// Optional SOCKS5 password for backend authentication.
     pub password: Option<String>,
     /// Human-readable name for the backend (auto-generated if not set).
     pub name: Option<String>,
-    /// Number of pre-authenticated connections to maintain (default: 5).
+    /// Number of pre-authenticated connections to maintain (default: 10).
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
 }
@@ -140,6 +147,28 @@ impl Config {
         }
         if self.inbound.socks5.is_none() && self.inbound.shadowsocks.is_none() {
             anyhow::bail!("at least one inbound (socks5 or shadowsocks) must be configured");
+        }
+        for (i, backend) in self.backends.iter().enumerate() {
+            let label = backend
+                .name
+                .as_deref()
+                .map(|n| format!("backend '{}'", n))
+                .unwrap_or_else(|| format!("backend[{}]", i));
+            match (&backend.address, &backend.unix_socket) {
+                (Some(_), None) | (None, Some(_)) => {} // exactly one set — OK
+                (Some(_), Some(_)) => {
+                    anyhow::bail!(
+                        "{}: 'address' and 'unix_socket' are mutually exclusive",
+                        label
+                    );
+                }
+                (None, None) => {
+                    anyhow::bail!(
+                        "{}: one of 'address' or 'unix_socket' must be set",
+                        label
+                    );
+                }
+            }
         }
         if let Some(ref ss) = self.inbound.shadowsocks {
             // Validate cipher method is parseable

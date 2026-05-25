@@ -20,6 +20,10 @@ inbound:
 # Ordered list of SOCKS5h backends (first = highest priority).
 # The load balancer will try each backend in order, falling back to
 # the next one if the current backend is unhealthy.
+#
+# Each backend uses exactly ONE of:
+#   address:     "host:port"  — TCP backend
+#   unix_socket: "/path/to/socks5.sock"  — Unix domain socket backend
 backends:
   - address: "127.0.0.1:10800"
     name: "backend-1"
@@ -31,6 +35,11 @@ backends:
 
   - address: "127.0.0.1:10802"
     name: "backend-3"
+
+  # Example: Unix domain socket backend
+  # - unix_socket: "/run/my-proxy/socks5.sock"
+  #   name: "local-uds"
+  #   pool_size: 5
 
 # Health check settings
 health_check:

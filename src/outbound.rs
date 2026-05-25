@@ -3,13 +3,19 @@
 //! Implements just enough of RFC 1928 to issue a CONNECT request with a
 //! domain name (ATYP=0x03, i.e. "socks5h") through a SOCKS5 backend.
 //! DNS resolution is performed by the backend, not locally.
+//!
+//! Transports: TCP (`TcpStream`) and Unix domain socket (`UnixStream`) are both
+//! supported via the [`BackendStream`] enum.
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpStream, UnixStream};
 
 use crate::backend::BackendInfo;
 
@@ -40,44 +46,134 @@ impl std::fmt::Display for TargetAddr {
     }
 }
 
+// ─── Transport abstraction ────────────────────────────────────────────────────
+
+/// A connected stream to a SOCKS5 backend — either TCP or Unix domain socket.
+///
+/// Both variants carry a fully bi-directional async byte stream.  The enum
+/// implements [`AsyncRead`] and [`AsyncWrite`] so that higher-level protocol
+/// code is transport-agnostic.
+pub enum BackendStream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl AsyncRead for BackendStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            BackendStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            BackendStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for BackendStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            BackendStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            BackendStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            BackendStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            BackendStream::Unix(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            BackendStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            BackendStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+// ─── Entry-point helpers ──────────────────────────────────────────────────────
+
 /// Connect to a SOCKS5h backend and issue a CONNECT to `target`.
 ///
-/// Returns the connected TCP stream ready for bidirectional relay.
+/// Dispatches to TCP or Unix socket transport based on [`BackendInfo::endpoint`].
+/// Returns the stream ready for bidirectional relay.
 pub async fn socks5h_connect(
     backend: &BackendInfo,
     target: &TargetAddr,
     timeout: Duration,
-) -> io::Result<TcpStream> {
-    let backend_addr = format!("{}:{}", backend.host, backend.port);
+) -> io::Result<BackendStream> {
+    use crate::backend::BackendEndpoint;
 
-    // TCP connect to the backend with timeout.
-    let stream = tokio::time::timeout(timeout, TcpStream::connect(&backend_addr))
+    match &backend.endpoint {
+        BackendEndpoint::Tcp { host, port } => {
+            let addr = format!("{}:{}", host, port);
+
+            let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend TCP connect timeout"))?
+                .map_err(|e| {
+                    io::Error::new(e.kind(), format!("backend TCP connect to {}: {}", addr, e))
+                })?;
+
+            tcp.set_nodelay(true)?;
+
+            let stream = socks5h_authenticate(BackendStream::Tcp(tcp), backend).await?;
+            socks5h_connect_target(stream, target).await
+        }
+        BackendEndpoint::Unix { path } => {
+            socks5h_connect_unix(path, backend, target, timeout).await
+        }
+    }
+}
+
+/// Connect via a Unix domain socket, authenticate, then issue the CONNECT.
+pub async fn socks5h_connect_unix(
+    socket_path: &str,
+    backend: &BackendInfo,
+    target: &TargetAddr,
+    timeout: Duration,
+) -> io::Result<BackendStream> {
+    let unix = tokio::time::timeout(timeout, UnixStream::connect(Path::new(socket_path)))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend TCP connect timeout"))?
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("backend UDS connect timeout: {}", socket_path),
+            )
+        })?
         .map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("backend TCP connect to {}: {}", backend_addr, e),
+                format!("backend UDS connect to {}: {}", socket_path, e),
             )
         })?;
 
-    // Disable Nagle's algorithm for lower latency.
-    stream.set_nodelay(true)?;
-
-    // Perform handshake: Auth then Connect.
-    let stream = socks5h_authenticate(stream, backend).await?;
+    let stream = socks5h_authenticate(BackendStream::Unix(unix), backend).await?;
     socks5h_connect_target(stream, target).await
 }
 
-/// Phase 1: Perform the SOCKS5 authentication negotiation on an already-connected stream.
-pub async fn socks5h_authenticate(
-    mut stream: TcpStream,
-    backend: &BackendInfo,
-) -> io::Result<TcpStream> {
+// ─── Protocol phases ──────────────────────────────────────────────────────────
+
+/// Phase 1: SOCKS5 auth negotiation on an already-connected stream.
+///
+/// Generic over the transport — works with TCP or Unix streams.
+pub async fn socks5h_authenticate<S>(mut stream: S, backend: &BackendInfo) -> io::Result<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // === Step 1: Auth negotiation ===
     if backend.requires_auth() {
         // Offer both no-auth and user/pass
-        stream.write_all(&[SOCKS5_VERSION, 2, AUTH_NONE, AUTH_USER_PASS]).await?;
+        stream
+            .write_all(&[SOCKS5_VERSION, 2, AUTH_NONE, AUTH_USER_PASS])
+            .await?;
     } else {
         stream.write_all(&[SOCKS5_VERSION, 1, AUTH_NONE]).await?;
     }
@@ -142,10 +238,12 @@ pub async fn socks5h_authenticate(
 }
 
 /// Phase 2: Issue a SOCKS5 CONNECT request to `target` on an already-authenticated stream.
-pub async fn socks5h_connect_target(
-    mut stream: TcpStream,
-    target: &TargetAddr,
-) -> io::Result<TcpStream> {
+///
+/// Generic over the transport — works with TCP or Unix streams.
+pub async fn socks5h_connect_target<S>(mut stream: S, target: &TargetAddr) -> io::Result<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // === Step 2: CONNECT request ===
     let connect_req = build_connect_request(target);
     stream.write_all(&connect_req).await?;
@@ -195,6 +293,8 @@ pub async fn socks5h_connect_target(
 
     Ok(stream)
 }
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /// Build a SOCKS5 CONNECT request packet.
 fn build_connect_request(target: &TargetAddr) -> Vec<u8> {
