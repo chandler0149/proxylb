@@ -54,20 +54,23 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ProxyLB — Backend Status</title>
+    <title>ProxyLB — Web Dashboard</title>
     <style>
         :root {{
-            --bg-primary: #0f0f23;
-            --bg-secondary: #1a1a3e;
-            --bg-card: #1e1e4a;
-            --text-primary: #e0e0ff;
-            --text-secondary: #a0a0cc;
+            --bg-primary: #060613;
+            --bg-secondary: #0c0c24;
+            --bg-card: rgba(22, 22, 59, 0.45);
+            --bg-card-hover: rgba(33, 33, 85, 0.6);
+            --text-primary: #f0f0f8;
+            --text-secondary: #9da4cf;
             --accent-green: #00e676;
-            --accent-red: #ff1744;
-            --accent-yellow: #ffea00;
-            --accent-blue: #448aff;
-            --border-subtle: rgba(255, 255, 255, 0.06);
-            --shadow-glow: 0 0 20px rgba(68, 138, 255, 0.15);
+            --accent-red: #ff3d71;
+            --accent-yellow: #ffc107;
+            --accent-blue: #00b0ff;
+            --border-subtle: rgba(255, 255, 255, 0.08);
+            --shadow-glow: 0 12px 40px 0 rgba(0, 0, 0, 0.5);
+            --font-main: 'Outfit', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
         }}
 
         * {{
@@ -77,109 +80,442 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
         }}
 
         body {{
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background: var(--bg-primary);
+            font-family: var(--font-main);
+            background: radial-gradient(circle at 50% 0%, var(--bg-secondary) 0%, var(--bg-primary) 100%);
             color: var(--text-primary);
             min-height: 100vh;
-            padding: 2rem;
+            padding: 2.5rem 2rem;
+            overflow-x: hidden;
+        }}
+
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
         }}
 
         .header {{
-            text-align: center;
-            margin-bottom: 2.5rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-subtle);
+            padding-bottom: 1.5rem;
         }}
 
-        .header h1 {{
-            font-size: 1.8rem;
-            font-weight: 700;
-            background: linear-gradient(135deg, var(--accent-blue), #7c4dff);
+        .header-title-area h1 {{
+            font-size: 2.2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #a370f7 0%, var(--accent-blue) 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
-            margin-bottom: 0.3rem;
+            letter-spacing: -0.5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }}
 
-        .header .subtitle {{
+        .header-title-area .subtitle {{
             color: var(--text-secondary);
-            font-size: 0.85rem;
+            font-size: 0.95rem;
+            margin-top: 4px;
+            font-weight: 400;
         }}
 
-        .refresh-info {{
-            text-align: center;
-            color: var(--text-secondary);
-            font-size: 0.75rem;
-            margin-bottom: 1.5rem;
+        .header-meta {{
+            text-align: right;
         }}
 
-        .grid {{
+        .refresh-badge {{
+            background: rgba(0, 176, 255, 0.1);
+            color: var(--accent-blue);
+            border: 1px solid rgba(0, 176, 255, 0.25);
+            padding: 6px 16px;
+            border-radius: 30px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .refresh-dot {{
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--accent-blue);
+            animation: pulse 1.5s infinite;
+        }}
+
+        /* Global Summary Panel */
+        .summary-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
             gap: 1.5rem;
-            max-width: 1400px;
-            margin: 0 auto;
         }}
 
-        .card {{
+        .summary-card {{
             background: var(--bg-card);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
             border: 1px solid var(--border-subtle);
-            border-radius: 12px;
+            border-radius: 16px;
             padding: 1.5rem;
             box-shadow: var(--shadow-glow);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            position: relative;
+            overflow: hidden;
         }}
 
-        .card:hover {{
-            transform: translateY(-2px);
-            box-shadow: 0 0 30px rgba(68, 138, 255, 0.25);
+        .summary-card:hover {{
+            transform: translateY(-4px);
+            border-color: rgba(163, 112, 247, 0.3);
+            box-shadow: 0 16px 48px 0 rgba(163, 112, 247, 0.15);
         }}
 
-        .card-header {{
+        .summary-card::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 4px;
+            background: linear-gradient(90deg, transparent, rgba(163, 112, 247, 0.5), transparent);
+            opacity: 0;
+            transition: opacity 0.3s;
+        }}
+
+        .summary-card:hover::before {{
+            opacity: 1;
+        }}
+
+        .summary-card-header {{
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 1rem;
         }}
 
-        .card-name {{
-            font-size: 1.1rem;
+        .summary-card-title {{
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
             font-weight: 600;
+        }}
+
+        .summary-card-icon {{
+            font-size: 1.25rem;
+            opacity: 0.8;
+        }}
+
+        .summary-card-value {{
+            font-size: 1.8rem;
+            font-weight: 700;
+            font-family: var(--font-mono);
+            line-height: 1.2;
+            margin-bottom: 0.5rem;
+        }}
+
+        .summary-card-subtext {{
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }}
+
+        /* Specific Summary Card Customizations */
+        .summary-card.health .beacon-container {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .summary-card.health .beacon {{
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            position: relative;
+        }}
+
+        .summary-card.health .beacon-pulse {{
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            animation: pulse-ring 1.8s cubic-bezier(0.215, 0.610, 0.355, 1) infinite;
+        }}
+
+        .beacon-green {{ background: var(--accent-green); }}
+        .beacon-green .beacon-pulse {{ background: rgba(0, 230, 118, 0.4); }}
+        .beacon-yellow {{ background: var(--accent-yellow); }}
+        .beacon-yellow .beacon-pulse {{ background: rgba(255, 193, 7, 0.4); }}
+        .beacon-red {{ background: var(--accent-red); }}
+        .beacon-red .beacon-pulse {{ background: rgba(255, 61, 113, 0.4); }}
+
+        /* Traffic Distribution Panel */
+        .distribution-card {{
+            background: var(--bg-card);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border-subtle);
+            border-radius: 20px;
+            padding: 2rem;
+            box-shadow: var(--shadow-glow);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }}
+
+        .distribution-card:hover {{
+            border-color: rgba(0, 176, 255, 0.2);
+            box-shadow: 0 16px 48px 0 rgba(0, 176, 255, 0.08);
+        }}
+
+        .distribution-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }}
+
+        .distribution-header h2 {{
+            font-size: 1.25rem;
+            font-weight: 700;
+            letter-spacing: -0.2px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .total-processed {{
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }}
+
+        .total-processed strong {{
+            color: var(--text-primary);
+            font-family: var(--font-mono);
+        }}
+
+        /* Stacked segment bar */
+        .stacked-bar-container {{
+            height: 24px;
+            width: 100%;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 12px;
+            display: flex;
+            overflow: hidden;
+            margin-bottom: 1.8rem;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 2px;
+        }}
+
+        .stacked-segment {{
+            height: 100%;
+            transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            cursor: pointer;
+        }}
+
+        .stacked-segment:hover {{
+            filter: brightness(1.2);
+            transform: scaleY(1.05);
+            z-index: 10;
+        }}
+
+        .stacked-segment:first-child {{
+            border-top-left-radius: 10px;
+            border-bottom-left-radius: 10px;
+        }}
+
+        .stacked-segment:last-child {{
+            border-top-right-radius: 10px;
+            border-bottom-right-radius: 10px;
+        }}
+
+        .stacked-segment-tooltip {{
+            position: absolute;
+            bottom: 35px;
+            left: 50%;
+            transform: translateX(-50%) translateY(10px);
+            background: #11112a;
+            color: #fff;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 0.75rem;
+            white-space: nowrap;
+            opacity: 0;
+            pointer-events: none;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+            border: 1px solid var(--border-subtle);
+            z-index: 100;
+        }}
+
+        .stacked-segment:hover .stacked-segment-tooltip {{
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }}
+
+        /* Distribution breakdown items */
+        .distribution-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 1.5rem;
+        }}
+
+        .dist-item {{
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-radius: 12px;
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            transition: all 0.2s;
+        }}
+
+        .dist-item:hover {{
+            background: rgba(255, 255, 255, 0.04);
+            border-color: rgba(255, 255, 255, 0.08);
+        }}
+
+        .dist-item-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }}
+
+        .dist-item-label {{
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .dist-color-dot {{
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }}
+
+        .dist-item-percentage {{
+            font-family: var(--font-mono);
+            font-weight: 700;
+            font-size: 0.95rem;
+        }}
+
+        .dist-bar-bg {{
+            height: 6px;
+            width: 100%;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 3px;
+            overflow: hidden;
+        }}
+
+        .dist-bar-fill {{
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+        }}
+
+        .dist-item-bytes {{
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            font-family: var(--font-mono);
+            display: flex;
+            justify-content: space-between;
+        }}
+
+        /* Backends Grid Section */
+        .backends-title {{
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-top: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+            gap: 1.5rem;
+        }}
+
+        .card {{
+            background: var(--bg-card);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border-subtle);
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: var(--shadow-glow);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            flex-direction: column;
+            gap: 1.2rem;
+        }}
+
+        .card:hover {{
+            transform: translateY(-4px);
+            border-color: rgba(0, 176, 255, 0.3);
+            box-shadow: 0 16px 48px 0 rgba(0, 176, 255, 0.15);
+        }}
+
+        .card-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+        }}
+
+        .card-name {{
+            font-size: 1.15rem;
+            font-weight: 700;
+            color: var(--text-primary);
         }}
 
         .card-address {{
             color: var(--text-secondary);
             font-size: 0.8rem;
-            font-family: 'JetBrains Mono', monospace;
+            font-family: var(--font-mono);
+            margin-top: 2px;
         }}
 
         .status-badge {{
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            padding: 4px 12px;
-            border-radius: 20px;
+            padding: 6px 14px;
+            border-radius: 30px;
             font-size: 0.75rem;
-            font-weight: 600;
+            font-weight: 700;
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }}
 
         .status-healthy {{
-            background: rgba(0, 230, 118, 0.15);
+            background: rgba(0, 230, 118, 0.12);
             color: var(--accent-green);
-            border: 1px solid rgba(0, 230, 118, 0.3);
+            border: 1px solid rgba(0, 230, 118, 0.25);
         }}
 
         .status-unhealthy {{
-            background: rgba(255, 23, 68, 0.15);
+            background: rgba(255, 61, 113, 0.12);
             color: var(--accent-red);
-            border: 1px solid rgba(255, 23, 68, 0.3);
+            border: 1px solid rgba(255, 61, 113, 0.25);
         }}
 
-        .status-dot {{
-            width: 8px;
-            height: 8px;
+        .card .status-dot {{
+            width: 7px;
+            height: 7px;
             border-radius: 50%;
-            animation: pulse 2s ease-in-out infinite;
         }}
 
         .status-healthy .status-dot {{
@@ -192,20 +528,19 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             box-shadow: 0 0 6px var(--accent-red);
         }}
 
-        @keyframes pulse {{
-            0%, 100% {{ opacity: 1; }}
-            50% {{ opacity: 0.5; }}
-        }}
-
         .metrics {{
             display: flex;
             gap: 1.5rem;
-            margin-bottom: 1rem;
+            padding: 0.8rem 1rem;
+            background: rgba(255, 255, 255, 0.02);
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.04);
         }}
 
         .metric {{
             display: flex;
             flex-direction: column;
+            flex: 1;
         }}
 
         .metric-label {{
@@ -213,118 +548,58 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             font-size: 0.7rem;
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            margin-bottom: 2px;
+            margin-bottom: 4px;
+            font-weight: 600;
         }}
 
         .metric-value {{
-            font-size: 1.1rem;
-            font-weight: 600;
-            font-family: 'JetBrains Mono', monospace;
-        }}
-
-        .history-title {{
-            color: var(--text-secondary);
-            font-size: 0.75rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 0.5rem;
-        }}
-
-        .history-table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.78rem;
-        }}
-
-        .history-table th {{
-            text-align: left;
-            color: var(--text-secondary);
-            font-weight: 500;
-            padding: 4px 8px;
-            border-bottom: 1px solid var(--border-subtle);
-            font-size: 0.7rem;
-            text-transform: uppercase;
-            letter-spacing: 0.3px;
-        }}
-
-        .history-table td {{
-            padding: 4px 8px;
-            border-bottom: 1px solid var(--border-subtle);
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.75rem;
-        }}
-
-        .history-table tr:last-child td {{
-            border-bottom: none;
-        }}
-
-        .history-success {{
-            color: var(--accent-green);
-        }}
-
-        .history-fail {{
-            color: var(--accent-red);
-        }}
-
-        .error-text {{
-            color: var(--accent-red);
-            font-size: 0.7rem;
-            max-width: 200px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-        }}
-
-        .empty-state {{
-            text-align: center;
-            color: var(--text-secondary);
-            padding: 3rem;
-            font-style: italic;
+            font-size: 1.15rem;
+            font-weight: 700;
+            font-family: var(--font-mono);
         }}
 
         .traffic-row {{
-            display: flex;
-            gap: 1.5rem;
-            margin-bottom: 1rem;
-            padding: 0.75rem;
-            background: rgba(255,255,255,0.04);
-            border-radius: 8px;
-            border: 1px solid var(--border-subtle);
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 0.8rem;
         }}
 
         .traffic-item {{
             display: flex;
             flex-direction: column;
-            flex: 1;
+            background: rgba(255, 255, 255, 0.015);
+            border: 1px solid rgba(255, 255, 255, 0.03);
+            border-radius: 10px;
+            padding: 0.6rem 0.8rem;
         }}
 
         .traffic-label {{
             color: var(--text-secondary);
-            font-size: 0.68rem;
+            font-size: 0.65rem;
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            margin-bottom: 2px;
+            margin-bottom: 4px;
+            font-weight: 600;
         }}
 
         .traffic-value {{
-            font-size: 0.95rem;
-            font-weight: 600;
-            font-family: 'JetBrains Mono', monospace;
-            color: var(--accent-blue);
+            font-size: 0.9rem;
+            font-weight: 700;
+            font-family: var(--font-mono);
+            color: var(--text-primary);
         }}
 
-        .traffic-value.upload {{ color: #ff9800; }}
+        .traffic-value.upload {{ color: #ffa726; }}
         .traffic-value.download {{ color: var(--accent-green); }}
         .traffic-value.active {{ color: var(--accent-yellow); }}
 
         .pool-row {{
             display: flex;
-            gap: 1rem;
-            margin-bottom: 1rem;
-            padding: 0.6rem 0.75rem;
-            background: rgba(124, 77, 255, 0.07);
-            border-radius: 8px;
-            border: 1px solid rgba(124, 77, 255, 0.2);
+            gap: 0.8rem;
+            padding: 0.8rem;
+            background: rgba(163, 112, 247, 0.05);
+            border-radius: 12px;
+            border: 1px solid rgba(163, 112, 247, 0.15);
         }}
 
         .pool-item {{
@@ -335,16 +610,17 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
 
         .pool-label {{
             color: var(--text-secondary);
-            font-size: 0.68rem;
+            font-size: 0.65rem;
             text-transform: uppercase;
             letter-spacing: 0.5px;
             margin-bottom: 2px;
+            font-weight: 600;
         }}
 
         .pool-value {{
-            font-size: 0.9rem;
-            font-weight: 600;
-            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.95rem;
+            font-weight: 700;
+            font-family: var(--font-mono);
         }}
 
         .pool-value.hit  {{ color: var(--accent-green); }}
@@ -352,28 +628,157 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
         .pool-value.stale {{ color: var(--accent-red); }}
 
         .pool-hit-rate {{
-            font-size: 0.7rem;
+            font-size: 0.68rem;
             color: var(--text-secondary);
-            margin-top: 1px;
+            margin-top: 2px;
+        }}
+
+        .history-title {{
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-weight: 600;
+        }}
+
+        .history-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8rem;
+        }}
+
+        .history-table th {{
+            text-align: left;
+            color: var(--text-secondary);
+            font-weight: 600;
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }}
+
+        .history-table td {{
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--border-subtle);
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+        }}
+
+        .history-table tr:last-child td {{
+            border-bottom: none;
+        }}
+
+        .history-success {{
+            color: var(--accent-green);
+            font-weight: 600;
+        }}
+
+        .history-fail {{
+            color: var(--accent-red);
+            font-weight: 600;
+        }}
+
+        .error-text {{
+            color: var(--accent-red);
+            font-size: 0.7rem;
+            max-width: 160px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }}
+
+        .empty-state {{
+            text-align: center;
+            color: var(--text-secondary);
+            padding: 4rem;
+            font-style: italic;
+            background: var(--bg-card);
+            border-radius: 16px;
+            border: 1px solid var(--border-subtle);
+        }}
+
+        @keyframes pulse {{
+            0%, 100% {{ opacity: 1; }}
+            50% {{ opacity: 0.4; }}
+        }}
+
+        @keyframes pulse-ring {{
+            0% {{ transform: scale(0.33); opacity: 1; }}
+            80%, 100% {{ transform: scale(2.2); opacity: 0; }}
+        }}
+
+        @media (max-width: 1000px) {{
+            .header {{ flex-direction: column; align-items: flex-start; gap: 1rem; }}
+            .header-meta {{ text-align: left; }}
         }}
 
         @media (max-width: 600px) {{
-            body {{ padding: 1rem; }}
+            body {{ padding: 1.5rem 1rem; }}
             .grid {{ grid-template-columns: 1fr; }}
+            .traffic-row {{ grid-template-columns: repeat(2, 1fr); }}
         }}
     </style>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 </head>
 <body>
-    <div class="header">
-        <h1>⚡ ProxyLB Status</h1>
-        <div class="subtitle">SOCKS5 Proxy Load Balancer</div>
+    <div class="container">
+        <div class="header">
+            <div class="header-title-area">
+                <h1>⚡ ProxyLB Dashboard</h1>
+                <div class="subtitle">High-Performance SOCKS5 Proxy Load Balancer & Failover Status</div>
+            </div>
+            <div class="header-meta">
+                <div class="refresh-badge">
+                    <span class="refresh-dot"></span>
+                    Auto-refreshing (5s)
+                </div>
+            </div>
+        </div>
+
+        <!-- Global Traffic Summary Panel -->
+        <div class="summary-grid" id="summary-grid">
+            <!-- Dynamic Global Stats will be injected here -->
+        </div>
+
+        <!-- Traffic Allocation Share -->
+        <div class="distribution-card" id="distribution-card" style="display: none;">
+            <div class="distribution-header">
+                <h2>📊 Global Traffic Share</h2>
+                <div class="total-processed">Total Processed: <span id="total-processed-val">0 B</span></div>
+            </div>
+            <div class="stacked-bar-container" id="stacked-bar">
+                <!-- Stacked segmented bar -->
+            </div>
+            <div class="distribution-grid" id="distribution-grid">
+                <!-- Distribution breakdown list -->
+            </div>
+        </div>
+
+        <!-- Detailed Backends Grid -->
+        <div>
+            <h2 class="backends-title">🔗 Load Balancer Backends</h2>
+            <div class="grid" id="grid" style="margin-top: 1rem;"></div>
+        </div>
     </div>
-    <div class="refresh-info">Auto-refreshes every 5 seconds</div>
-    <div class="grid" id="grid"></div>
 
     <script>
         let backendsData = {backends_json};
+
+        // Harmonious UI HSL colors for backends
+        const palette = [
+            'hsl(262, 85%, 68%)',  // Indigo/Purple
+            'hsl(190, 90%, 50%)',  // Teal/Cyan
+            'hsl(145, 80%, 45%)',  // Green
+            'hsl(35, 95%, 55%)',   // Orange
+            'hsl(330, 85%, 60%)',  // Pink/Rose
+            'hsl(210, 95%, 55%)',  // Azure Blue
+            'hsl(285, 80%, 58%)'   // Magenta
+        ];
+
+        function getBackendColor(index) {{
+            return palette[index % palette.length];
+        }}
 
         function formatTime(ts) {{
             const d = new Date(ts);
@@ -400,16 +805,180 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                 <div class="pool-item">
                     <span class="pool-label">Pool Misses</span>
                     <span class="pool-value miss">${{b.pool_misses}}</span>
-                    <span class="pool-hit-rate">pool empty \u2192 fresh conn</span>
+                    <span class="pool-hit-rate">pool empty \u2192 fresh</span>
                 </div>
                 <div class="pool-item">
                     <span class="pool-label">Stale Evicted</span>
                     <span class="pool-value stale">${{b.pool_stale}}</span>
-                    <span class="pool-hit-rate">dead conn \u2192 retried fresh</span>
+                    <span class="pool-hit-rate">dead \u2192 replaced</span>
                 </div>`;
         }}
 
+        function renderSummary(backends) {{
+            const summaryGrid = document.getElementById('summary-grid');
+            if (!backends || backends.length === 0) {{
+                summaryGrid.innerHTML = '';
+                return;
+            }}
+
+            let totalBytesUp = 0;
+            let totalBytesDown = 0;
+            let totalActiveConns = 0;
+            let totalConns = 0;
+            let totalPoolHits = 0;
+            let totalPoolMisses = 0;
+            let totalPoolStale = 0;
+            let healthyCount = 0;
+
+            backends.forEach(b => {{
+                totalBytesUp += b.bytes_up;
+                totalBytesDown += b.bytes_down;
+                totalActiveConns += Math.max(0, b.active_connections);
+                totalConns += b.total_connections;
+                totalPoolHits += b.pool_hits;
+                totalPoolMisses += b.pool_misses;
+                totalPoolStale += b.pool_stale;
+                if (b.healthy) healthyCount++;
+            }});
+
+            const totalBytes = totalBytesUp + totalBytesDown;
+            const totalPoolRequests = totalPoolHits + totalPoolMisses + totalPoolStale;
+            const globalHitRate = totalPoolRequests > 0 ? ((totalPoolHits / totalPoolRequests) * 100) : 0;
+
+            // Health status class and beacon color
+            let healthStatusClass = 'beacon-red';
+            let healthText = 'All Unhealthy';
+            if (healthyCount === backends.length) {{
+                healthStatusClass = 'beacon-green';
+                healthText = 'All Backends Healthy';
+            }} else if (healthyCount > 0) {{
+                healthStatusClass = 'beacon-yellow';
+                healthText = `${{healthyCount}} / ${{backends.length}} Healthy`;
+            }}
+
+            summaryGrid.innerHTML = `
+                <!-- Health Card -->
+                <div class="summary-card health">
+                    <div class="summary-card-header">
+                        <span class="summary-card-title">System Status</span>
+                        <div class="beacon-container">
+                            <span class="summary-card-subtext">${{healthText}}</span>
+                            <div class="beacon ${{healthStatusClass}}">
+                                <span class="beacon-pulse"></span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="summary-card-value">${{healthyCount}} / ${{backends.length}}</div>
+                    <div class="summary-card-subtext">Active load balancer nodes</div>
+                </div>
+
+                <!-- Traffic Card -->
+                <div class="summary-card">
+                    <div class="summary-card-header">
+                        <span class="summary-card-title">Total Bandwidth</span>
+                        <span class="summary-card-icon">⚡</span>
+                    </div>
+                    <div class="summary-card-value" style="font-size: 1.6rem; margin-bottom: 0.7rem;">${{formatBytes(totalBytes)}}</div>
+                    <div class="summary-card-subtext" style="gap: 12px;">
+                        <span style="color: #ffa726;">▲ ${{formatBytes(totalBytesUp)}}</span>
+                        <span style="color: var(--accent-green);">▼ ${{formatBytes(totalBytesDown)}}</span>
+                    </div>
+                </div>
+
+                <!-- Connections Card -->
+                <div class="summary-card">
+                    <div class="summary-card-header">
+                        <span class="summary-card-title">Active Connections</span>
+                        <span class="summary-card-icon">🔌</span>
+                    </div>
+                    <div class="summary-card-value">${{totalActiveConns}}</div>
+                    <div class="summary-card-subtext">Historical total: ${{totalConns}}</div>
+                </div>
+
+                <!-- Pool Performance Card -->
+                <div class="summary-card">
+                    <div class="summary-card-header">
+                        <span class="summary-card-title">Global Pool Hit Rate</span>
+                        <span class="summary-card-icon">💾</span>
+                    </div>
+                    <div class="summary-card-value">${{globalHitRate.toFixed(1)}}%</div>
+                    <div class="summary-card-subtext">
+                        Hits: ${{totalPoolHits}} / Misses: ${{totalPoolMisses}}
+                    </div>
+                </div>
+            `;
+
+            // Render Traffic Allocation Share
+            const distCard = document.getElementById('distribution-card');
+            if (backends.length > 0) {{
+                distCard.style.display = 'block';
+                document.getElementById('total-processed-val').innerText = formatBytes(totalBytes);
+
+                const stackedBar = document.getElementById('stacked-bar');
+                const distGrid = document.getElementById('distribution-grid');
+
+                // Clear
+                stackedBar.innerHTML = '';
+                distGrid.innerHTML = '';
+
+                backends.forEach((b, i) => {{
+                    const backendBytes = b.bytes_up + b.bytes_down;
+                    const pct = totalBytes > 0 ? ((backendBytes / totalBytes) * 100) : 0;
+                    const color = getBackendColor(i);
+
+                    // Add to stacked bar if pct > 0 (or default state)
+                    if (totalBytes > 0 && pct > 0) {{
+                        const segment = document.createElement('div');
+                        segment.className = 'stacked-segment';
+                        segment.style.width = `${{pct}}%`;
+                        segment.style.backgroundColor = color;
+                        
+                        const tooltip = document.createElement('span');
+                        tooltip.className = 'stacked-segment-tooltip';
+                        tooltip.innerHTML = `<strong>${{b.name}}</strong>: ${{pct.toFixed(1)}}% (${{formatBytes(backendBytes)}})`;
+                        segment.appendChild(tooltip);
+
+                        stackedBar.appendChild(segment);
+                    }}
+
+                    // Add to breakdown grid
+                    const distItem = document.createElement('div');
+                    distItem.className = 'dist-item';
+                    distItem.innerHTML = `
+                        <div class="dist-item-header">
+                            <span class="dist-item-label">
+                                <span class="dist-color-dot" style="background-color: ${{color}}"></span>
+                                ${{b.name}}
+                            </span>
+                            <span class="dist-item-percentage">${{pct.toFixed(1)}}%</span>
+                        </div>
+                        <div class="dist-bar-bg">
+                            <div class="dist-bar-fill" style="width: ${{pct}}%; background-color: ${{color}}"></div>
+                        </div>
+                        <div class="dist-item-bytes">
+                            <span>Upload: ${{formatBytes(b.bytes_up)}}</span>
+                            <span>Download: ${{formatBytes(b.bytes_down)}}</span>
+                        </div>
+                    `;
+                    distGrid.appendChild(distItem);
+                }});
+
+                // If total processed is 0, add empty placeholder segment in stacked bar
+                if (totalBytes === 0) {{
+                    stackedBar.innerHTML = `
+                        <div class="stacked-segment" style="width: 100%; background-color: rgba(255,255,255,0.05); cursor: default;">
+                            <span class="stacked-segment-tooltip">No traffic processed yet</span>
+                        </div>
+                    `;
+                }}
+            }} else {{
+                distCard.style.display = 'none';
+            }}
+        }}
+
         function render(backends) {{
+            renderSummary(backends);
+
             const grid = document.getElementById('grid');
             if (!backends || backends.length === 0) {{
                 grid.innerHTML = '<div class="empty-state">No backends configured</div>';
@@ -459,26 +1028,29 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                     <div class="pool-row">
                         ${{poolStats(b)}}
                     </div>
-                    <div class="history-title">Recent Health Checks</div>
-                    <table class="history-table">
-                        <thead>
-                            <tr><th>Time</th><th>Status</th><th>Latency</th><th>Error</th></tr>
-                        </thead>
-                        <tbody>
-                            ${{b.history.slice().reverse().map(h => `
-                                <tr>
-                                    <td>${{formatTime(h.timestamp)}}</td>
-                                    <td class="${{h.success ? 'history-success' : 'history-fail'}}">${{h.success ? '✓ OK' : '✗ FAIL'}}</td>
-                                    <td>${{h.latency_ms != null ? h.latency_ms + ' ms' : '—'}}</td>
-                                    <td class="error-text" title="${{h.error || ''}}">${{h.error || '—'}}</td>
-                                </tr>
-                            `).join('')}}
-                        </tbody>
-                    </table>
+                    <div>
+                        <div class="history-title" style="margin-bottom: 0.5rem;">Recent Health Checks</div>
+                        <table class="history-table">
+                            <thead>
+                                <tr><th>Time</th><th>Status</th><th>Latency</th><th>Error</th></tr>
+                            </thead>
+                            <tbody>
+                                ${{b.history.slice().reverse().map(h => `
+                                    <tr>
+                                        <td>${{formatTime(h.timestamp)}}</td>
+                                        <td class="${{h.success ? 'history-success' : 'history-fail'}}">${{h.success ? '✓ OK' : '✗ FAIL'}}</td>
+                                        <td>${{h.latency_ms != null ? h.latency_ms + ' ms' : '—'}}</td>
+                                        <td class="error-text" title="${{h.error || ''}}">${{h.error || '—'}}</td>
+                                    </tr>
+                                `).join('')}}
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             `).join('');
         }}
 
+        // Initial render
         render(backendsData);
 
         // Auto-refresh every 5 seconds.
