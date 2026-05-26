@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Initialize backend pool.
-    let pool = backend::BackendPool::new(&config.backends)?;
+    let pool = backend::BackendPool::new(&config.backends, &config.groups, config.failover_order.as_ref())?;
 
     // Spawn health checker with its own cancellation token.
     let mut health_cancel = CancellationToken::new();
@@ -167,7 +167,7 @@ async fn perform_hot_reload(
     health_cancel.cancel();
 
     // Swap the backend pool.
-    match pool.reload(&new_config.backends).await {
+    match pool.reload(&new_config.backends, &new_config.groups, new_config.failover_order.as_ref()).await {
         Ok((added, removed, kept)) => {
             tracing::info!(
                 added,

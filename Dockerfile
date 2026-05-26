@@ -1,4 +1,4 @@
-FROM rust:trixie as builder
+FROM rust:trixie AS builder
 
 WORKDIR /usr/src/app
 

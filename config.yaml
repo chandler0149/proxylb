@@ -1,6 +1,6 @@
 # ProxyLB Configuration
 # ---------------------
-# A SOCKS5 proxy load balancer with Shadowsocks inbound support.
+# A high-performance SOCKS5 proxy load balancer with Shadowsocks inbound support.
 
 inbound:
   # SOCKS5 inbound listener
@@ -17,29 +17,58 @@ inbound:
     #   aes-256-gcm
     #   chacha20-ietf-poly1305
 
-# Ordered list of SOCKS5h backends (first = highest priority).
-# The load balancer will try each backend in order, falling back to
-# the next one if the current backend is unhealthy.
-#
-# Each backend uses exactly ONE of:
-#   address:     "host:port"  — TCP backend
-#   unix_socket: "/path/to/socks5.sock"  — Unix domain socket backend
+# All individual physical backends.
+# Each backend must define exactly one of:
+#   address:     "host:port"                 — TCP backend
+#   unix_socket: "/path/to/socks5.sock"      — Unix domain socket backend
 backends:
   - address: "127.0.0.1:10800"
-    name: "backend-1"
+    name: "backend-us-1"
+    pool_size: 5
     # username: "user1"
     # password: "pass1"
 
   - address: "127.0.0.1:10801"
-    name: "backend-2"
+    name: "backend-us-2"
+    pool_size: 5
 
   - address: "127.0.0.1:10802"
-    name: "backend-3"
+    name: "backend-eu-1"
+    pool_size: 2
+
+  - address: "127.0.0.1:10803"
+    name: "backend-eu-2"
+    pool_size: 2
 
   # Example: Unix domain socket backend
   # - unix_socket: "/run/my-proxy/socks5.sock"
   #   name: "local-uds"
-  #   pool_size: 5
+  #   pool_size: 10
+
+# Backend groups let you cluster individual backends.
+# Strategy options:
+#   urltest  - Dynamically routes to the healthy backend with the lowest health check latency.
+#   failover - Routes in configured order: tries first backend, falls back to second if first is down.
+groups:
+  - name: "group-us"
+    strategy: "urltest"
+    backends:
+      - "backend-us-1"
+      - "backend-us-2"
+
+  - name: "group-eu"
+    strategy: "failover"
+    backends:
+      - "backend-eu-1"
+      - "backend-eu-2"
+
+# Global priority failover order.
+# The load balancer attempts to resolve targets in this order.
+# Targets can be group names or single ungrouped backend names.
+# If omitted, default behavior falls back in sequential order: all groups first, followed by ungrouped backends.
+failover_order:
+  - "group-us"
+  - "group-eu"
 
 # Health check settings
 health_check:

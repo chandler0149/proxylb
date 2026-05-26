@@ -932,10 +932,9 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                         segment.className = 'stacked-segment';
                         segment.style.width = `${{pct}}%`;
                         segment.style.backgroundColor = color;
-                        
                         const tooltip = document.createElement('span');
                         tooltip.className = 'stacked-segment-tooltip';
-                        tooltip.innerHTML = `<strong>${{b.name}}</strong>: ${{pct.toFixed(1)}}% (${{formatBytes(backendBytes)}})`;
+                        tooltip.innerHTML = `<strong>${{b.name}}${{b.group ? ' (' + b.group + ')' : ''}}</strong>: ${{pct.toFixed(1)}}% (${{formatBytes(backendBytes)}})`;
                         segment.appendChild(tooltip);
 
                         stackedBar.appendChild(segment);
@@ -948,7 +947,7 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                         <div class="dist-item-header">
                             <span class="dist-item-label">
                                 <span class="dist-color-dot" style="background-color: ${{color}}"></span>
-                                ${{b.name}}
+                                ${{b.name}}${{b.group ? ' (' + b.group + ')' : ''}}
                             </span>
                             <span class="dist-item-percentage">${{pct.toFixed(1)}}%</span>
                         </div>
@@ -989,7 +988,10 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                 <div class="card">
                     <div class="card-header">
                         <div>
-                            <div class="card-name">${{b.name}}</div>
+                            <div class="card-name">
+                                ${{b.name}}
+                                ${{b.group ? '<span style="font-size: 0.8rem; font-weight: normal; opacity: 0.65; margin-left: 8px; padding: 2px 8px; background: rgba(255,255,255,0.06); border-radius: 8px; border: 1px solid var(--border-subtle)">' + b.group + '</span>' : ''}}
+                            </div>
                             <div class="card-address">${{b.address}}</div>
                         </div>
                         <span class="status-badge ${{b.healthy ? 'status-healthy' : 'status-unhealthy'}}">

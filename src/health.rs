@@ -170,6 +170,9 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
     for handle in handles {
         let _ = handle.await;
     }
+
+    // Single-pass candidate pre-calculation after all checks completed
+    pool.recalculate_candidates().await;
 }
 
 /// Perform a minimal HTTP/1.1 GET request on the stream.

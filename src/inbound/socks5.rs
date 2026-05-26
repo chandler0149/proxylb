@@ -88,17 +88,14 @@ async fn handle_socks5_connection(stream: TcpStream, pool: BackendPool) -> anyho
 
     // Try backends in order with fallback.
     let backend_timeout = Duration::from_secs(10);
-    let backends = pool.get_backends_in_order().await;
+    let (healthy_candidates, unhealthy_candidates) = pool.get_candidates().await;
 
     let mut backend_stream: Option<BackendStream> = None;
     // Traffic Arc carried from pool acquisition — zero additional RwLock reads on the hot path.
     let mut chosen_traffic: Option<Arc<TrafficCounters>> = None;
 
     // First pass: try healthy backends.
-    for (index, info, healthy) in &backends {
-        if !healthy {
-            continue;
-        }
+    for (index, info) in &healthy_candidates {
         // Single RwLock read: yields both the pooled stream (if any) and the traffic Arc.
         let pc = pool.get_pooled_connection(*index).await;
         let (pool_stream, traffic) = match pc {
@@ -155,10 +152,7 @@ async fn handle_socks5_connection(stream: TcpStream, pool: BackendPool) -> anyho
     // Second pass: try unhealthy backends as last resort.
     // Rare slow-path: one extra get_traffic_counters call is acceptable here.
     if backend_stream.is_none() {
-        for (index, info, healthy) in &backends {
-            if *healthy {
-                continue;
-            }
+        for (index, info) in &unhealthy_candidates {
             if let Ok(stream) = socks5h_connect(info, &target, backend_timeout).await {
                 tracing::debug!(backend = %info.name, target = %target, "connected through unhealthy backend (fallback)");
                 backend_stream = Some(stream);

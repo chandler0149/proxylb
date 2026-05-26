@@ -16,9 +16,34 @@ pub struct Config {
     pub inbound: InboundConfig,
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
+    pub groups: Vec<GroupConfig>,
+    #[serde(default)]
+    pub failover_order: Option<Vec<String>>,
+    #[serde(default)]
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub web: WebConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupStrategy {
+    UrlTest,
+    Failover,
+}
+
+impl Default for GroupStrategy {
+    fn default() -> Self {
+        Self::UrlTest
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GroupConfig {
+    pub name: String,
+    #[serde(default)]
+    pub strategy: GroupStrategy,
+    pub backends: Vec<String>,
 }
 
 /// Inbound listener configuration.
@@ -146,7 +171,16 @@ impl Config {
         if self.backends.is_empty() {
             anyhow::bail!("at least one backend must be configured");
         }
+
+        // Collect all backend names to check existence.
+        let mut backend_names = std::collections::HashSet::new();
         for (i, backend) in self.backends.iter().enumerate() {
+            let name = backend
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("backend-{}", i));
+            backend_names.insert(name);
+
             let label = backend
                 .name
                 .as_deref()
@@ -168,6 +202,60 @@ impl Config {
                 }
             }
         }
+
+        // Validate groups
+        let mut group_names = std::collections::HashSet::new();
+        let mut grouped_backends = std::collections::HashSet::new();
+        for group in &self.groups {
+            if group_names.contains(&group.name) {
+                anyhow::bail!("duplicate group name: {}", group.name);
+            }
+            if backend_names.contains(&group.name) {
+                anyhow::bail!("group name '{}' conflicts with backend name", group.name);
+            }
+            group_names.insert(group.name.clone());
+
+            if group.backends.is_empty() {
+                anyhow::bail!("group '{}' has no backends", group.name);
+            }
+
+            for member in &group.backends {
+                if !backend_names.contains(member) {
+                    anyhow::bail!(
+                        "group '{}' refers to non-existent backend '{}'",
+                        group.name,
+                        member
+                    );
+                }
+                // Enforce: the same backend cannot be used in multiple groups
+                if !grouped_backends.insert(member.clone()) {
+                    anyhow::bail!(
+                        "backend '{}' cannot be used in multiple groups",
+                        member
+                    );
+                }
+            }
+        }
+
+        // Validate failover_order if present
+        if let Some(ref order) = self.failover_order {
+            for target in order {
+                if !group_names.contains(target) && !backend_names.contains(target) {
+                    anyhow::bail!(
+                        "failover_order refers to unknown target '{}' (must be a group or backend name)",
+                        target
+                    );
+                }
+                // Enforce: a backend cannot be used as a standalone target in failover_order if it belongs to a group
+                if backend_names.contains(target) && grouped_backends.contains(target) {
+                    anyhow::bail!(
+                        "backend '{}' cannot be used as a standalone target in failover_order because it belongs to a group",
+                        target
+                    );
+                }
+            }
+        }
+
         if let Some(ref ss) = self.inbound.shadowsocks {
             // Validate cipher method is parseable
             ss.method
@@ -175,5 +263,65 @@ impl Config {
                 .map_err(|_| anyhow::anyhow!("unsupported shadowsocks cipher: {}", ss.method))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_config_with_groups() {
+        let cfg = Config {
+            inbound: InboundConfig::default(),
+            backends: vec![
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1 },
+                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, name: Some("b2".to_string()), username: None, password: None, pool_size: 1 },
+            ],
+            groups: vec![
+                GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
+            ],
+            failover_order: Some(vec!["g1".to_string(), "b2".to_string()]),
+            health_check: HealthCheckConfig::default(),
+            web: WebConfig::default(),
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_invalid_duplicate_backend_in_multiple_groups() {
+        let cfg = Config {
+            inbound: InboundConfig::default(),
+            backends: vec![
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1 },
+            ],
+            groups: vec![
+                GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
+                GroupConfig { name: "g2".to_string(), strategy: GroupStrategy::Failover, backends: vec!["b1".to_string()] },
+            ],
+            failover_order: None,
+            health_check: HealthCheckConfig::default(),
+            web: WebConfig::default(),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("cannot be used in multiple groups"));
+    }
+
+    #[test]
+    fn test_invalid_grouped_backend_as_standalone_in_failover_order() {
+        let cfg = Config {
+            inbound: InboundConfig::default(),
+            backends: vec![
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1 },
+            ],
+            groups: vec![
+                GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
+            ],
+            failover_order: Some(vec!["g1".to_string(), "b1".to_string()]),
+            health_check: HealthCheckConfig::default(),
+            web: WebConfig::default(),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("cannot be used as a standalone target"));
     }
 }
