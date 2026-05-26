@@ -26,6 +26,10 @@ amd64:
 server:
 	@echo "Building for AMD64..."
 	RUSTFLAGS="-C target-cpu=x86-64-v2" $(CARGO) build --target=$(AMD64_TARGET) --release
+
+ali:
+	@echo "Building for AMD64..."
+	RUSTFLAGS="-C target-cpu=x86-64-v4" $(CARGO) build --target=$(AMD64_TARGET) --release
 ## Remove build artifacts
 clean:
 	@echo "Cleaning project..."
