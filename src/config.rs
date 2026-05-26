@@ -12,6 +12,7 @@ use serde::Deserialize;
 /// Root configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    #[serde(default)]
     pub inbound: InboundConfig,
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
@@ -21,7 +22,7 @@ pub struct Config {
 }
 
 /// Inbound listener configuration.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct InboundConfig {
     pub socks5: Option<Socks5InboundConfig>,
     pub shadowsocks: Option<ShadowsocksInboundConfig>,
@@ -144,9 +145,6 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.backends.is_empty() {
             anyhow::bail!("at least one backend must be configured");
-        }
-        if self.inbound.socks5.is_none() && self.inbound.shadowsocks.is_none() {
-            anyhow::bail!("at least one inbound (socks5 or shadowsocks) must be configured");
         }
         for (i, backend) in self.backends.iter().enumerate() {
             let label = backend
