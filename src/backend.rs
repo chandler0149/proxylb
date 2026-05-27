@@ -761,10 +761,10 @@ fn push_history(history: &mut VecDeque<HealthCheckResult>, result: HealthCheckRe
 /// so that dynamic load balancing states are kept up-to-date with minimal latency
 /// and completely lock-free for the connection handling worker threads.
 pub async fn run_candidate_selector(pool: BackendPool, cancel: tokio_util::sync::CancellationToken) {
-    let interval = std::time::Duration::from_secs(3);
+    let interval = std::time::Duration::from_secs(1);
     let mut ticker = tokio::time::interval(interval);
 
-    // Skip the immediate tick so we tick 3s later
+    // Skip the immediate tick so we tick 1s later
     ticker.tick().await;
 
     tracing::info!("candidate selector worker started");
