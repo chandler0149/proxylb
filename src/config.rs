@@ -30,11 +30,12 @@ pub struct Config {
 pub enum GroupStrategy {
     UrlTest,
     Failover,
+    LoadBalance,
 }
 
 impl Default for GroupStrategy {
     fn default() -> Self {
-        Self::UrlTest
+        Self::Failover
     }
 }
 

@@ -56,7 +56,6 @@ pub async fn run_health_checker(
     );
 
     let mut ticker = time::interval(interval);
-    ticker.tick().await; // skip the immediate first tick
 
     loop {
         tokio::select! {
@@ -170,9 +169,6 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
     for handle in handles {
         let _ = handle.await;
     }
-
-    // Single-pass candidate pre-calculation after all checks completed
-    pool.recalculate_candidates().await;
 }
 
 /// Perform a minimal HTTP/1.1 GET request on the stream.

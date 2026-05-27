@@ -270,12 +270,21 @@ fn build_groups_and_failover_order(
         }
     } else {
         // Default failover order:
-        // 1. All groups in order of appearance
-        // 2. All backends not in any group in order of appearance
-        for i in 0..groups.len() {
-            failover_order.push(Target::Group(i));
+        // 1. Groups with strategy Failover
+        for (i, g) in groups.iter().enumerate() {
+            if g.strategy == GroupStrategy::Failover {
+                failover_order.push(Target::Group(i));
+            }
         }
 
+        // 2. Groups with strategy UrlTest or LoadBalance
+        for (i, g) in groups.iter().enumerate() {
+            if g.strategy == GroupStrategy::UrlTest || g.strategy == GroupStrategy::LoadBalance {
+                failover_order.push(Target::Group(i));
+            }
+        }
+
+        // 3. Standalone backends (not in any group)
         let mut grouped_indices = std::collections::HashSet::new();
         for g in &groups {
             for &idx in &g.backend_indices {
@@ -338,6 +347,16 @@ fn calculate_candidates(
                         GroupStrategy::Failover => {
                             // Keep configured order
                         }
+                        GroupStrategy::LoadBalance => {
+                            // Sort by total historical connections, then active connections.
+                            group_healthy.sort_by_key(|&(idx, _, _)| {
+                                let tc = &entries[idx].traffic;
+                                (
+                                    tc.total_connections.load(Ordering::Relaxed),
+                                    tc.active_connections.load(Ordering::Relaxed),
+                                )
+                            });
+                        }
                     }
 
                     // Add to final list
@@ -375,12 +394,21 @@ fn calculate_candidates(
                         }
                     }
 
-                    // Sort if urltest, although all are unhealthy, we can still sort by last recorded latency if helpful
+                    // Sort if urltest or loadbalance
                     match group.strategy {
                         GroupStrategy::UrlTest => {
                             group_unhealthy.sort_by_key(|(_, _, lat)| lat.unwrap_or(Duration::MAX));
                         }
                         GroupStrategy::Failover => {}
+                        GroupStrategy::LoadBalance => {
+                            group_unhealthy.sort_by_key(|&(idx, _, _)| {
+                                let tc = &entries[idx].traffic;
+                                (
+                                    tc.total_connections.load(Ordering::Relaxed),
+                                    tc.active_connections.load(Ordering::Relaxed),
+                                )
+                            });
+                        }
                     }
 
                     for (idx, info, _) in group_unhealthy {
@@ -703,6 +731,7 @@ impl BackendPool {
                         let strategy_str = match group.strategy {
                             crate::config::GroupStrategy::Failover => "failover",
                             crate::config::GroupStrategy::UrlTest => "urltest",
+                            crate::config::GroupStrategy::LoadBalance => "loadbalance",
                         }.to_string();
                         
                         tree.push(TreeItem::Group {
@@ -724,6 +753,34 @@ fn push_history(history: &mut VecDeque<HealthCheckResult>, result: HealthCheckRe
         history.pop_front();
     }
     history.push_back(result);
+}
+
+/// Run the background candidate selector task.
+///
+/// Recalculates and updates the cached candidate list periodically (every 3 seconds)
+/// so that dynamic load balancing states are kept up-to-date with minimal latency
+/// and completely lock-free for the connection handling worker threads.
+pub async fn run_candidate_selector(pool: BackendPool, cancel: tokio_util::sync::CancellationToken) {
+    let interval = std::time::Duration::from_secs(3);
+    let mut ticker = tokio::time::interval(interval);
+
+    // Skip the immediate tick so we tick 3s later
+    ticker.tick().await;
+
+    tracing::info!("candidate selector worker started");
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::debug!("candidate selector cancelled");
+                return;
+            }
+            _ = ticker.tick() => {
+                pool.recalculate_candidates().await;
+            }
+        }
+    }
 }
 
 /// Background task that keeps the SOCKS5 connection pool filled for a backend.
@@ -905,5 +962,128 @@ mod tests {
         assert_eq!(healthy.len(), 2);
         assert_eq!(healthy[0].1.name, "b2");
         assert_eq!(healthy[1].1.name, "b1");
+    }
+
+    #[tokio::test]
+    async fn test_loadbalance_strategy() {
+        let b1 = BackendConfig {
+            address: Some("127.0.0.1:8081".to_string()),
+            unix_socket: None,
+            username: None,
+            password: None,
+            name: Some("b1".to_string()),
+            pool_size: 1,
+        };
+        let b2 = BackendConfig {
+            address: Some("127.0.0.1:8082".to_string()),
+            unix_socket: None,
+            username: None,
+            password: None,
+            name: Some("b2".to_string()),
+            pool_size: 1,
+        };
+
+        let g = GroupConfig {
+            name: "group-lb".to_string(),
+            strategy: GroupStrategy::LoadBalance,
+            backends: vec!["b1".to_string(), "b2".to_string()],
+        };
+
+        let pool = BackendPool::new(
+            &[b1, b2],
+            &[g],
+            Some(&vec!["group-lb".to_string()]),
+        ).unwrap();
+
+        // Simulate b1 has more historical connections (total_connections = 10) than b2 (total_connections = 5)
+        {
+            let guard = pool.inner.read().await;
+            guard.entries[0].traffic.total_connections.store(10, Ordering::Relaxed);
+            guard.entries[1].traffic.total_connections.store(5, Ordering::Relaxed);
+        }
+
+        // Recalculate candidates (which runs `calculate_candidates` and caches results)
+        pool.recalculate_candidates().await;
+
+        let (healthy, _) = pool.get_candidates().await;
+        assert_eq!(healthy.len(), 2);
+        // b2 should be first because it has fewer historical connections (5 < 10)
+        assert_eq!(healthy[0].1.name, "b2");
+        assert_eq!(healthy[1].1.name, "b1");
+
+        // Now simulate b2 also getting up to 10 connections, but b1 having fewer active connections
+        {
+            let guard = pool.inner.read().await;
+            guard.entries[1].traffic.total_connections.store(10, Ordering::Relaxed);
+            // b1 active connections = 1, b2 active connections = 2
+            guard.entries[0].traffic.active_connections.store(1, Ordering::Relaxed);
+            guard.entries[1].traffic.active_connections.store(2, Ordering::Relaxed);
+        }
+
+        pool.recalculate_candidates().await;
+        let (healthy, _) = pool.get_candidates().await;
+        assert_eq!(healthy.len(), 2);
+        // b1 should be first because active connections 1 < 2 (since total_connections are equal)
+        assert_eq!(healthy[0].1.name, "b1");
+        assert_eq!(healthy[1].1.name, "b2");
+    }
+
+    #[tokio::test]
+    async fn test_default_global_failover_order() {
+        let b1 = BackendConfig {
+            address: Some("127.0.0.1:8081".to_string()),
+            unix_socket: None,
+            username: None,
+            password: None,
+            name: Some("b1".to_string()),
+            pool_size: 1,
+        };
+        let b2 = BackendConfig {
+            address: Some("127.0.0.1:8082".to_string()),
+            unix_socket: None,
+            username: None,
+            password: None,
+            name: Some("b2".to_string()),
+            pool_size: 1,
+        };
+        let b3 = BackendConfig {
+            address: Some("127.0.0.1:8083".to_string()),
+            unix_socket: None,
+            username: None,
+            password: None,
+            name: Some("b3".to_string()),
+            pool_size: 1,
+        };
+
+        // g1 is loadbalance (dynamic)
+        let g1 = GroupConfig {
+            name: "g-lb".to_string(),
+            strategy: GroupStrategy::LoadBalance,
+            backends: vec!["b1".to_string()],
+        };
+
+        // g2 is failover (static)
+        let g2 = GroupConfig {
+            name: "g-fo".to_string(),
+            strategy: GroupStrategy::Failover,
+            backends: vec!["b2".to_string()],
+        };
+
+        // b3 is standalone (not in any group)
+
+        // When we build the pool WITHOUT failover_order, the default failover order must be:
+        // g-fo (Failover group) first, then g-lb (LoadBalance group) and b3 (standalone)
+        let pool = BackendPool::new(
+            &[b1, b2, b3],
+            &[g1, g2],
+            None, // No explicit failover order
+        ).unwrap();
+
+        let (healthy, _) = pool.get_candidates().await;
+        assert_eq!(healthy.len(), 3);
+        // Order of healthy backends should be: b2 (from g-fo), b1 (from g-lb), b3 (standalone)
+        assert_eq!(healthy[0].1.name, "b2");
+        assert_eq!(healthy[1].1.name, "b1");
+        assert_eq!(healthy[2].1.name, "b3");
     }
 }

@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize backend pool.
     let pool = backend::BackendPool::new(&config.backends, &config.groups, config.failover_order.as_ref())?;
 
-    // Spawn health checker with its own cancellation token.
+    // Spawn health checker and candidate selector background tasks with a shared cancellation token.
     let mut health_cancel = CancellationToken::new();
     {
         let health_pool = pool.clone();
@@ -64,6 +64,12 @@ async fn main() -> anyhow::Result<()> {
         let token = health_cancel.clone();
         tokio::spawn(async move {
             health::run_health_checker(health_pool, health_config, token).await;
+        });
+
+        let selector_pool = pool.clone();
+        let token = health_cancel.clone();
+        tokio::spawn(async move {
+            backend::run_candidate_selector(selector_pool, token).await;
         });
     }
 
@@ -179,8 +185,8 @@ async fn perform_hot_reload(
         }
         Err(e) => {
             tracing::error!(error = %e, "hot reload failed: could not apply new backend config");
-            // Even on failure the old checker is already gone — restart it with
-            // the old pool state so health checking continues.
+            // Even on failure the old checker is already gone — restart both tasks
+            // the old pool state so health checking and candidate selection continue.
             *health_cancel = CancellationToken::new();
             let health_pool = pool.clone();
             let health_config = new_config.health_check.clone();
@@ -188,11 +194,16 @@ async fn perform_hot_reload(
             tokio::spawn(async move {
                 health::run_health_checker(health_pool, health_config, token).await;
             });
+            let selector_pool = pool.clone();
+            let token = health_cancel.clone();
+            tokio::spawn(async move {
+                backend::run_candidate_selector(selector_pool, token).await;
+            });
             return;
         }
     }
 
-    // Start a fresh health checker against the now-consistent pool.
+    // Start a fresh health checker and candidate selector against the now-consistent pool.
     *health_cancel = CancellationToken::new();
     {
         let health_pool = pool.clone();
@@ -200,6 +211,12 @@ async fn perform_hot_reload(
         let token = health_cancel.clone();
         tokio::spawn(async move {
             health::run_health_checker(health_pool, health_config, token).await;
+        });
+
+        let selector_pool = pool.clone();
+        let token = health_cancel.clone();
+        tokio::spawn(async move {
+            backend::run_candidate_selector(selector_pool, token).await;
         });
     }
 }
