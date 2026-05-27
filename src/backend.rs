@@ -160,7 +160,7 @@ pub struct BackendEntry {
 }
 
 /// Serializable backend status for the web API.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BackendStatusView {
     pub name: String,
     pub address: String,
@@ -179,6 +179,22 @@ pub struct BackendStatusView {
     pub pool_stale: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+}
+
+/// Serializable tree node representing routing topology.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum TreeItem {
+    #[serde(rename = "backend")]
+    Backend {
+        status: BackendStatusView,
+    },
+    #[serde(rename = "group")]
+    Group {
+        name: String,
+        strategy: String,
+        backends: Vec<BackendStatusView>,
+    },
 }
 
 /// Result of a single pool acquisition attempt.
@@ -635,6 +651,71 @@ impl BackendPool {
             });
         }
         views
+    }
+
+    /// Get hierarchical status tree of backends for the web dashboard.
+    pub async fn status_tree(&self) -> Vec<TreeItem> {
+        let guard = self.inner.read().await;
+        let mut tree = Vec::with_capacity(guard.failover_order.len());
+        
+        let mut views = Vec::with_capacity(guard.entries.len());
+        for (i, e) in guard.entries.iter().enumerate() {
+            let group_name = guard.groups.iter()
+                .find(|g| g.backend_indices.contains(&i))
+                .map(|g| g.name.clone());
+
+            let status = e.status.lock().unwrap();
+            views.push(BackendStatusView {
+                name: e.info.name.clone(),
+                address: e.info.endpoint.display(),
+                healthy: status.healthy,
+                last_latency_ms: status.last_latency.map(|d| d.as_millis() as u64),
+                consecutive_failures: status.consecutive_failures,
+                history: status.history.iter().cloned().collect(),
+                bytes_up: e.traffic.bytes_up.load(Ordering::Relaxed),
+                bytes_down: e.traffic.bytes_down.load(Ordering::Relaxed),
+                active_connections: e.traffic.active_connections.load(Ordering::Relaxed),
+                total_connections: e.traffic.total_connections.load(Ordering::Relaxed),
+                pool_hits: e.traffic.pool_hits.load(Ordering::Relaxed),
+                pool_misses: e.traffic.pool_misses.load(Ordering::Relaxed),
+                pool_stale: e.traffic.pool_stale.load(Ordering::Relaxed),
+                group: group_name,
+            });
+        }
+
+        for target in &guard.failover_order {
+            match target {
+                Target::Backend(idx) => {
+                    if let Some(status) = views.get(*idx) {
+                        tree.push(TreeItem::Backend {
+                            status: status.clone(),
+                        });
+                    }
+                }
+                Target::Group(g_idx) => {
+                    if let Some(group) = guard.groups.get(*g_idx) {
+                        let mut group_backends = Vec::new();
+                        for &b_idx in &group.backend_indices {
+                            if let Some(status) = views.get(b_idx) {
+                                group_backends.push(status.clone());
+                            }
+                        }
+                        let strategy_str = match group.strategy {
+                            crate::config::GroupStrategy::Failover => "failover",
+                            crate::config::GroupStrategy::UrlTest => "urltest",
+                        }.to_string();
+                        
+                        tree.push(TreeItem::Group {
+                            name: group.name.clone(),
+                            strategy: strategy_str,
+                            backends: group_backends,
+                        });
+                    }
+                }
+            }
+        }
+        
+        tree
     }
 }
 

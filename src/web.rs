@@ -18,6 +18,7 @@ use crate::backend::BackendPool;
 #[derive(Serialize)]
 struct ApiResponse {
     backends: Vec<crate::backend::BackendStatusView>,
+    tree: Vec<crate::backend::TreeItem>,
 }
 
 /// Create the axum router.
@@ -40,13 +41,16 @@ pub async fn run_web_server(listen_addr: String, pool: BackendPool) -> anyhow::R
 /// JSON API endpoint: GET /api/status
 async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
     let backends = pool.status_views().await;
-    Json(ApiResponse { backends })
+    let tree = pool.status_tree().await;
+    Json(ApiResponse { backends, tree })
 }
 
 /// HTML dashboard: GET /
 async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
     let backends = pool.status_views().await;
+    let tree = pool.status_tree().await;
     let backends_json = serde_json::to_string(&backends).unwrap_or_else(|_| "[]".to_string());
+    let tree_json = serde_json::to_string(&tree).unwrap_or_else(|_| "[]".to_string());
 
     let html = format!(
         r##"<!DOCTYPE html>
@@ -718,6 +722,101 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             .grid {{ grid-template-columns: 1fr; }}
             .traffic-row {{ grid-template-columns: repeat(2, 1fr); }}
         }}
+
+        /* Tree layout styling */
+        .tree-root {{
+            display: flex;
+            flex-direction: column;
+            gap: 2.5rem;
+            position: relative;
+            padding-left: 1.8rem;
+            margin-bottom: 3rem;
+        }}
+
+        .tree-root::before {{
+            content: '';
+            position: absolute;
+            left: 0.2rem;
+            top: 24px;
+            bottom: 24px;
+            width: 2px;
+            background: linear-gradient(to bottom, var(--accent-blue), rgba(255, 255, 255, 0.05));
+            border-radius: 1px;
+        }}
+
+        .tree-node-wrapper {{
+            position: relative;
+        }}
+
+        .tree-node-wrapper::before {{
+            content: '';
+            position: absolute;
+            left: -1.6rem;
+            top: 24px;
+            width: 1.6rem;
+            height: 2px;
+            background: var(--border-subtle);
+        }}
+
+        .tree-root > .tree-node-wrapper:first-child::before {{
+            background: var(--accent-blue);
+        }}
+
+        .tree-group-card {{
+            background: var(--bg-card);
+            border: 1px solid var(--border-subtle);
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: var(--shadow-glow);
+            backdrop-filter: blur(12px);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }}
+
+        .tree-group-card:hover {{
+            border-color: rgba(0, 176, 255, 0.4);
+            box-shadow: 0 0 30px rgba(0, 176, 255, 0.1);
+        }}
+
+        .tree-group-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border-subtle);
+            padding-bottom: 0.8rem;
+        }}
+
+        .tree-group-title {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }}
+
+        .tree-group-strategy {{
+            font-size: 0.8rem;
+            font-family: var(--font-mono);
+            text-transform: uppercase;
+            background: rgba(0, 176, 255, 0.1);
+            color: var(--accent-blue);
+            border: 1px solid rgba(0, 176, 255, 0.2);
+            padding: 3px 10px;
+            border-radius: 12px;
+        }}
+
+        .tree-group-children {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+            gap: 1.5rem;
+        }}
+
+        @media (max-width: 900px) {{
+            .tree-group-children {{
+                grid-template-columns: 1fr;
+            }}
+        }}
     </style>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
 </head>
@@ -755,15 +854,16 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             </div>
         </div>
 
-        <!-- Detailed Backends Grid -->
+        <!-- Hierarchical Routing Tree -->
         <div>
-            <h2 class="backends-title">🔗 Load Balancer Backends</h2>
-            <div class="grid" id="grid" style="margin-top: 1rem;"></div>
+            <h2 class="backends-title">🌳 Routing Hierarchy (Global Failover Tree)</h2>
+            <div class="tree-root" id="tree-root-container" style="margin-top: 1.5rem;"></div>
         </div>
     </div>
 
     <script>
         let backendsData = {backends_json};
+        let treeData = {tree_json};
 
         // Harmonious UI HSL colors for backends
         const palette = [
@@ -975,16 +1075,29 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             }}
         }}
 
-        function render(backends) {{
-            renderSummary(backends);
+        function renderBackendCard(b) {{
+            const hitRate = (b.pool_hits + b.pool_misses + b.pool_stale) > 0 
+                ? ((b.pool_hits / (b.pool_hits + b.pool_misses + b.pool_stale)) * 100).toFixed(1) + '% hit rate' 
+                : 'no requests yet';
 
-            const grid = document.getElementById('grid');
-            if (!backends || backends.length === 0) {{
-                grid.innerHTML = '<div class="empty-state">No backends configured</div>';
-                return;
-            }}
+            const poolStatsHtml = `
+                <div class="pool-item">
+                    <span class="pool-label">Pool Hits</span>
+                    <span class="pool-value hit">${{b.pool_hits}}</span>
+                    <span class="pool-hit-rate">${{hitRate}}</span>
+                </div>
+                <div class="pool-item">
+                    <span class="pool-label">Pool Misses</span>
+                    <span class="pool-value miss">${{b.pool_misses}}</span>
+                    <span class="pool-hit-rate">pool empty \u2192 fresh</span>
+                </div>
+                <div class="pool-item">
+                    <span class="pool-label">Stale Evicted</span>
+                    <span class="pool-value stale">${{b.pool_stale}}</span>
+                    <span class="pool-hit-rate">dead \u2192 replaced</span>
+                </div>`;
 
-            grid.innerHTML = backends.map(b => `
+            return `
                 <div class="card">
                     <div class="card-header">
                         <div>
@@ -1002,7 +1115,7 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                     <div class="metrics">
                         <div class="metric">
                             <span class="metric-label">Latency</span>
-                            <span class="metric-value">${{b.last_latency_ms != null ? b.last_latency_ms + ' ms' : '—'}}</span>
+                            <span class="metric-value">${{b.last_latency_ms != null ? b.last_latency_ms + ' ms' : '\u2014'}}</span>
                         </div>
                         <div class="metric">
                             <span class="metric-label">Failures</span>
@@ -1028,7 +1141,7 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                         </div>
                     </div>
                     <div class="pool-row">
-                        ${{poolStats(b)}}
+                        ${{poolStatsHtml}}
                     </div>
                     <div>
                         <div class="history-title" style="margin-bottom: 0.5rem;">Recent Health Checks</div>
@@ -1040,20 +1153,58 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                                 ${{b.history.slice().reverse().map(h => `
                                     <tr>
                                         <td>${{formatTime(h.timestamp)}}</td>
-                                        <td class="${{h.success ? 'history-success' : 'history-fail'}}">${{h.success ? '✓ OK' : '✗ FAIL'}}</td>
-                                        <td>${{h.latency_ms != null ? h.latency_ms + ' ms' : '—'}}</td>
-                                        <td class="error-text" title="${{h.error || ''}}">${{h.error || '—'}}</td>
+                                        <td class="${{h.success ? 'history-success' : 'history-fail'}}">${{h.success ? '\u2713 OK' : '\u2717 FAIL'}}</td>
+                                        <td>${{h.latency_ms != null ? h.latency_ms + ' ms' : '\u2014'}}</td>
+                                        <td class="error-text" title="${{h.error || ''}}">${{h.error || '\u2014'}}</td>
                                     </tr>
                                 `).join('')}}
                             </tbody>
                         </table>
                     </div>
                 </div>
-            `).join('');
+            `;
+        }}
+
+        function render(backends, tree) {{
+            renderSummary(backends);
+
+            const container = document.getElementById('tree-root-container');
+            if (!tree || tree.length === 0) {{
+                container.innerHTML = '<div class="empty-state">No routing hierarchy configured</div>';
+                return;
+            }}
+
+            container.innerHTML = tree.map((item, index) => {{
+                if (item.type === 'backend') {{
+                    const b = item.status;
+                    return `
+                        <div class="tree-node-wrapper">
+                            ${{renderBackendCard(b)}}
+                        </div>
+                    `;
+                }} else if (item.type === 'group') {{
+                    return `
+                        <div class="tree-node-wrapper">
+                            <div class="tree-group-card">
+                                <div class="tree-group-header">
+                                    <div class="tree-group-title">
+                                        <span>📂 Group: ${{item.name}}</span>
+                                    </div>
+                                    <span class="tree-group-strategy">${{item.strategy}}</span>
+                                </div>
+                                <div class="tree-group-children">
+                                    ${{item.backends.map(b => renderBackendCard(b)).join('')}}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }}
+                return '';
+            }}).join('');
         }}
 
         // Initial render
-        render(backendsData);
+        render(backendsData, treeData);
 
         // Auto-refresh every 5 seconds.
         setInterval(async () => {{
@@ -1061,7 +1212,8 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                 const resp = await fetch('/api/status');
                 const data = await resp.json();
                 backendsData = data.backends;
-                render(backendsData);
+                treeData = data.tree;
+                render(backendsData, treeData);
             }} catch(e) {{
                 console.error('Refresh failed:', e);
             }}
