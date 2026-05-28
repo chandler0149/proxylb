@@ -51,4 +51,6 @@ arc-swap = "1.9.1"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+panic = 'abort'
 strip = true
+overflow-checks = false

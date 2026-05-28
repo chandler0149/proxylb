@@ -24,12 +24,16 @@ inbound:
 backends:
   - address: "127.0.0.1:10800"
     name: "backend-us-1"
-    pool_size: 5
+    pool_size: 6
     # username: "user1"
     # password: "pass1"
 
   - address: "127.0.0.1:10801"
     name: "backend-us-2"
+    pool_size: 5
+
+  - address: "127.0.0.1:10800"
+    name: "backend-us-3"
     pool_size: 5
 
   - address: "127.0.0.1:10802"
@@ -55,6 +59,7 @@ groups:
     backends:
       - "backend-us-1"
       - "backend-us-2"
+      - "backend-us-3"
 
   - name: "group-eu"
     strategy: "failover"

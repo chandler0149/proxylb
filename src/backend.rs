@@ -501,7 +501,28 @@ impl BackendPool {
                 // Reuse the existing entry — just update pool_size on the info.
                 // We swap it out of the vec to move it into new_entries.
                 let mut entry = guard.entries.swap_remove(pos);
-                entry.info = new_info; // picks up any pool_size / auth changes
+                
+                let creds_or_pool_changed = entry.info.username != new_info.username
+                    || entry.info.password != new_info.password
+                    || entry.info.pool_size != new_info.pool_size;
+
+                entry.info = new_info.clone();
+
+                if creds_or_pool_changed {
+                    // Cancel old refill task
+                    entry.cancel.cancel();
+
+                    // Create fresh cancel token and channel
+                    let new_cancel = CancellationToken::new();
+                    let (tx, rx) = flume::bounded(new_info.pool_size.max(1));
+
+                    entry.pool_rx = rx;
+                    entry.cancel = new_cancel.clone();
+
+                    // Spawn the new refill task with new configuration and channel
+                    tokio::spawn(refill_pool_task(new_info, tx, new_cancel));
+                }
+
                 new_entries.push(entry);
                 kept += 1;
             } else {
@@ -1085,5 +1106,120 @@ mod tests {
         assert_eq!(healthy[0].1.name, "b2");
         assert_eq!(healthy[1].1.name, "b1");
         assert_eq!(healthy[2].1.name, "b3");
+    }
+
+    #[tokio::test]
+    async fn test_reload_adds_backend_to_group() {
+        let b1 = BackendConfig {
+            address: Some("127.0.0.1:8081".to_string()),
+            unix_socket: None,
+            username: None,
+            password: None,
+            name: Some("b1".to_string()),
+            pool_size: 1,
+        };
+        let b2 = BackendConfig {
+            address: Some("127.0.0.1:8082".to_string()),
+            unix_socket: None,
+            username: None,
+            password: None,
+            name: Some("b2".to_string()),
+            pool_size: 1,
+        };
+
+        let g1 = GroupConfig {
+            name: "group-1".to_string(),
+            strategy: GroupStrategy::Failover,
+            backends: vec!["b1".to_string()],
+        };
+
+        let pool = BackendPool::new(
+            &[b1.clone()],
+            &[g1.clone()],
+            Some(&vec!["group-1".to_string()]),
+        ).unwrap();
+
+        let (healthy, _) = pool.get_candidates().await;
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].1.name, "b1");
+
+        // Reload with b2 added and b2 added to group-1
+        let g1_new = GroupConfig {
+            name: "group-1".to_string(),
+            strategy: GroupStrategy::Failover,
+            backends: vec!["b1".to_string(), "b2".to_string()],
+        };
+
+        let (added, removed, kept) = pool.reload(
+            &[b1, b2],
+            &[g1_new],
+            Some(&vec!["group-1".to_string()]),
+        ).await.unwrap();
+
+        assert_eq!(added, 1);
+        assert_eq!(removed, 0);
+        assert_eq!(kept, 1);
+
+        let (healthy, _) = pool.get_candidates().await;
+        assert_eq!(healthy.len(), 2);
+        assert_eq!(healthy[0].1.name, "b1");
+        assert_eq!(healthy[1].1.name, "b2");
+    }
+
+    #[tokio::test]
+    async fn test_reload_restarts_refill_task_on_config_change() {
+        let b1 = BackendConfig {
+            address: Some("127.0.0.1:8081".to_string()),
+            unix_socket: None,
+            username: None,
+            password: None,
+            name: Some("b1".to_string()),
+            pool_size: 1,
+        };
+
+        let pool = BackendPool::new(
+            &[b1.clone()],
+            &[],
+            None,
+        ).unwrap();
+
+        let original_cancel = {
+            let guard = pool.inner.read().await;
+            assert_eq!(guard.entries[0].info.pool_size, 1);
+            assert_eq!(guard.entries[0].info.username, None);
+            guard.entries[0].cancel.clone()
+        };
+
+        // Reload with b1 having updated pool_size and credentials
+        let b1_updated = BackendConfig {
+            address: Some("127.0.0.1:8081".to_string()),
+            unix_socket: None,
+            username: Some("new-user".to_string()),
+            password: Some("new-pass".to_string()),
+            name: Some("b1".to_string()),
+            pool_size: 3,
+        };
+
+        let (added, removed, kept) = pool.reload(
+            &[b1_updated],
+            &[],
+            None,
+        ).await.unwrap();
+
+        assert_eq!(added, 0);
+        assert_eq!(removed, 0);
+        assert_eq!(kept, 1);
+
+        let guard = pool.inner.read().await;
+        assert_eq!(guard.entries[0].info.pool_size, 3);
+        assert_eq!(guard.entries[0].info.username.as_deref(), Some("new-user"));
+        assert_eq!(guard.entries[0].info.password.as_deref(), Some("new-pass"));
+
+        let new_cancel = guard.entries[0].cancel.clone();
+        
+        // Assert the old refill task cancellation token is cancelled
+        assert!(original_cancel.is_cancelled());
+        // Assert the new refill task cancellation token is NOT cancelled
+        assert!(!new_cancel.is_cancelled());
     }
 }
