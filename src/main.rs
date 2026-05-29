@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+use tracing_appender::non_blocking::WorkerGuard;
 
 /// ProxyLB — SOCKS5 Proxy Load Balancer with Shadowsocks support.
 #[derive(Parser, Debug)]
@@ -41,15 +42,11 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
-        )
-        .with_target(false)
-        .with_timer(tracing_subscriber::fmt::time::time())
-        .init();
+    // Initialize async (non-blocking) tracing.
+    // The worker guard MUST be kept alive for the entire lifetime of main();
+    // dropping it early will shut down the background I/O thread and lose
+    // buffered log lines.
+    let _log_guard: WorkerGuard = init_tracing(&args.log_level);
 
     tracing::info!("ProxyLB starting...");
 
@@ -261,4 +258,26 @@ fn warn_if_inbounds_changed(old: &[config::InboundItemConfig], new: &[config::In
     }
 }
 
+/// Initialise a non-blocking tracing subscriber that writes to stderr.
+///
+/// A dedicated background thread performs all I/O so that log calls on the
+/// hot proxy path are reduced to a single lock-free channel send.
+///
+/// The returned [`WorkerGuard`] **must** be stored in a binding that lives for
+/// the entire duration of `main`; dropping it earlier shuts down the I/O
+/// thread and may lose buffered log lines.
+fn init_tracing(log_level: &str) -> tracing_appender::non_blocking::WorkerGuard {
+    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
 
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(log_level)),
+        )
+        .with_target(false)
+        .with_timer(tracing_subscriber::fmt::time::time())
+        .init();
+
+    guard
+}
