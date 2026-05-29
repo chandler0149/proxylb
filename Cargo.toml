@@ -17,6 +17,8 @@ fast-socks5 = "1.0.0"
 # Web dashboard
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
+httparse = "1.10.1"
+
 
 # Serialization / config
 serde = { version = "1", features = ["derive"] }
@@ -44,6 +46,9 @@ flume = "0.12"
 # Task cancellation (CancellationToken) for hot reload
 tokio-util = { version = "0.7.18", features = ["rt"] }
 arc-swap = "1.9.1"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.7"
 
 
 

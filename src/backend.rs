@@ -221,6 +221,28 @@ pub enum Target {
     Group(usize),
 }
 
+#[derive(Debug)]
+pub struct InboundStats {
+    pub name: String,
+    pub listen: String,
+    pub inbound_type: String,
+    pub total_connections: AtomicU64,
+    pub active_connections: AtomicI64,
+    pub tx_bytes: AtomicU64,
+    pub rx_bytes: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InboundStatsView {
+    pub name: String,
+    pub listen: String,
+    pub inbound_type: String,
+    pub total_connections: u64,
+    pub active_connections: i64,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+}
+
 struct BackendPoolInner {
     entries: Vec<BackendEntry>,
     groups: Vec<Group>,
@@ -237,6 +259,7 @@ pub struct CachedCandidates {
 pub struct BackendPool {
     inner: Arc<RwLock<BackendPoolInner>>,
     cached: Arc<ArcSwap<CachedCandidates>>,
+    pub inbound_stats: Arc<std::sync::Mutex<Vec<Arc<InboundStats>>>>,
 }
 
 fn build_groups_and_failover_order(
@@ -464,7 +487,49 @@ impl BackendPool {
                 failover_order,
             })),
             cached,
+            inbound_stats: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
+    }
+
+    /// Register a new inbound listener dynamically or return existing stats if already registered.
+    pub fn register_inbound(
+        &self,
+        name: String,
+        listen: String,
+        inbound_type: String,
+    ) -> Arc<InboundStats> {
+        let mut stats_list = self.inbound_stats.lock().unwrap();
+        if let Some(existing) = stats_list.iter().find(|s| s.listen == listen) {
+            return Arc::clone(existing);
+        }
+        let stats = Arc::new(InboundStats {
+            name,
+            listen,
+            inbound_type,
+            total_connections: AtomicU64::new(0),
+            active_connections: AtomicI64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+        });
+        stats_list.push(Arc::clone(&stats));
+        stats
+    }
+
+    /// Retrieve a snapshot of the stats for all registered inbounds.
+    pub fn get_inbound_stats(&self) -> Vec<InboundStatsView> {
+        let stats_list = self.inbound_stats.lock().unwrap();
+        stats_list
+            .iter()
+            .map(|s| InboundStatsView {
+                name: s.name.clone(),
+                listen: s.listen.clone(),
+                inbound_type: s.inbound_type.clone(),
+                total_connections: s.total_connections.load(Ordering::Relaxed),
+                active_connections: s.active_connections.load(Ordering::Relaxed),
+                tx_bytes: s.tx_bytes.load(Ordering::Relaxed),
+                rx_bytes: s.rx_bytes.load(Ordering::Relaxed),
+            })
+            .collect()
     }
 
     /// Hot-reload the backend list from new configs.

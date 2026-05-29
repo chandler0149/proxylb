@@ -4,23 +4,25 @@
 //! command execution disabled — we intercept the target address and
 //! forward through our SOCKS5h backend pool instead of connecting directly.
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use fast_socks5::server::{Config, DenyAuthentication, Socks5Socket};
 use fast_socks5::util::target_addr::TargetAddr as FastTargetAddr;
 use fast_socks5::consts;
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::backend::{BackendPool, TrafficCounters};
-use crate::outbound::{socks5h_connect, socks5h_connect_target, BackendStream, TargetAddr};
-use crate::relay;
+use crate::backend::BackendPool;
+use crate::outbound::TargetAddr;
 
 
 /// Run the SOCKS5 inbound listener.
-pub async fn run_socks5_inbound(listen_addr: String, pool: BackendPool) -> anyhow::Result<()> {
+pub async fn run_socks5_inbound(
+    listen_addr: String,
+    pool: BackendPool,
+    stats: Arc<crate::backend::InboundStats>,
+    filter_enabled: bool,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&listen_addr).await?;
     tracing::info!(listen = %listen_addr, "SOCKS5 inbound listener started");
 
@@ -28,9 +30,10 @@ pub async fn run_socks5_inbound(listen_addr: String, pool: BackendPool) -> anyho
         match listener.accept().await {
             Ok((stream, client_addr)) => {
                 let pool = pool.clone();
+                let stats = Arc::clone(&stats);
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
-                    if let Err(e) = handle_socks5_connection(stream, pool).await {
+                    if let Err(e) = handle_socks5_connection(stream, pool, stats, filter_enabled).await {
                         tracing::debug!(
                             client = %client_addr,
                             error = %e,
@@ -52,8 +55,14 @@ pub async fn run_socks5_inbound(listen_addr: String, pool: BackendPool) -> anyho
 /// so it performs the auth handshake and reads the CONNECT request, but does NOT
 /// connect to the target or do DNS resolution. We then take the target address
 /// and forward through our backend pool.
-async fn handle_socks5_connection(stream: TcpStream, pool: BackendPool) -> anyhow::Result<()> {
+async fn handle_socks5_connection(
+    stream: TcpStream,
+    pool: BackendPool,
+    stats: Arc<crate::backend::InboundStats>,
+    filter_enabled: bool,
+) -> anyhow::Result<()> {
     // Configure fast-socks5 to NOT execute the command or resolve DNS.
+
     let mut config = Config::<DenyAuthentication>::default();
     config.set_execute_command(false);
     config.set_dns_resolve(false);
@@ -83,127 +92,39 @@ async fn handle_socks5_connection(stream: TcpStream, pool: BackendPool) -> anyho
 
     tracing::debug!(target = %target, "SOCKS5 CONNECT request");
 
+    let is_private = crate::inbound::is_private_target(&target).await;
+    if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
+        tracing::warn!(target = %target, "SOCKS5 connection rejected: private target");
+        let mut client_stream = socks5_socket.into_inner();
+        let reply = build_socks5_reply(0x02); // Connection not allowed by ruleset
+        let _ = client_stream.write_all(&reply).await;
+        return Ok(());
+    }
+
+
     // Get the raw stream back from the socks5 socket.
     let mut client_stream = socks5_socket.into_inner();
 
+
     // Try backends in order with fallback.
-    let backend_timeout = Duration::from_secs(10);
-    let (healthy_candidates, unhealthy_candidates) = pool.get_candidates().await;
-
-    let mut backend_stream: Option<BackendStream> = None;
-    // Traffic Arc carried from pool acquisition — zero additional RwLock reads on the hot path.
-    let mut chosen_traffic: Option<Arc<TrafficCounters>> = None;
-
-    // First pass: try healthy backends.
-    for (index, info) in &healthy_candidates {
-        // Single RwLock read: yields both the pooled stream (if any) and the traffic Arc.
-        let pc = pool.get_pooled_connection(*index).await;
-        let (pool_stream, traffic) = match pc {
-            Some(pc) => (pc.stream, Some(pc.traffic)),
-            None => (None, None), // OOB — never happens
-        };
-
-        let conn_res = match pool_stream {
-            Some(stream) => {
-                tracing::debug!(backend = %info.name, "using pooled connection");
-                match socks5h_connect_target(stream, &target).await {
-                    Ok(s) => {
-                        if let Some(ref tc) = traffic {
-                            tc.pool_hits.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(s)
-                    }
-                    Err(e) => {
-                        if let Some(ref tc) = traffic {
-                            tc.pool_stale.fetch_add(1, Ordering::Relaxed);
-                        }
-                        tracing::debug!(
-                            backend = %info.name,
-                            error = %e,
-                            "pooled connection was stale, retrying with fresh connection"
-                        );
-                        socks5h_connect(info, &target, backend_timeout).await
-                    }
-                }
-            }
-            None => {
-                if let Some(ref tc) = traffic {
-                    tc.pool_misses.fetch_add(1, Ordering::Relaxed);
-                }
-                socks5h_connect(info, &target, backend_timeout).await
-            }
-        };
-
-        match conn_res {
-            Ok(stream) => {
-                tracing::debug!(backend = %info.name, target = %target, "connected through backend");
-                backend_stream = Some(stream);
-                chosen_traffic = traffic;
-                break;
-            }
-            Err(e) => {
-                tracing::debug!(backend = %info.name, error = %e, "backend connect failed, trying next");
-                pool.mark_unhealthy(*index, &format!("connect failed: {}", e))
-                    .await;
-            }
-        }
-    }
-
-    // Second pass: try unhealthy backends as last resort.
-    // Rare slow-path: one extra get_traffic_counters call is acceptable here.
-    if backend_stream.is_none() {
-        for (index, info) in &unhealthy_candidates {
-            if let Ok(stream) = socks5h_connect(info, &target, backend_timeout).await {
-                tracing::debug!(backend = %info.name, target = %target, "connected through unhealthy backend (fallback)");
-                backend_stream = Some(stream);
-                chosen_traffic = pool.get_traffic_counters(*index).await;
-                break;
-            }
-        }
-    }
-
-    let mut backend_stream = match backend_stream {
-        Some(s) => s,
-        None => {
-            tracing::warn!(target = %target, "all backends failed");
+    let (backend_stream, chosen_traffic) = match crate::inbound::route_and_connect(&pool, &target).await {
+        Ok((s, t)) => (s, t),
+        Err(e) => {
+            tracing::warn!(target = %target, error = %e, "all backends failed");
             let reply = build_socks5_reply(consts::SOCKS5_REPLY_HOST_UNREACHABLE);
             let _ = client_stream.write_all(&reply).await;
             return Ok(());
         }
     };
 
+
     // Send SOCKS5 success reply to the client.
     let reply = build_socks5_reply(consts::SOCKS5_REPLY_SUCCEEDED);
     client_stream.write_all(&reply).await?;
     client_stream.flush().await?;
 
-    // All remaining counter updates go through the Arc — zero RwLock reads from here on.
-    if let Some(ref tc) = chosen_traffic {
-        tc.total_connections.fetch_add(1, Ordering::Relaxed);
-        tc.active_connections.fetch_add(1, Ordering::Relaxed);
-    }
+    crate::inbound::relay_and_track(client_stream, backend_stream, chosen_traffic, Some(stats), &target, "SOCKS5").await
 
-    // Bidirectional relay.
-    match relay::relay(&mut client_stream, &mut backend_stream).await {
-        Ok((up, down)) => {
-            tracing::debug!(target = %target, up_bytes = up, down_bytes = down, "SOCKS5 relay complete");
-            if let Some(ref tc) = chosen_traffic {
-                tc.bytes_up.fetch_add(up, Ordering::Relaxed);
-                tc.bytes_down.fetch_add(down, Ordering::Relaxed);
-            }
-        }
-        Err(e) => {
-            tracing::debug!(target = %target, error = %e, "SOCKS5 relay error");
-        }
-    }
-    if let Some(ref tc) = chosen_traffic {
-        tc.active_connections.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    let _ = client_stream.shutdown().await;
-    let _ = backend_stream.shutdown().await;
-
-    Ok(())
 }
 
 /// Build a minimal SOCKS5 reply: VER=5, REP, RSV=0, ATYP=IPv4, BND.ADDR=0.0.0.0, BND.PORT=0

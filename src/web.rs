@@ -14,11 +14,57 @@ use serde::Serialize;
 
 use crate::backend::BackendPool;
 
+/// Memory statistics.
+#[derive(Serialize, Clone, Copy, Debug)]
+pub struct MemoryStats {
+    pub rss: u64,
+    pub vmsize: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_memory_usage() -> MemoryStats {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    let mut rss = 0;
+    let mut vmsize = 0;
+
+    if let Ok(file) = File::open("/proc/self/status") {
+        let reader = BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.starts_with("VmRSS:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<u64>() {
+                        rss = kb * 1024;
+                    }
+                }
+            } else if line.starts_with("VmSize:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<u64>() {
+                        vmsize = kb * 1024;
+                    }
+                }
+            }
+        }
+    }
+
+    MemoryStats { rss, vmsize }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_memory_usage() -> MemoryStats {
+    MemoryStats { rss: 0, vmsize: 0 }
+}
+
 /// JSON API response.
 #[derive(Serialize)]
 struct ApiResponse {
     backends: Vec<crate::backend::BackendStatusView>,
     tree: Vec<crate::backend::TreeItem>,
+    memory: MemoryStats,
+    inbounds: Vec<crate::backend::InboundStatsView>,
 }
 
 /// Create the axum router.
@@ -42,15 +88,26 @@ pub async fn run_web_server(listen_addr: String, pool: BackendPool) -> anyhow::R
 async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
     let backends = pool.status_views().await;
     let tree = pool.status_tree().await;
-    Json(ApiResponse { backends, tree })
+    let memory = get_memory_usage();
+    let inbounds = pool.get_inbound_stats();
+    Json(ApiResponse {
+        backends,
+        tree,
+        memory,
+        inbounds,
+    })
 }
 
 /// HTML dashboard: GET /
 async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
     let backends = pool.status_views().await;
     let tree = pool.status_tree().await;
+    let memory = get_memory_usage();
+    let inbounds = pool.get_inbound_stats();
     let backends_json = serde_json::to_string(&backends).unwrap_or_else(|_| "[]".to_string());
     let tree_json = serde_json::to_string(&tree).unwrap_or_else(|_| "[]".to_string());
+    let memory_json = serde_json::to_string(&memory).unwrap_or_else(|_| "{}".to_string());
+    let inbounds_json = serde_json::to_string(&inbounds).unwrap_or_else(|_| "[]".to_string());
 
     let html = format!(
         r##"<!DOCTYPE html>
@@ -81,6 +138,107 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
+        }}
+
+        .inbounds-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 1.5rem;
+        }}
+
+        .inbound-card {{
+            background: var(--bg-card);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border-subtle);
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: var(--shadow-glow);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }}
+
+        .inbound-card:hover {{
+            transform: translateY(-4px);
+            border-color: rgba(0, 176, 255, 0.3);
+            box-shadow: 0 16px 48px 0 rgba(0, 176, 255, 0.15);
+        }}
+
+        .inbound-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+
+        .inbound-badge {{
+            font-size: 0.75rem;
+            font-family: var(--font-mono);
+            text-transform: uppercase;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-weight: 700;
+        }}
+
+        .inbound-badge.socks5 {{
+            background: rgba(0, 176, 255, 0.1);
+            color: var(--accent-blue);
+            border: 1px solid rgba(0, 176, 255, 0.2);
+        }}
+
+        .inbound-badge.shadowsocks {{
+            background: rgba(163, 112, 247, 0.1);
+            color: #a370f7;
+            border: 1px solid rgba(163, 112, 247, 0.2);
+        }}
+
+        .inbound-badge.http {{
+            background: rgba(0, 230, 118, 0.1);
+            color: var(--accent-green);
+            border: 1px solid rgba(0, 230, 118, 0.2);
+        }}
+
+        .inbound-title {{
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }}
+
+        .inbound-address {{
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }}
+
+        .inbound-stats-list {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            border-top: 1px solid var(--border-subtle);
+            padding-top: 12px;
+        }}
+
+        .inbound-stat-item {{
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }}
+
+        .inbound-stat-label {{
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+
+        .inbound-stat-value {{
+            font-size: 0.95rem;
+            font-weight: 600;
+            font-family: var(--font-mono);
+            color: var(--text-primary);
         }}
 
         body {{
@@ -854,6 +1012,14 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             </div>
         </div>
 
+        <!-- Active Inbounds Statistics -->
+        <div>
+            <h2 class="backends-title">🔌 Active Inbound Listeners</h2>
+            <div class="inbounds-grid" id="inbounds-grid" style="margin-top: 1.5rem;">
+                <!-- Dynamic inbound listener cards will be injected here -->
+            </div>
+        </div>
+
         <!-- Hierarchical Routing Tree -->
         <div>
             <h2 class="backends-title">🌳 Routing Hierarchy (Global Failover Tree)</h2>
@@ -864,6 +1030,8 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
     <script>
         let backendsData = {backends_json};
         let treeData = {tree_json};
+        let memoryData = {memory_json};
+        let inboundsData = {inbounds_json};
 
         // Harmonious UI HSL colors for backends
         const palette = [
@@ -914,7 +1082,7 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                 </div>`;
         }}
 
-        function renderSummary(backends) {{
+        function renderSummary(backends, memory) {{
             const summaryGrid = document.getElementById('summary-grid');
             if (!backends || backends.length === 0) {{
                 summaryGrid.innerHTML = '';
@@ -1007,6 +1175,32 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                     </div>
                 </div>
             `;
+
+            const memoryHtml = (memory && memory.rss > 0) ? `
+                <!-- Memory Footprint Card -->
+                <div class="summary-card">
+                    <div class="summary-card-header">
+                        <span class="summary-card-title">Memory Footprint</span>
+                        <span class="summary-card-icon">🧠</span>
+                    </div>
+                    <div class="summary-card-value">${{formatBytes(memory.rss)}}</div>
+                    <div class="summary-card-subtext">
+                        Virtual Size: ${{formatBytes(memory.vmsize)}}
+                    </div>
+                </div>` : `
+                <!-- Memory Footprint Card -->
+                <div class="summary-card">
+                    <div class="summary-card-header">
+                        <span class="summary-card-title">Memory Footprint</span>
+                        <span class="summary-card-icon">🧠</span>
+                    </div>
+                    <div class="summary-card-value">N/A</div>
+                    <div class="summary-card-subtext">
+                        Only available on Linux
+                    </div>
+                </div>`;
+
+            summaryGrid.innerHTML += memoryHtml;
 
             // Render Traffic Allocation Share
             const distCard = document.getElementById('distribution-card');
@@ -1165,8 +1359,47 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             `;
         }}
 
-        function render(backends, tree) {{
-            renderSummary(backends);
+        function renderInbounds(inbounds) {{
+            const grid = document.getElementById('inbounds-grid');
+            if (!inbounds || inbounds.length === 0) {{
+                grid.innerHTML = '<div class="empty-state">No inbound listeners configured</div>';
+                return;
+            }}
+            grid.innerHTML = inbounds.map(i => {{
+                const badgeClass = i.inbound_type.toLowerCase();
+                return `
+                    <div class="inbound-card">
+                        <div class="inbound-header">
+                            <div class="inbound-title">\uD83D\uDD0C ${{i.name}}</div>
+                            <span class="inbound-badge ${{badgeClass}}">${{i.inbound_type}}</span>
+                        </div>
+                        <div class="inbound-address">Listen: ${{i.listen}}</div>
+                        <div class="inbound-stats-list">
+                            <div class="inbound-stat-item">
+                                <span class="inbound-stat-label">Active Conn</span>
+                                <span class="inbound-stat-value" style="color: var(--accent-blue);">${{i.active_connections}}</span>
+                            </div>
+                            <div class="inbound-stat-item">
+                                <span class="inbound-stat-label">Total Conn</span>
+                                <span class="inbound-stat-value">${{i.total_connections}}</span>
+                            </div>
+                            <div class="inbound-stat-item" style="border-top: 1px solid rgba(255,255,255,0.03); padding-top: 8px;">
+                                <span class="inbound-stat-label">Uploaded</span>
+                                <span class="inbound-stat-value" style="color: #ffa726;">${{formatBytes(i.tx_bytes)}}</span>
+                            </div>
+                            <div class="inbound-stat-item" style="border-top: 1px solid rgba(255,255,255,0.03); padding-top: 8px;">
+                                <span class="inbound-stat-label">Downloaded</span>
+                                <span class="inbound-stat-value" style="color: var(--accent-green);">${{formatBytes(i.rx_bytes)}}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }}).join('');
+        }}
+
+        function render(backends, tree, memory, inbounds) {{
+            renderSummary(backends, memory);
+            renderInbounds(inbounds);
 
             const container = document.getElementById('tree-root-container');
             if (!tree || tree.length === 0) {{
@@ -1204,7 +1437,7 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
         }}
 
         // Initial render
-        render(backendsData, treeData);
+        render(backendsData, treeData, memoryData, inboundsData);
 
         // Auto-refresh every 5 seconds.
         setInterval(async () => {{
@@ -1213,7 +1446,9 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                 const data = await resp.json();
                 backendsData = data.backends;
                 treeData = data.tree;
-                render(backendsData, treeData);
+                memoryData = data.memory;
+                inboundsData = data.inbounds;
+                render(backendsData, treeData, memoryData, inboundsData);
             }} catch(e) {{
                 console.error('Refresh failed:', e);
             }}

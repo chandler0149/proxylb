@@ -17,6 +17,33 @@ inbound:
     #   aes-256-gcm
     #   chacha20-ietf-poly1305
 
+  # HTTP inbound listener (supports CONNECT and absolute requests)
+  http:
+    listen: "0.0.0.0:8080"
+
+  # Private address target filter (reject private/loopback targets if enabled)
+  filter:
+    enabled: true
+
+
+# Multiple Inbound Listeners Reference
+# ------------------------------------
+# You can define multiple concurrent inbound listeners using the `inbounds` key.
+# Legacy single `inbound` configuration keys defined above will merge with this list.
+#
+# inbounds:
+#   - type: socks5
+#     listen: "0.0.0.0:1081"
+#     filter:
+#       enabled: false # Custom override to allow private targets for this listener
+#
+#   - type: shadowsocks
+#     listen: "0.0.0.0:8389"
+#     password: "another-password"
+#     method: "chacha20-ietf-poly1305"
+#
+#   - type: http
+#     listen: "0.0.0.0:8081"
 # All individual physical backends.
 # Each backend must define exactly one of:
 #   address:     "host:port"                 — TCP backend

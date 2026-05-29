@@ -1,2 +1,258 @@
 pub mod shadowsocks;
 pub mod socks5;
+pub mod http;
+
+use crate::outbound::TargetAddr;
+use std::sync::Arc;
+
+/// Branch prediction hint: indicates that `b` is highly likely to be true.
+#[inline(always)]
+pub fn likely(b: bool) -> bool {
+    if !b {
+        cold_path();
+    }
+    b
+}
+
+/// Branch prediction hint: indicates that `b` is highly unlikely to be true.
+#[inline(always)]
+pub fn unlikely(b: bool) -> bool {
+    if b {
+        cold_path();
+    }
+    b
+}
+
+/// Helper function representing a cold path.
+#[cold]
+#[inline(never)]
+pub fn cold_path() {}
+
+/// Consolidates high-performance routing and load-balanced/failover backend connection establishment.
+pub async fn route_and_connect(
+    pool: &crate::backend::BackendPool,
+    target: &TargetAddr,
+) -> Result<(crate::outbound::BackendStream, Arc<crate::backend::TrafficCounters>), anyhow::Error> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use crate::outbound::{socks5h_connect, socks5h_connect_target};
+
+    let backend_timeout = Duration::from_secs(10);
+    let (healthy_candidates, unhealthy_candidates) = pool.get_candidates().await;
+
+    let mut backend_stream: Option<crate::outbound::BackendStream> = None;
+    let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
+
+
+    // First pass: try healthy backends.
+    for (index, info) in &healthy_candidates {
+        // Single RwLock read: yields both the pooled stream (if any) and the traffic Arc.
+        let pc = pool.get_pooled_connection(*index).await;
+        let (pool_stream, traffic) = match pc {
+            Some(pc) => (pc.stream, Some(pc.traffic)),
+            None => (None, None), // OOB — never happens
+        };
+
+        let conn_res = match pool_stream {
+            Some(stream) => {
+                tracing::debug!(backend = %info.name, "using pooled connection");
+                match socks5h_connect_target(stream, target).await {
+                    Ok(s) => {
+                        if let Some(ref tc) = traffic {
+                            tc.pool_hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(s)
+                    }
+                    Err(e) => {
+                        if let Some(ref tc) = traffic {
+                            tc.pool_stale.fetch_add(1, Ordering::Relaxed);
+                        }
+                        tracing::debug!(
+                            backend = %info.name,
+                            error = %e,
+                            "pooled connection was stale, retrying with fresh connection"
+                        );
+                        socks5h_connect(info, target, backend_timeout).await
+                    }
+                }
+            }
+            None => {
+                if let Some(ref tc) = traffic {
+                    tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+                }
+                socks5h_connect(info, target, backend_timeout).await
+            }
+        };
+
+        match conn_res {
+            Ok(stream) => {
+                tracing::debug!(backend = %info.name, target = %target, "connected through backend");
+                backend_stream = Some(stream);
+                chosen_traffic = traffic;
+                break;
+            }
+            Err(e) => {
+                tracing::debug!(backend = %info.name, error = %e, "backend connect failed, trying next");
+                pool.mark_unhealthy(*index, &format!("connect failed: {}", e))
+                    .await;
+            }
+        }
+    }
+
+    // Second pass: try unhealthy backends as last resort.
+    if backend_stream.is_none() {
+        for (index, info) in &unhealthy_candidates {
+            if let Ok(stream) = socks5h_connect(info, target, backend_timeout).await {
+                tracing::debug!(backend = %info.name, target = %target, "connected through unhealthy backend (fallback)");
+                backend_stream = Some(stream);
+                chosen_traffic = pool.get_traffic_counters(*index).await;
+                break;
+            }
+        }
+    }
+
+    if let (Some(stream), Some(traffic)) = (backend_stream, chosen_traffic) {
+        Ok((stream, traffic))
+    } else {
+        Err(anyhow::anyhow!("all backends failed to connect"))
+    }
+}
+
+/// Generic, high-performance bidirectional relay with unified traffic counter tracking and clean stream shutdown.
+pub async fn relay_and_track<I, B>(
+    mut inbound_stream: I,
+    mut backend_stream: B,
+    traffic: Arc<crate::backend::TrafficCounters>,
+    inbound_stats: Option<Arc<crate::backend::InboundStats>>,
+    target: &TargetAddr,
+    protocol_name: &str,
+) -> Result<(), anyhow::Error>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+
+    traffic.total_connections.fetch_add(1, Ordering::Relaxed);
+    traffic.active_connections.fetch_add(1, Ordering::Relaxed);
+    if let Some(ref stats) = inbound_stats {
+        stats.total_connections.fetch_add(1, Ordering::Relaxed);
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    match crate::relay::relay(&mut inbound_stream, &mut backend_stream).await {
+        Ok((up, down)) => {
+            tracing::debug!(
+                target = %target,
+                up_bytes = up,
+                down_bytes = down,
+                "{} relay complete",
+                protocol_name
+            );
+            traffic.bytes_up.fetch_add(up, Ordering::Relaxed);
+            traffic.bytes_down.fetch_add(down, Ordering::Relaxed);
+            if let Some(ref stats) = inbound_stats {
+                stats.tx_bytes.fetch_add(up, Ordering::Relaxed);
+                stats.rx_bytes.fetch_add(down, Ordering::Relaxed);
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                target = %target,
+                error = %e,
+                "{} relay error",
+                protocol_name
+            );
+        }
+    }
+
+    traffic.active_connections.fetch_sub(1, Ordering::Relaxed);
+    if let Some(ref stats) = inbound_stats {
+        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    let _ = inbound_stream.shutdown().await;
+    let _ = backend_stream.shutdown().await;
+
+    Ok(())
+}
+
+
+
+
+
+
+/// Helper function to check if a target address points to a private/loopback address.
+pub async fn is_private_target(target: &TargetAddr) -> bool {
+    match target {
+        TargetAddr::Ip(addr) => is_private_ip(addr.ip()),
+        TargetAddr::Domain(host, _port) => {
+            let host_lower = host.to_lowercase();
+            host_lower == "localhost" || host_lower.ends_with(".local")
+        }
+    }
+}
+
+
+/// Helper function to check if an IpAddr is private or loopback/local.
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            ipv4.is_loopback()
+                || ipv4.is_private()
+                || ipv4.is_link_local()
+                || ipv4.is_unspecified()
+                || ipv4.is_broadcast()
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                || is_ipv6_unique_local(&ipv6)
+                || is_ipv6_link_local(&ipv6)
+        }
+    }
+}
+
+fn is_ipv6_unique_local(ipv6: &std::net::Ipv6Addr) -> bool {
+    (ipv6.octets()[0] & 0xfe) == 0xfc
+}
+
+fn is_ipv6_link_local(ipv6: &std::net::Ipv6Addr) -> bool {
+    (ipv6.octets()[0] == 0xfe) && ((ipv6.octets()[1] & 0xc0) == 0x80)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn test_is_private_ip() {
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)))); // ::1
+        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)))); // fc00::1
+
+        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+
+    #[tokio::test]
+    async fn test_is_private_target() {
+        let t1 = TargetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80));
+        assert!(is_private_target(&t1).await);
+
+        let t2 = TargetAddr::Domain("localhost".to_string(), 80);
+        assert!(is_private_target(&t2).await);
+
+        let t3 = TargetAddr::Domain("some-service.local".to_string(), 80);
+        assert!(is_private_target(&t3).await);
+
+        let t4 = TargetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80));
+        assert!(!is_private_target(&t4).await);
+    }
+}

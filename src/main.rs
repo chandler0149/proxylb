@@ -11,6 +11,13 @@ mod outbound;
 mod relay;
 mod web;
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -87,34 +94,57 @@ async fn main() -> anyhow::Result<()> {
     // Spawn inbound listeners.
     let mut handles = Vec::new();
 
-    if let Some(ref socks5_config) = config.inbound.socks5 {
-        let listen = socks5_config.listen.clone();
-        let socks5_pool = pool.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = inbound::socks5::run_socks5_inbound(listen, socks5_pool).await {
-                tracing::error!(error = %e, "SOCKS5 inbound failed");
+    for inbound_item in config.all_inbounds() {
+        let inbound_pool = pool.clone();
+        match inbound_item {
+            config::InboundItemConfig::Socks5 { listen, filter } => {
+                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
+                let stats = pool.register_inbound(
+                    format!("SOCKS5 ({})", listen),
+                    listen.clone(),
+                    "socks5".to_string(),
+                );
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = inbound::socks5::run_socks5_inbound(listen, inbound_pool, stats, filter_enabled).await {
+                        tracing::error!(error = %e, "SOCKS5 inbound failed");
+                    }
+                }));
             }
-        }));
-    }
-
-    if let Some(ref ss_config) = config.inbound.shadowsocks {
-        let listen = ss_config.listen.clone();
-        let password = ss_config.password.clone();
-        let method = ss_config.method.clone();
-        let ss_pool = pool.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) =
-                inbound::shadowsocks::run_shadowsocks_inbound(listen, password, method, ss_pool)
-                    .await
-            {
-                tracing::error!(error = %e, "Shadowsocks inbound failed");
+            config::InboundItemConfig::Shadowsocks { listen, password, method, filter } => {
+                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
+                let stats = pool.register_inbound(
+                    format!("Shadowsocks ({})", listen),
+                    listen.clone(),
+                    "shadowsocks".to_string(),
+                );
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) =
+                        inbound::shadowsocks::run_shadowsocks_inbound(listen, password, method, inbound_pool, stats, filter_enabled)
+                            .await
+                    {
+                        tracing::error!(error = %e, "Shadowsocks inbound failed");
+                    }
+                }));
             }
-        }));
+            config::InboundItemConfig::Http { listen, filter } => {
+                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
+                let stats = pool.register_inbound(
+                    format!("HTTP ({})", listen),
+                    listen.clone(),
+                    "http".to_string(),
+                );
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = inbound::http::run_http_inbound(listen, inbound_pool, stats, filter_enabled).await {
+                        tracing::error!(error = %e, "HTTP inbound failed");
+                    }
+                }));
+            }
+        }
     }
 
     // Keep a snapshot of the initial inbound config to detect unsupported
     // listener-address changes on reload (those require a restart).
-    let initial_inbound = config.inbound.clone();
+    let initial_inbounds = config.all_inbounds();
 
     tracing::info!("ProxyLB is running. Send SIGHUP to reload config, Ctrl+C to stop.");
 
@@ -135,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
                     &args.config,
                     &pool,
                     &mut health_cancel,
-                    &initial_inbound,
+                    &initial_inbounds,
                 )
                 .await;
             }
@@ -155,7 +185,7 @@ async fn perform_hot_reload(
     config_path: &PathBuf,
     pool: &backend::BackendPool,
     health_cancel: &mut CancellationToken,
-    initial_inbound: &config::InboundConfig,
+    initial_inbounds: &[config::InboundItemConfig],
 ) {
     let new_config = match config::Config::load(config_path) {
         Ok(c) => c,
@@ -166,7 +196,7 @@ async fn perform_hot_reload(
     };
 
     // Warn about inbound listener changes that require a restart.
-    warn_if_inbound_changed(initial_inbound, &new_config.inbound);
+    warn_if_inbounds_changed(initial_inbounds, &new_config.all_inbounds());
 
     // Stop the health checker BEFORE swapping the pool so it cannot race
     // mark_healthy / mark_unhealthy against indices that are mid-rewrite.
@@ -222,29 +252,13 @@ async fn perform_hot_reload(
 }
 
 /// Emit warnings for inbound config changes that can't be applied without a restart.
-fn warn_if_inbound_changed(old: &config::InboundConfig, new: &config::InboundConfig) {
-    let socks5_listen_changed = match (&old.socks5, &new.socks5) {
-        (Some(o), Some(n)) => o.listen != n.listen,
-        (None, Some(_)) | (Some(_), None) => true,
-        (None, None) => false,
-    };
-    if socks5_listen_changed {
+fn warn_if_inbounds_changed(old: &[config::InboundItemConfig], new: &[config::InboundItemConfig]) {
+    if old != new {
         tracing::warn!(
-            "hot reload: socks5.listen address changed \
-             — restart required for this change to take effect"
-        );
-    }
-
-    let ss_listen_changed = match (&old.shadowsocks, &new.shadowsocks) {
-        (Some(o), Some(n)) => o.listen != n.listen || o.method != n.method || o.password != n.password,
-        (None, Some(_)) | (Some(_), None) => true,
-        (None, None) => false,
-    };
-    if ss_listen_changed {
-        tracing::warn!(
-            "hot reload: shadowsocks config changed \
+            "hot reload: inbound listener configuration changed \
              — restart required for this change to take effect"
         );
     }
 }
+
 
