@@ -3,24 +3,6 @@
 # A high-performance SOCKS5 proxy load balancer with Shadowsocks inbound support.
 
 inbound:
-  # SOCKS5 inbound listener
-  socks5:
-    listen: "0.0.0.0:1080"
-
-  # Shadowsocks inbound listener
-  shadowsocks:
-    listen: "0.0.0.0:8388"
-    password: "my-secret-password"
-    method: "aes-256-gcm"
-    # Supported methods:
-    #   aes-128-gcm
-    #   aes-256-gcm
-    #   chacha20-ietf-poly1305
-
-  # HTTP inbound listener (supports CONNECT and absolute requests)
-  http:
-    listen: "0.0.0.0:8080"
-
   # Private address target filter (reject private/loopback targets if enabled)
   filter:
     enabled: true
@@ -31,19 +13,25 @@ inbound:
 # You can define multiple concurrent inbound listeners using the `inbounds` key.
 # Legacy single `inbound` configuration keys defined above will merge with this list.
 #
-# inbounds:
-#   - type: socks5
-#     listen: "0.0.0.0:1081"
-#     filter:
-#       enabled: false # Custom override to allow private targets for this listener
-#
-#   - type: shadowsocks
-#     listen: "0.0.0.0:8389"
-#     password: "another-password"
-#     method: "chacha20-ietf-poly1305"
-#
-#   - type: http
-#     listen: "0.0.0.0:8081"
+inbounds:
+  - type: socks5
+    listen: "0.0.0.0:1081"
+    filter:
+      enabled: false # Custom override to allow private targets for this listener
+
+  - type: socks5
+    listen: "0.0.0.0:1082"
+    filter:
+      enabled: false 
+
+  - type: shadowsocks
+    listen: "0.0.0.0:8389"
+    password: "another-password"
+    method: "chacha20-ietf-poly1305"
+
+  - type: http
+    listen: "0.0.0.0:8081"
+
 # All individual physical backends.
 # Each backend must define exactly one of:
 #   address:     "host:port"                 — TCP backend
@@ -51,30 +39,17 @@ inbound:
 backends:
   - address: "127.0.0.1:10800"
     name: "backend-us-1"
-    pool_size: 6
-    # username: "user1"
-    # password: "pass1"
+    username: "user1"
+    password: "pass1"
 
   - address: "127.0.0.1:10801"
     name: "backend-us-2"
-    pool_size: 5
 
-  - address: "127.0.0.1:10800"
-    name: "backend-us-3"
-    pool_size: 5
-
-  - address: "127.0.0.1:10802"
-    name: "backend-eu-1"
-    pool_size: 2
-
-  - address: "127.0.0.1:10803"
-    name: "backend-eu-2"
-    pool_size: 2
 
   # Example: Unix domain socket backend
-  # - unix_socket: "/run/my-proxy/socks5.sock"
-  #   name: "local-uds"
-  #   pool_size: 10
+  # socks5 over domain socket
+  - unix_socket: "/run/my-proxy/socks5.sock"
+    name: "local-uds"
 
 # Backend groups let you cluster individual backends.
 # Strategy options:
@@ -86,13 +61,7 @@ groups:
     backends:
       - "backend-us-1"
       - "backend-us-2"
-      - "backend-us-3"
 
-  - name: "group-eu"
-    strategy: "failover"
-    backends:
-      - "backend-eu-1"
-      - "backend-eu-2"
 
 # Global priority failover order.
 # The load balancer attempts to resolve targets in this order.
@@ -100,13 +69,13 @@ groups:
 # If omitted, default behavior falls back in sequential order: all groups first, followed by ungrouped backends.
 failover_order:
   - "group-us"
-  - "group-eu"
+  - "local-uds"
 
 # Health check settings
 health_check:
   interval_secs: 10
   timeout_secs: 5
-  check_target: "www.google.com:80"
+  check_target: "http://www.gstatic.com/generate_204"
 
 # Web status dashboard
 web:
