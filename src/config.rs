@@ -123,10 +123,13 @@ impl Default for FilterConfig {
 
 
 
-/// A SOCKS5h backend entry.
+/// A backend entry.
 ///
 /// Exactly one of `address` (TCP) or `unix_socket` (Unix domain socket path)
 /// must be set. Setting both or neither is a configuration error.
+///
+/// If `ss_password` and `ss_method` are both present the backend is treated as
+/// a **Shadowsocks** server; otherwise it is a plain SOCKS5h backend.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BackendConfig {
     /// TCP backend address in the form "host:port".
@@ -136,14 +139,22 @@ pub struct BackendConfig {
     /// Mutually exclusive with `address`.
     pub unix_socket: Option<String>,
     /// Optional SOCKS5 username for backend authentication.
+    /// Ignored when the backend is a Shadowsocks server.
     pub username: Option<String>,
     /// Optional SOCKS5 password for backend authentication.
+    /// Ignored when the backend is a Shadowsocks server.
     pub password: Option<String>,
     /// Human-readable name for the backend (auto-generated if not set).
     pub name: Option<String>,
-    /// Number of pre-authenticated connections to maintain (default: 10).
+    /// Number of pre-connected connections to maintain in the pool (default: 10).
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
+
+    // ── Shadowsocks backend fields ───────────────────────────────────────────
+    /// Shadowsocks password (enables SS backend when combined with `ss_method`).
+    pub ss_password: Option<String>,
+    /// Shadowsocks cipher method, e.g. "chacha20-ietf-poly1305" or "aes-256-gcm".
+    pub ss_method: Option<String>,
 }
 
 fn default_pool_size() -> usize {
@@ -366,6 +377,33 @@ impl Config {
                     .map_err(|_| anyhow::anyhow!("unsupported shadowsocks cipher: {}", method))?;
             }
         }
+
+        // Validate Shadowsocks backend cipher methods.
+        for (i, backend) in self.backends.iter().enumerate() {
+            let label = backend
+                .name
+                .as_deref()
+                .map(|n| format!("backend '{}'", n))
+                .unwrap_or_else(|| format!("backend[{}]", i));
+            match (&backend.ss_password, &backend.ss_method) {
+                (Some(_), Some(m)) => {
+                    m.parse::<shadowsocks::crypto::CipherKind>()
+                        .map_err(|_| anyhow::anyhow!("{}: unsupported ss_method '{}'", label, m))?;
+                }
+                (Some(_), None) => {
+                    anyhow::bail!("{}: 'ss_method' is required when 'ss_password' is set", label);
+                }
+                (None, Some(_)) => {
+                    anyhow::bail!("{}: 'ss_password' is required when 'ss_method' is set", label);
+                }
+                (None, None) => {} // plain SOCKS5 backend
+            }
+            // Shadowsocks backends must use TCP (not Unix sockets).
+            if backend.ss_password.is_some() && backend.unix_socket.is_some() {
+                anyhow::bail!("{}: Shadowsocks backend must use 'address', not 'unix_socket'", label);
+            }
+        }
+
         Ok(())
     }
 }
@@ -380,8 +418,8 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1 },
-                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, name: Some("b2".to_string()), username: None, password: None, pool_size: 1 },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None },
+                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, name: Some("b2".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -399,7 +437,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1 },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -419,7 +457,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1 },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },

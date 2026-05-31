@@ -35,7 +35,7 @@ pub async fn route_and_connect(
 ) -> Result<(crate::outbound::BackendStream, Arc<crate::backend::TrafficCounters>), anyhow::Error> {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
-    use crate::outbound::{socks5h_connect, socks5h_connect_target};
+    use crate::outbound::{socks5h_connect, socks5h_connect_target, ss_connect_fresh, ss_connect_pooled, BackendStream};
 
     let backend_timeout = Duration::from_secs(10);
     let (healthy_candidates, unhealthy_candidates) = pool.get_candidates().await;
@@ -53,34 +53,76 @@ pub async fn route_and_connect(
             None => (None, None), // OOB — never happens
         };
 
-        let conn_res = match pool_stream {
-            Some(stream) => {
-                tracing::debug!(backend = %info.name, "using pooled connection");
-                match socks5h_connect_target(stream, target).await {
-                    Ok(s) => {
-                        if let Some(ref tc) = traffic {
-                            tc.pool_hits.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Ok(s)
+        let conn_res: std::io::Result<BackendStream> = if info.is_shadowsocks() {
+            // ── Shadowsocks backend ────────────────────────────────────────
+            let ss_cfg = info.ss_config.as_ref().unwrap();
+            let ss_ctx = info.ss_context.as_ref().unwrap().clone();
+
+            match pool_stream {
+                Some(BackendStream::Tcp(raw_tcp)) => {
+                    // Pool hit: wrap the pre-established TCP stream.
+                    tracing::debug!(backend = %info.name, "SS: using pooled TCP connection");
+                    if let Some(ref tc) = traffic {
+                        tc.pool_hits.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(e) => {
-                        if let Some(ref tc) = traffic {
-                            tc.pool_stale.fetch_add(1, Ordering::Relaxed);
+                    Ok(ss_connect_pooled(raw_tcp, ss_cfg, ss_ctx, target))
+                }
+                Some(_other) => {
+                    // Shouldn't happen — SS pool only ever puts Tcp streams in.
+                    if let Some(ref tc) = traffic {
+                        tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                    match &info.endpoint {
+                        crate::backend::BackendEndpoint::Tcp { host, port } => {
+                            ss_connect_fresh(host, *port, ss_cfg, ss_ctx, target, backend_timeout).await
                         }
-                        tracing::debug!(
-                            backend = %info.name,
-                            error = %e,
-                            "pooled connection was stale, retrying with fresh connection"
-                        );
-                        socks5h_connect(info, target, backend_timeout).await
+                        _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP"))
+                    }
+                }
+                None => {
+                    // Pool miss: open a fresh TCP connection.
+                    if let Some(ref tc) = traffic {
+                        tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                    match &info.endpoint {
+                        crate::backend::BackendEndpoint::Tcp { host, port } => {
+                            ss_connect_fresh(host, *port, ss_cfg, ss_ctx, target, backend_timeout).await
+                        }
+                        _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP"))
                     }
                 }
             }
-            None => {
-                if let Some(ref tc) = traffic {
-                    tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // ── SOCKS5 backend ─────────────────────────────────────────
+            match pool_stream {
+                Some(stream) => {
+                    tracing::debug!(backend = %info.name, "using pooled connection");
+                    match socks5h_connect_target(stream, target).await {
+                        Ok(s) => {
+                            if let Some(ref tc) = traffic {
+                                tc.pool_hits.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Ok(s)
+                        }
+                        Err(e) => {
+                            if let Some(ref tc) = traffic {
+                                tc.pool_stale.fetch_add(1, Ordering::Relaxed);
+                            }
+                            tracing::debug!(
+                                backend = %info.name,
+                                error = %e,
+                                "pooled connection was stale, retrying with fresh connection"
+                            );
+                            socks5h_connect(info, target, backend_timeout).await
+                        }
+                    }
                 }
-                socks5h_connect(info, target, backend_timeout).await
+                None => {
+                    if let Some(ref tc) = traffic {
+                        tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                    socks5h_connect(info, target, backend_timeout).await
+                }
             }
         };
 
@@ -102,7 +144,20 @@ pub async fn route_and_connect(
     // Second pass: try unhealthy backends as last resort.
     if backend_stream.is_none() {
         for (index, info) in &unhealthy_candidates {
-            if let Ok(stream) = socks5h_connect(info, target, backend_timeout).await {
+            let result: std::io::Result<BackendStream> = if info.is_shadowsocks() {
+                let ss_cfg = info.ss_config.as_ref().unwrap();
+                let ss_ctx = info.ss_context.as_ref().unwrap().clone();
+                match &info.endpoint {
+                    crate::backend::BackendEndpoint::Tcp { host, port } => {
+                        ss_connect_fresh(host, *port, ss_cfg, ss_ctx, target, backend_timeout).await
+                    }
+                    _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP")),
+                }
+            } else {
+                socks5h_connect(info, target, backend_timeout).await
+            };
+
+            if let Ok(stream) = result {
                 tracing::debug!(backend = %info.name, target = %target, "connected through unhealthy backend (fallback)");
                 backend_stream = Some(stream);
                 chosen_traffic = pool.get_traffic_counters(*index).await;

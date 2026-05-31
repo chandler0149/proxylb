@@ -51,6 +51,17 @@ backends:
   - unix_socket: "/run/my-proxy/socks5.sock"
     name: "local-uds"
 
+  # Example: Shadowsocks backend
+  # The backend is a Shadowsocks server; proxylb speaks the SS client protocol.
+  # Pool refill pre-establishes TCP connections eagerly; the AEAD header (with
+  # the target address) is sent on first write when a real request arrives.
+  #
+  # - address: "ss-server.example.com:8388"
+  #   name: "ss-backend-1"
+  #   ss_password: "my-shadowsocks-password"
+  #   ss_method: "chacha20-ietf-poly1305"   # or "aes-256-gcm", "aes-128-gcm"
+  #   pool_size: 10
+
 # Backend groups let you cluster individual backends.
 # Strategy options:
 #   urltest  - Dynamically routes to the healthy backend with the lowest health check latency.

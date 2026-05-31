@@ -16,7 +16,7 @@ use url::Url;
 
 use crate::backend::{BackendPool, PooledConn};
 use crate::config::HealthCheckConfig;
-use crate::outbound::{socks5h_connect, socks5h_connect_target, TargetAddr};
+use crate::outbound::{socks5h_connect, socks5h_connect_target, ss_connect_fresh, ss_connect_pooled, BackendStream, TargetAddr};
 use std::sync::atomic::Ordering;
 
 /// Target for the health check probe.
@@ -99,29 +99,70 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
             let start = Instant::now();
 
             let result = async {
-                // Try the pool first (same pattern as inbound handlers).
-                // This validates that pooled connections are still alive and
-                // contributes to the pool_hits/misses/stale stats.
                 let pc = pool.get_pooled_connection(index).await;
-                let stream = match pc {
-                    Some(PooledConn { stream: Some(pooled), ref traffic }) => {
-                        match socks5h_connect_target(pooled, &target.addr).await {
-                            Ok(s) => {
-                                traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
-                                s
+
+                let stream: BackendStream = if info.is_shadowsocks() {
+                    // ── Shadowsocks backend health check ───────────────────────────
+                    // Pool holds raw TCP streams; wrap with SS crypto for the probe.
+                    let ss_cfg = info.ss_config.as_ref().unwrap();
+                    let ss_ctx = info.ss_context.as_ref().unwrap().clone();
+
+                    match pc {
+                        Some(PooledConn { stream: Some(BackendStream::Tcp(raw_tcp)), ref traffic }) => {
+                            traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
+                            ss_connect_pooled(raw_tcp, ss_cfg, ss_ctx, &target.addr)
+                        }
+                        Some(PooledConn { stream: Some(_other), ref traffic }) => {
+                            // Shouldn't happen; treat as a miss.
+                            traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
+                            match &info.endpoint {
+                                crate::backend::BackendEndpoint::Tcp { host, port } => {
+                                    ss_connect_fresh(host, *port, ss_cfg, ss_ctx, &target.addr, timeout).await?
+                                }
+                                _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP")),
                             }
-                            Err(_) => {
-                                // Pooled connection was stale — retry fresh.
-                                traffic.pool_stale.fetch_add(1, Ordering::Relaxed);
-                                socks5h_connect(&info, &target.addr, timeout).await?
+                        }
+                        Some(PooledConn { stream: None, ref traffic }) => {
+                            traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
+                            match &info.endpoint {
+                                crate::backend::BackendEndpoint::Tcp { host, port } => {
+                                    ss_connect_fresh(host, *port, ss_cfg, ss_ctx, &target.addr, timeout).await?
+                                }
+                                _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP")),
+                            }
+                        }
+                        None => {
+                            match &info.endpoint {
+                                crate::backend::BackendEndpoint::Tcp { host, port } => {
+                                    ss_connect_fresh(host, *port, ss_cfg, ss_ctx, &target.addr, timeout).await?
+                                }
+                                _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP")),
                             }
                         }
                     }
-                    Some(PooledConn { stream: None, ref traffic }) => {
-                        traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
-                        socks5h_connect(&info, &target.addr, timeout).await?
+                } else {
+                    // ── SOCKS5 backend health check ─────────────────────────────
+                    // Try the pool first: validates pooled connections are still alive.
+                    match pc {
+                        Some(PooledConn { stream: Some(pooled), ref traffic }) => {
+                            match socks5h_connect_target(pooled, &target.addr).await {
+                                Ok(s) => {
+                                    traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
+                                    s
+                                }
+                                Err(_) => {
+                                    // Pooled connection was stale — retry fresh.
+                                    traffic.pool_stale.fetch_add(1, Ordering::Relaxed);
+                                    socks5h_connect(&info, &target.addr, timeout).await?
+                                }
+                            }
+                        }
+                        Some(PooledConn { stream: None, ref traffic }) => {
+                            traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
+                            socks5h_connect(&info, &target.addr, timeout).await?
+                        }
+                        None => socks5h_connect(&info, &target.addr, timeout).await?,
                     }
-                    None => socks5h_connect(&info, &target.addr, timeout).await?,
                 };
 
                 if let Some(config) = tls_config {

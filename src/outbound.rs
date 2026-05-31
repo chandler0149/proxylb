@@ -11,9 +11,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use shadowsocks::config::ServerConfig as SsServerConfig;
+use shadowsocks::context::SharedContext;
+use shadowsocks::relay::socks5::Address as SsAddress;
+use shadowsocks::relay::tcprelay::proxy_stream::client::ProxyClientStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
 
@@ -46,9 +51,20 @@ impl std::fmt::Display for TargetAddr {
     }
 }
 
+// ─── Combined async I/O trait ────────────────────────────────────────────────
+
+/// Combines `AsyncRead` and `AsyncWrite` into a single trait object-safe trait.
+///
+/// This works around the Rust restriction that only one non-auto trait can
+/// appear in a `dyn Trait` trait object (`dyn AsyncRead + AsyncWrite` is
+/// rejected; `dyn AsyncReadWrite` is accepted).
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Send {}
+impl<T: AsyncRead + AsyncWrite + Send> AsyncReadWrite for T {}
+
 // ─── Transport abstraction ────────────────────────────────────────────────────
 
-/// A connected stream to a SOCKS5 backend — either TCP or Unix domain socket.
+/// A connected stream to a SOCKS5 backend — either TCP, Unix domain socket,
+/// or a type-erased boxed async stream (used for Shadowsocks client connections).
 ///
 /// Both variants carry a fully bi-directional async byte stream.  The enum
 /// implements [`AsyncRead`] and [`AsyncWrite`] so that higher-level protocol
@@ -56,7 +72,14 @@ impl std::fmt::Display for TargetAddr {
 pub enum BackendStream {
     Tcp(TcpStream),
     Unix(UnixStream),
+    /// Type-erased stream; used to hold a `ProxyClientStream` after wrapping
+    /// a raw TCP connection with the Shadowsocks AEAD layer.
+    Boxed(Pin<Box<dyn AsyncReadWrite>>),
 }
+
+// SAFETY: TcpStream and UnixStream are Unpin. The Boxed variant is accessed
+// only through `Pin::as_mut()` in poll_* impls; the inner value is never moved.
+impl Unpin for BackendStream {}
 
 impl AsyncRead for BackendStream {
     fn poll_read(
@@ -67,6 +90,7 @@ impl AsyncRead for BackendStream {
         match self.get_mut() {
             BackendStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             BackendStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            BackendStream::Boxed(s) => s.as_mut().poll_read(cx, buf),
         }
     }
 }
@@ -80,6 +104,7 @@ impl AsyncWrite for BackendStream {
         match self.get_mut() {
             BackendStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             BackendStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            BackendStream::Boxed(s) => s.as_mut().poll_write(cx, buf),
         }
     }
 
@@ -87,6 +112,7 @@ impl AsyncWrite for BackendStream {
         match self.get_mut() {
             BackendStream::Tcp(s) => Pin::new(s).poll_flush(cx),
             BackendStream::Unix(s) => Pin::new(s).poll_flush(cx),
+            BackendStream::Boxed(s) => s.as_mut().poll_flush(cx),
         }
     }
 
@@ -94,6 +120,7 @@ impl AsyncWrite for BackendStream {
         match self.get_mut() {
             BackendStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             BackendStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            BackendStream::Boxed(s) => s.as_mut().poll_shutdown(cx),
         }
     }
 }
@@ -292,6 +319,59 @@ where
     }
 
     Ok(stream)
+}
+
+// ─── Shadowsocks outbound helpers ────────────────────────────────────────────
+
+/// Convert our [`TargetAddr`] to the shadowsocks [`SsAddress`] type.
+fn to_ss_address(target: &TargetAddr) -> SsAddress {
+    match target {
+        TargetAddr::Domain(host, port) => SsAddress::DomainNameAddress(host.clone(), *port),
+        TargetAddr::Ip(addr) => SsAddress::SocketAddress(*addr),
+    }
+}
+
+/// Connect **fresh** to a Shadowsocks server and wrap the stream for `target`.
+///
+/// This opens a new TCP connection, wraps it with AEAD crypto, and embeds
+/// `target` in the Shadowsocks header.  The header is sent on the first write
+/// together with the first payload chunk — no separate RTT.
+pub async fn ss_connect_fresh(
+    host: &str,
+    port: u16,
+    svr_cfg: &Arc<SsServerConfig>,
+    ctx: SharedContext,
+    target: &TargetAddr,
+    timeout: Duration,
+) -> io::Result<BackendStream> {
+    let addr = format!("{}:{}", host, port);
+    let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SS backend TCP connect timeout"))?
+        .map_err(|e| {
+            io::Error::new(e.kind(), format!("SS backend TCP connect to {}: {}", addr, e))
+        })?;
+    tcp.set_nodelay(true)?;
+
+    let ss_addr = to_ss_address(target);
+    let client_stream = ProxyClientStream::from_stream(ctx, tcp, svr_cfg.as_ref(), ss_addr);
+    Ok(BackendStream::Boxed(Box::pin(client_stream)))
+}
+
+/// Wrap an **already-established** raw TCP stream (from the connection pool)
+/// with the Shadowsocks AEAD layer for `target`.
+///
+/// This is the zero-RTT hot path: TCP is pre-connected by the pool refill task;
+/// we only build the in-memory crypto state here.
+pub fn ss_connect_pooled(
+    raw: TcpStream,
+    svr_cfg: &Arc<SsServerConfig>,
+    ctx: SharedContext,
+    target: &TargetAddr,
+) -> BackendStream {
+    let ss_addr = to_ss_address(target);
+    let client_stream = ProxyClientStream::from_stream(ctx, raw, svr_cfg.as_ref(), ss_addr);
+    BackendStream::Boxed(Box::pin(client_stream))
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────

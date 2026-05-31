@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use shadowsocks::config::ServerConfig as SsServerConfig;
+use shadowsocks::context::{Context as SsContext, SharedContext};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -72,6 +74,11 @@ pub struct BackendInfo {
     pub username: Option<String>,
     pub password: Option<String>,
     pub pool_size: usize,
+    /// Set when this backend is a Shadowsocks server.
+    /// Contains the pre-derived key material (cheap to clone — inner is `Arc`).
+    pub ss_config: Option<Arc<SsServerConfig>>,
+    /// Shared Shadowsocks context — one per backend, reused across pool connections.
+    pub ss_context: Option<SharedContext>,
 }
 
 impl BackendInfo {
@@ -99,16 +106,59 @@ impl BackendInfo {
             .clone()
             .unwrap_or_else(|| format!("backend-{}", index));
 
+        // Build Shadowsocks config if this is an SS backend.
+        let (ss_config, ss_context) = match (&cfg.ss_password, &cfg.ss_method) {
+            (Some(pass), Some(method_str)) => {
+                // Extract host:port from the TCP endpoint — validation guarantees
+                // this is a TCP backend when ss_password is set.
+                let addr = cfg.address.as_deref().expect("ss backend must have address");
+                let dummy_sock: std::net::SocketAddr = addr
+                    .parse()
+                    .or_else(|_| {
+                        // Handle bare host:port by trying to parse into SocketAddr.
+                        // If that fails we construct one from parts.
+                        if let Some(pos) = addr.rfind(':') {
+                            let port: u16 = addr[pos + 1..].parse()?;
+                            let host_str = &addr[..pos];
+                            // Use a placeholder IP; the real address is in BackendEndpoint.
+                            let ip: std::net::IpAddr = host_str.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                            Ok(std::net::SocketAddr::new(ip, port))
+                        } else {
+                            Err(anyhow::anyhow!("invalid address"))
+                        }
+                    })
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+
+                let method: shadowsocks::crypto::CipherKind = method_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("unsupported ss_method: {}", method_str))?;
+
+                let ss_cfg = SsServerConfig::new(dummy_sock, pass.as_str(), method)
+                    .map_err(|e| anyhow::anyhow!("shadowsocks config error for backend '{}': {}", name, e))?;
+
+                let ctx = SsContext::new_shared(shadowsocks::config::ServerType::Local);
+                (Some(Arc::new(ss_cfg)), Some(ctx))
+            }
+            _ => (None, None),
+        };
+
         Ok(Self {
             name,
             endpoint,
             username: cfg.username.clone(),
             password: cfg.password.clone(),
             pool_size: cfg.pool_size,
+            ss_config,
+            ss_context,
         })
     }
 
-    /// Returns true if this backend requires authentication.
+    /// Returns `true` if this is a Shadowsocks backend.
+    pub fn is_shadowsocks(&self) -> bool {
+        self.ss_config.is_some()
+    }
+
+    /// Returns true if this backend requires SOCKS5 authentication.
     pub fn requires_auth(&self) -> bool {
         self.username.is_some() && self.password.is_some()
     }
@@ -869,14 +919,82 @@ pub async fn run_candidate_selector(pool: BackendPool, cancel: tokio_util::sync:
     }
 }
 
-/// Background task that keeps the SOCKS5 connection pool filled for a backend.
+/// Background task that keeps the connection pool filled for a backend.
+///
+/// **SOCKS5 backends**: performs TCP connect + auth handshake, storing an
+/// already-authenticated stream.  `socks5h_connect_target` runs on the hot path.
+///
+/// **Shadowsocks backends**: performs only TCP connect (no AEAD handshake — the
+/// target address is not known yet).  The raw `TcpStream` is stored; wrapping
+/// with `ProxyClientStream` happens in `route_and_connect` when the target is
+/// known.  This is the "handshake as early as possible" design: we spend the
+/// TCP RTT in the background so the hot path only pays for the in-memory crypto
+/// setup.
 ///
 /// Exits cleanly when `cancel` is cancelled (backend removed during hot reload).
 async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>, cancel: CancellationToken) {
     let retry_interval = Duration::from_secs(5);
 
     loop {
-        // Attempt to establish and authenticate a new connection.
+        // ── Shadowsocks backend: pre-connect TCP only ────────────────────────
+        if info.is_shadowsocks() {
+            let result: std::io::Result<BackendStream> = match &info.endpoint {
+                BackendEndpoint::Tcp { host, port } => {
+                    let addr = format!("{}:{}", host, port);
+                    match TcpStream::connect(&addr).await {
+                        Ok(stream) => {
+                            if let Err(e) = stream.set_nodelay(true) {
+                                Err(e)
+                            } else {
+                                Ok(BackendStream::Tcp(stream))
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                BackendEndpoint::Unix { .. } => {
+                    // Validated to be unreachable for SS backends.
+                    unreachable!("Shadowsocks backend must use TCP")
+                }
+            };
+
+            match result {
+                Ok(stream) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            tracing::trace!(backend = %info.name, "SS refill task cancelled");
+                            return;
+                        }
+                        res = tx.send_async(stream) => {
+                            if res.is_err() {
+                                return; // Receiver dropped.
+                            }
+                            tracing::trace!(backend = %info.name, "SS pool refilled with pre-connected TCP");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        backend = %info.name,
+                        error = %e,
+                        "SS backend TCP connect failed; retrying in {}s",
+                        retry_interval.as_secs()
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            tracing::trace!(backend = %info.name, "SS refill task cancelled during retry backoff");
+                            return;
+                        }
+                        _ = tokio::time::sleep(retry_interval) => {}
+                    }
+                }
+            }
+            continue;
+        }
+
+        // ── SOCKS5 backend: TCP connect + auth handshake ─────────────────────
         let result: std::io::Result<BackendStream> = match &info.endpoint {
             BackendEndpoint::Tcp { host, port } => {
                 let addr = format!("{}:{}", host, port);
@@ -951,6 +1069,8 @@ mod tests {
             password: None,
             name: Some("b1".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
         let b2 = BackendConfig {
             address: Some("127.0.0.1:8082".to_string()),
@@ -959,6 +1079,8 @@ mod tests {
             password: None,
             name: Some("b2".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
         let b3 = BackendConfig {
             address: Some("127.0.0.1:8083".to_string()),
@@ -967,6 +1089,8 @@ mod tests {
             password: None,
             name: Some("b3".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
 
         // Group 1 uses urltest
@@ -1026,8 +1150,8 @@ mod tests {
         // Let's test failover order with a different pool where group-failover is first.
         let pool_fo = BackendPool::new(
             &[
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, username: None, password: None, name: Some("b1".to_string()), pool_size: 1 },
-                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, username: None, password: None, name: Some("b2".to_string()), pool_size: 1 },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, username: None, password: None, name: Some("b1".to_string()), pool_size: 1, ss_password: None, ss_method: None },
+                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, username: None, password: None, name: Some("b2".to_string()), pool_size: 1, ss_password: None, ss_method: None },
             ],
             &[
                 GroupConfig {
@@ -1059,6 +1183,8 @@ mod tests {
             password: None,
             name: Some("b1".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
         let b2 = BackendConfig {
             address: Some("127.0.0.1:8082".to_string()),
@@ -1067,6 +1193,8 @@ mod tests {
             password: None,
             name: Some("b2".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
 
         let g = GroupConfig {
@@ -1123,6 +1251,8 @@ mod tests {
             password: None,
             name: Some("b1".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
         let b2 = BackendConfig {
             address: Some("127.0.0.1:8082".to_string()),
@@ -1131,6 +1261,8 @@ mod tests {
             password: None,
             name: Some("b2".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
         let b3 = BackendConfig {
             address: Some("127.0.0.1:8083".to_string()),
@@ -1139,6 +1271,8 @@ mod tests {
             password: None,
             name: Some("b3".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
 
         // g1 is loadbalance (dynamic)
@@ -1182,6 +1316,8 @@ mod tests {
             password: None,
             name: Some("b1".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
         let b2 = BackendConfig {
             address: Some("127.0.0.1:8082".to_string()),
@@ -1190,6 +1326,8 @@ mod tests {
             password: None,
             name: Some("b2".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
 
         let g1 = GroupConfig {
@@ -1240,6 +1378,8 @@ mod tests {
             password: None,
             name: Some("b1".to_string()),
             pool_size: 1,
+            ss_password: None,
+            ss_method: None,
         };
 
         let pool = BackendPool::new(
@@ -1263,6 +1403,8 @@ mod tests {
             password: Some("new-pass".to_string()),
             name: Some("b1".to_string()),
             pool_size: 3,
+            ss_password: None,
+            ss_method: None,
         };
 
         let (added, removed, kept) = pool.reload(
