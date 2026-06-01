@@ -16,7 +16,7 @@ use url::Url;
 
 use crate::backend::{BackendPool, PooledConn};
 use crate::config::HealthCheckConfig;
-use crate::outbound::{socks5h_connect, socks5h_connect_target, ss_connect_fresh, ss_connect_pooled, BackendStream, TargetAddr};
+use crate::outbound::{socks5h_connect, socks5h_connect_target, ss_connect_fresh, ss_connect_pooled, direct_connect, BackendStream, TargetAddr};
 use std::sync::atomic::Ordering;
 
 /// Target for the health check probe.
@@ -101,7 +101,10 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
             let result = async {
                 let pc = pool.get_pooled_connection(index).await;
 
-                let stream: BackendStream = if info.is_shadowsocks() {
+                let stream: BackendStream = if info.is_direct() {
+                    // ── Direct backend health check ────────────────────────────────
+                    direct_connect(&target.addr, timeout).await?
+                } else if info.is_shadowsocks() {
                     // ── Shadowsocks backend health check ───────────────────────────
                     // Pool holds raw TCP streams; wrap with SS crypto for the probe.
                     let ss_cfg = info.ss_config.as_ref().unwrap();

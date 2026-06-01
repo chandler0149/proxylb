@@ -51,6 +51,11 @@ backends:
   - unix_socket: "/run/my-proxy/socks5.sock"
     name: "local-uds"
 
+  # Example: Direct outbound connection
+  # Connects directly to the target address without using any remote proxy backend.
+  - direct: true
+    name: "direct-out"
+
   # Example: Shadowsocks backend
   # The backend is a Shadowsocks server; proxylb speaks the SS client protocol.
   # Pool refill pre-establishes TCP connections eagerly; the AEAD header (with
@@ -81,6 +86,7 @@ groups:
 failover_order:
   - "group-us"
   - "local-uds"
+  - "direct-out"
 
 # Health check settings
 health_check:

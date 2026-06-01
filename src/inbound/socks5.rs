@@ -96,7 +96,7 @@ async fn handle_socks5_connection(
     if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
         tracing::warn!(target = %target, "SOCKS5 connection rejected: private target");
         let mut client_stream = socks5_socket.into_inner();
-        let reply = build_socks5_reply(0x02); // Connection not allowed by ruleset
+        let reply = build_socks5_reply(consts::SOCKS5_REPLY_CONNECTION_NOT_ALLOWED); // Connection not allowed by ruleset
         let _ = client_stream.write_all(&reply).await;
         return Ok(());
     }

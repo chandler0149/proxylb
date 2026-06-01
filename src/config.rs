@@ -155,6 +155,11 @@ pub struct BackendConfig {
     pub ss_password: Option<String>,
     /// Shadowsocks cipher method, e.g. "chacha20-ietf-poly1305" or "aes-256-gcm".
     pub ss_method: Option<String>,
+
+    // ── Direct outbound backend fields ───────────────────────────────────────
+    /// Whether this is a direct connection outbound backend (default: false).
+    #[serde(default)]
+    pub direct: bool,
 }
 
 fn default_pool_size() -> usize {
@@ -299,19 +304,41 @@ impl Config {
                 .as_deref()
                 .map(|n| format!("backend '{}'", n))
                 .unwrap_or_else(|| format!("backend[{}]", i));
-            match (&backend.address, &backend.unix_socket) {
-                (Some(_), None) | (None, Some(_)) => {} // exactly one set — OK
-                (Some(_), Some(_)) => {
+
+            if backend.direct {
+                if backend.address.is_some() || backend.unix_socket.is_some() {
                     anyhow::bail!(
-                        "{}: 'address' and 'unix_socket' are mutually exclusive",
+                        "{}: direct backend must not specify 'address' or 'unix_socket'",
                         label
                     );
                 }
-                (None, None) => {
+                if backend.ss_password.is_some() || backend.ss_method.is_some() {
                     anyhow::bail!(
-                        "{}: one of 'address' or 'unix_socket' must be set",
+                        "{}: direct backend must not specify Shadowsocks settings ('ss_password' or 'ss_method')",
                         label
                     );
+                }
+                if backend.username.is_some() || backend.password.is_some() {
+                    anyhow::bail!(
+                        "{}: direct backend must not specify SOCKS5 authentication credentials ('username' or 'password')",
+                        label
+                    );
+                }
+            } else {
+                match (&backend.address, &backend.unix_socket) {
+                    (Some(_), None) | (None, Some(_)) => {} // exactly one set — OK
+                    (Some(_), Some(_)) => {
+                        anyhow::bail!(
+                            "{}: 'address' and 'unix_socket' are mutually exclusive",
+                            label
+                        );
+                    }
+                    (None, None) => {
+                        anyhow::bail!(
+                            "{}: one of 'address' or 'unix_socket' must be set",
+                            label
+                        );
+                    }
                 }
             }
         }
@@ -418,8 +445,8 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None },
-                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, name: Some("b2".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false },
+                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, name: Some("b2".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -437,7 +464,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -457,7 +484,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -518,5 +545,42 @@ backends:
             }
             _ => panic!("Expected HTTP inbound"),
         }
+    }
+
+    #[test]
+    fn test_valid_config_with_direct_backend() {
+        let yaml = r#"
+backends:
+  - name: "direct-out"
+    direct: true
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.backends[0].direct, true);
+    }
+
+    #[test]
+    fn test_invalid_direct_backend_with_address() {
+        let yaml = r#"
+backends:
+  - name: "direct-out"
+    direct: true
+    address: "127.0.0.1:1080"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_invalid_direct_backend_with_shadowsocks() {
+        let yaml = r#"
+backends:
+  - name: "direct-out"
+    direct: true
+    ss_password: "password"
+    ss_method: "aes-256-gcm"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_err());
     }
 }

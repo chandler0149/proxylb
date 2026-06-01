@@ -35,7 +35,7 @@ pub async fn route_and_connect(
 ) -> Result<(crate::outbound::BackendStream, Arc<crate::backend::TrafficCounters>), anyhow::Error> {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
-    use crate::outbound::{socks5h_connect, socks5h_connect_target, ss_connect_fresh, ss_connect_pooled, BackendStream};
+    use crate::outbound::{socks5h_connect, socks5h_connect_target, ss_connect_fresh, ss_connect_pooled, direct_connect, BackendStream};
 
     let backend_timeout = Duration::from_secs(10);
     let (healthy_candidates, unhealthy_candidates) = pool.get_candidates().await;
@@ -53,7 +53,13 @@ pub async fn route_and_connect(
             None => (None, None), // OOB — never happens
         };
 
-        let conn_res: std::io::Result<BackendStream> = if info.is_shadowsocks() {
+        let conn_res: std::io::Result<BackendStream> = if info.is_direct() {
+            // ── Direct backend ─────────────────────────────────────────────
+            if let Some(ref tc) = traffic {
+                tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            direct_connect(target, backend_timeout).await
+        } else if info.is_shadowsocks() {
             // ── Shadowsocks backend ────────────────────────────────────────
             let ss_cfg = info.ss_config.as_ref().unwrap();
             let ss_ctx = info.ss_context.as_ref().unwrap().clone();
@@ -144,7 +150,9 @@ pub async fn route_and_connect(
     // Second pass: try unhealthy backends as last resort.
     if backend_stream.is_none() {
         for (index, info) in &unhealthy_candidates {
-            let result: std::io::Result<BackendStream> = if info.is_shadowsocks() {
+            let result: std::io::Result<BackendStream> = if info.is_direct() {
+                direct_connect(target, backend_timeout).await
+            } else if info.is_shadowsocks() {
                 let ss_cfg = info.ss_config.as_ref().unwrap();
                 let ss_ctx = info.ss_context.as_ref().unwrap().clone();
                 match &info.endpoint {

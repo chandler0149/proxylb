@@ -54,6 +54,8 @@ pub enum BackendEndpoint {
     Tcp { host: String, port: u16 },
     /// Unix domain socket at the given filesystem path.
     Unix { path: String },
+    /// Direct connection outbound.
+    Direct,
 }
 
 impl BackendEndpoint {
@@ -62,6 +64,7 @@ impl BackendEndpoint {
         match self {
             BackendEndpoint::Tcp { host, port } => format!("{}:{}", host, port),
             BackendEndpoint::Unix { path } => format!("unix:{}", path),
+            BackendEndpoint::Direct => "direct".to_string(),
         }
     }
 }
@@ -83,28 +86,38 @@ pub struct BackendInfo {
 
 impl BackendInfo {
     pub fn from_config(cfg: &BackendConfig, index: usize) -> anyhow::Result<Self> {
-        let endpoint = match (&cfg.address, &cfg.unix_socket) {
-            (Some(addr), None) => {
-                // Parse "host:port"
-                if let Some(pos) = addr.rfind(':') {
-                    let host = addr[..pos].to_string();
-                    let port: u16 = addr[pos + 1..].parse().map_err(|_| {
-                        anyhow::anyhow!("invalid port in backend address: {}", addr)
-                    })?;
-                    BackendEndpoint::Tcp { host, port }
-                } else {
-                    anyhow::bail!("backend address must be in host:port format: {}", addr);
+        let endpoint = if cfg.direct {
+            BackendEndpoint::Direct
+        } else {
+            match (&cfg.address, &cfg.unix_socket) {
+                (Some(addr), None) => {
+                    // Parse "host:port"
+                    if let Some(pos) = addr.rfind(':') {
+                        let host = addr[..pos].to_string();
+                        let port: u16 = addr[pos + 1..].parse().map_err(|_| {
+                            anyhow::anyhow!("invalid port in backend address: {}", addr)
+                        })?;
+                        BackendEndpoint::Tcp { host, port }
+                    } else {
+                        anyhow::bail!("backend address must be in host:port format: {}", addr);
+                    }
                 }
+                (None, Some(path)) => BackendEndpoint::Unix { path: path.clone() },
+                // Both Some or both None are caught by config validation before we get here.
+                _ => unreachable!("config validation ensures exactly one of address/unix_socket or direct"),
             }
-            (None, Some(path)) => BackendEndpoint::Unix { path: path.clone() },
-            // Both Some or both None are caught by config validation before we get here.
-            _ => unreachable!("config validation ensures exactly one of address/unix_socket"),
         };
 
         let name = cfg
             .name
             .clone()
-            .unwrap_or_else(|| format!("backend-{}", index));
+            .unwrap_or_else(|| {
+                if cfg.direct {
+                    format!("direct-{}", index)
+                } else {
+                    format!("backend-{}", index)
+                }
+            });
 
         // Build Shadowsocks config if this is an SS backend.
         let (ss_config, ss_context) = match (&cfg.ss_password, &cfg.ss_method) {
@@ -142,12 +155,14 @@ impl BackendInfo {
             _ => (None, None),
         };
 
+        let pool_size = if cfg.direct { 0 } else { cfg.pool_size };
+
         Ok(Self {
             name,
             endpoint,
             username: cfg.username.clone(),
             password: cfg.password.clone(),
-            pool_size: cfg.pool_size,
+            pool_size,
             ss_config,
             ss_context,
         })
@@ -156,6 +171,11 @@ impl BackendInfo {
     /// Returns `true` if this is a Shadowsocks backend.
     pub fn is_shadowsocks(&self) -> bool {
         self.ss_config.is_some()
+    }
+
+    /// Returns `true` if this is a direct connection outbound backend.
+    pub fn is_direct(&self) -> bool {
+        matches!(self.endpoint, BackendEndpoint::Direct)
     }
 
     /// Returns true if this backend requires SOCKS5 authentication.
@@ -933,6 +953,11 @@ pub async fn run_candidate_selector(pool: BackendPool, cancel: tokio_util::sync:
 ///
 /// Exits cleanly when `cancel` is cancelled (backend removed during hot reload).
 async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>, cancel: CancellationToken) {
+    if info.is_direct() {
+        // Direct connections are established on demand and cannot be pre-connected/pooled.
+        return;
+    }
+
     let retry_interval = Duration::from_secs(5);
 
     loop {
@@ -955,6 +980,9 @@ async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>, c
                 BackendEndpoint::Unix { .. } => {
                     // Validated to be unreachable for SS backends.
                     unreachable!("Shadowsocks backend must use TCP")
+                }
+                BackendEndpoint::Direct => {
+                    unreachable!("direct backend has no refill pool task")
                 }
             };
 
@@ -1013,6 +1041,9 @@ async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>, c
                 }
                 .await
             }
+            BackendEndpoint::Direct => {
+                unreachable!("direct backend has no refill pool task")
+            }
         };
 
         match result {
@@ -1060,38 +1091,25 @@ mod tests {
     use super::*;
     use crate::config::GroupStrategy;
 
+    fn make_cfg(addr: &str, name: &str) -> BackendConfig {
+        BackendConfig {
+            address: Some(addr.to_string()),
+            unix_socket: None,
+            username: None,
+            password: None,
+            name: Some(name.to_string()),
+            pool_size: 1,
+            ss_password: None,
+            ss_method: None,
+            direct: false,
+        }
+    }
+
     #[tokio::test]
     async fn test_urltest_and_failover_strategy() {
-        let b1 = BackendConfig {
-            address: Some("127.0.0.1:8081".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b1".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
-        let b2 = BackendConfig {
-            address: Some("127.0.0.1:8082".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b2".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
-        let b3 = BackendConfig {
-            address: Some("127.0.0.1:8083".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b3".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
+        let b1 = make_cfg("127.0.0.1:8081", "b1");
+        let b2 = make_cfg("127.0.0.1:8082", "b2");
+        let b3 = make_cfg("127.0.0.1:8083", "b3");
 
         // Group 1 uses urltest
         let g1 = GroupConfig {
@@ -1150,8 +1168,8 @@ mod tests {
         // Let's test failover order with a different pool where group-failover is first.
         let pool_fo = BackendPool::new(
             &[
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, username: None, password: None, name: Some("b1".to_string()), pool_size: 1, ss_password: None, ss_method: None },
-                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, username: None, password: None, name: Some("b2".to_string()), pool_size: 1, ss_password: None, ss_method: None },
+                make_cfg("127.0.0.1:8081", "b1"),
+                make_cfg("127.0.0.1:8082", "b2"),
             ],
             &[
                 GroupConfig {
@@ -1176,26 +1194,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_loadbalance_strategy() {
-        let b1 = BackendConfig {
-            address: Some("127.0.0.1:8081".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b1".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
-        let b2 = BackendConfig {
-            address: Some("127.0.0.1:8082".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b2".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
+        let b1 = make_cfg("127.0.0.1:8081", "b1");
+        let b2 = make_cfg("127.0.0.1:8082", "b2");
 
         let g = GroupConfig {
             name: "group-lb".to_string(),
@@ -1244,36 +1244,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_global_failover_order() {
-        let b1 = BackendConfig {
-            address: Some("127.0.0.1:8081".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b1".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
-        let b2 = BackendConfig {
-            address: Some("127.0.0.1:8082".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b2".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
-        let b3 = BackendConfig {
-            address: Some("127.0.0.1:8083".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b3".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
+        let b1 = make_cfg("127.0.0.1:8081", "b1");
+        let b2 = make_cfg("127.0.0.1:8082", "b2");
+        let b3 = make_cfg("127.0.0.1:8083", "b3");
 
         // g1 is loadbalance (dynamic)
         let g1 = GroupConfig {
@@ -1309,26 +1282,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_adds_backend_to_group() {
-        let b1 = BackendConfig {
-            address: Some("127.0.0.1:8081".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b1".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
-        let b2 = BackendConfig {
-            address: Some("127.0.0.1:8082".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b2".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
+        let b1 = make_cfg("127.0.0.1:8081", "b1");
+        let b2 = make_cfg("127.0.0.1:8082", "b2");
 
         let g1 = GroupConfig {
             name: "group-1".to_string(),
@@ -1371,16 +1326,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_restarts_refill_task_on_config_change() {
-        let b1 = BackendConfig {
-            address: Some("127.0.0.1:8081".to_string()),
-            unix_socket: None,
-            username: None,
-            password: None,
-            name: Some("b1".to_string()),
-            pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-        };
+        let b1 = make_cfg("127.0.0.1:8081", "b1");
 
         let pool = BackendPool::new(
             &[b1.clone()],
@@ -1405,6 +1351,7 @@ mod tests {
             pool_size: 3,
             ss_password: None,
             ss_method: None,
+            direct: false,
         };
 
         let (added, removed, kept) = pool.reload(
