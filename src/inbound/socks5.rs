@@ -10,7 +10,7 @@ use fast_socks5::util::target_addr::TargetAddr as FastTargetAddr;
 use fast_socks5::consts;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener};
 
 use crate::backend::BackendPool;
 use crate::outbound::TargetAddr;
