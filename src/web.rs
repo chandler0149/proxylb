@@ -73,8 +73,8 @@ pub fn create_router(pool: BackendPool) -> Router {
     Router::new()
         .route("/", get(dashboard_html))
         .route("/api/status", get(api_status))
-        .route("/api/backends/:name/enable", post(api_enable_backend))
-        .route("/api/backends/:name/disable", post(api_disable_backend))
+        .route("/api/backends/{name}/enable", post(api_enable_backend))
+        .route("/api/backends/{name}/disable", post(api_disable_backend))
         .with_state(pool)
 }
 

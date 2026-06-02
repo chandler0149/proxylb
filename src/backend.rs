@@ -848,8 +848,17 @@ impl BackendPool {
     pub async fn set_backend_enabled(&self, name: &str, enabled: bool) -> anyhow::Result<bool> {
         let guard = self.inner.read().await;
         let mut found = false;
+        let mut changed = false;
         for entry in &guard.entries {
             if entry.info.name == name {
+                found = true;
+
+                // Idempotent: skip if already in the desired state.
+                let current = entry.status.lock().unwrap().enabled;
+                if current == enabled {
+                    break;
+                }
+
                 // Set the atomic flag for the refill task
                 entry.enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
                 
@@ -863,18 +872,17 @@ impl BackendPool {
                     while entry.pool_rx.try_recv().is_ok() {}
                 }
                 
-                found = true;
+                changed = true;
                 break;
             }
         }
 
-        if found {
+        if changed {
             drop(guard);
             self.recalculate_candidates().await;
-            Ok(true)
-        } else {
-            Ok(false)
         }
+
+        Ok(found)
     }
 
     /// Recalculate candidates and cache them.
