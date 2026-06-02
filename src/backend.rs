@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use shadowsocks::config::ServerConfig as SsServerConfig;
 use shadowsocks::context::{Context as SsContext, SharedContext};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use arc_swap::ArcSwap;
@@ -82,10 +82,15 @@ pub struct BackendInfo {
     pub ss_config: Option<Arc<SsServerConfig>>,
     /// Shared Shadowsocks context — one per backend, reused across pool connections.
     pub ss_context: Option<SharedContext>,
+    pub bind_interface: Option<String>,
 }
 
 impl BackendInfo {
-    pub fn from_config(cfg: &BackendConfig, index: usize) -> anyhow::Result<Self> {
+    pub fn from_config(
+        cfg: &BackendConfig,
+        index: usize,
+        global_bind_interface: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let endpoint = if cfg.direct {
             BackendEndpoint::Direct
         } else {
@@ -156,6 +161,10 @@ impl BackendInfo {
         };
 
         let pool_size = if cfg.direct { 0 } else { cfg.pool_size };
+        let bind_interface = cfg
+            .bind_interface
+            .clone()
+            .or_else(|| global_bind_interface.map(String::from));
 
         Ok(Self {
             name,
@@ -165,6 +174,7 @@ impl BackendInfo {
             pool_size,
             ss_config,
             ss_context,
+            bind_interface,
         })
     }
 
@@ -522,10 +532,11 @@ impl BackendPool {
         configs: &[BackendConfig],
         group_configs: &[GroupConfig],
         failover_order_cfg: Option<&Vec<String>>,
+        global_bind_interface: Option<&str>,
     ) -> anyhow::Result<Self> {
         let mut entries = Vec::with_capacity(configs.len());
         for (i, cfg) in configs.iter().enumerate() {
-            let info = BackendInfo::from_config(cfg, i)?;
+            let info = BackendInfo::from_config(cfg, i, global_bind_interface)?;
             let cancel = CancellationToken::new();
             let (tx, rx) = flume::bounded(info.pool_size.max(1));
 
@@ -616,6 +627,7 @@ impl BackendPool {
         new_configs: &[BackendConfig],
         group_configs: &[GroupConfig],
         failover_order_cfg: Option<&Vec<String>>,
+        global_bind_interface: Option<&str>,
     ) -> anyhow::Result<(usize, usize, usize)> {
         let mut guard = self.inner.write().await;
 
@@ -624,7 +636,7 @@ impl BackendPool {
         let mut kept = 0usize;
 
         for (i, cfg) in new_configs.iter().enumerate() {
-            let new_info = BackendInfo::from_config(cfg, i)?;
+            let new_info = BackendInfo::from_config(cfg, i, global_bind_interface)?;
 
             // Look for a matching existing entry (same endpoint + name).
             let existing_pos = guard.entries.iter().position(|e| {
@@ -966,7 +978,7 @@ async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>, c
             let result: std::io::Result<BackendStream> = match &info.endpoint {
                 BackendEndpoint::Tcp { host, port } => {
                     let addr = format!("{}:{}", host, port);
-                    match TcpStream::connect(&addr).await {
+                    match crate::outbound::tcp_connect_raw(&addr, info.bind_interface.as_deref(), Duration::from_secs(10)).await {
                         Ok(stream) => {
                             if let Err(e) = stream.set_nodelay(true) {
                                 Err(e)
@@ -1027,7 +1039,7 @@ async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>, c
             BackendEndpoint::Tcp { host, port } => {
                 let addr = format!("{}:{}", host, port);
                 async {
-                    let stream = TcpStream::connect(&addr).await?;
+                    let stream = crate::outbound::tcp_connect_raw(&addr, info.bind_interface.as_deref(), Duration::from_secs(10)).await?;
                     stream.set_nodelay(true)?;
                     socks5h_authenticate(BackendStream::Tcp(stream), &info).await
                 }
@@ -1102,6 +1114,7 @@ mod tests {
             ss_password: None,
             ss_method: None,
             direct: false,
+            bind_interface: None,
         }
     }
 
@@ -1129,6 +1142,7 @@ mod tests {
             &[b1, b2, b3],
             &[g1, g2],
             Some(&vec!["group-urltest".to_string(), "group-failover".to_string()]),
+            None,
         ).unwrap();
 
         // 1. Initially all backends are healthy by default on startup.
@@ -1179,6 +1193,7 @@ mod tests {
                 }
             ],
             Some(&vec!["group-fo".to_string()]),
+            None,
         ).unwrap();
 
         pool_fo.mark_healthy(0, Duration::from_millis(10)).await; // b1: 10ms
@@ -1207,6 +1222,7 @@ mod tests {
             &[b1, b2],
             &[g],
             Some(&vec!["group-lb".to_string()]),
+            None,
         ).unwrap();
 
         // Simulate b1 has more historical connections (total_connections = 10) than b2 (total_connections = 5)
@@ -1270,6 +1286,7 @@ mod tests {
             &[b1, b2, b3],
             &[g1, g2],
             None, // No explicit failover order
+            None,
         ).unwrap();
 
         let (healthy, _) = pool.get_candidates().await;
@@ -1295,6 +1312,7 @@ mod tests {
             &[b1.clone()],
             &[g1.clone()],
             Some(&vec!["group-1".to_string()]),
+            None,
         ).unwrap();
 
         let (healthy, _) = pool.get_candidates().await;
@@ -1312,6 +1330,7 @@ mod tests {
             &[b1, b2],
             &[g1_new],
             Some(&vec!["group-1".to_string()]),
+            None,
         ).await.unwrap();
 
         assert_eq!(added, 1);
@@ -1331,6 +1350,7 @@ mod tests {
         let pool = BackendPool::new(
             &[b1.clone()],
             &[],
+            None,
             None,
         ).unwrap();
 
@@ -1352,11 +1372,13 @@ mod tests {
             ss_password: None,
             ss_method: None,
             direct: false,
+            bind_interface: None,
         };
 
         let (added, removed, kept) = pool.reload(
             &[b1_updated],
             &[],
+            None,
             None,
         ).await.unwrap();
 
@@ -1375,5 +1397,28 @@ mod tests {
         assert!(original_cancel.is_cancelled());
         // Assert the new refill task cancellation token is NOT cancelled
         assert!(!new_cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_bind_interface_fallback() {
+        let mut b1 = make_cfg("127.0.0.1:8081", "b1");
+        b1.bind_interface = None;
+
+        let mut b2 = make_cfg("127.0.0.1:8082", "b2");
+        b2.bind_interface = Some("eno1".to_string());
+
+        // Pool constructed with a global bind interface "eno0"
+        let pool = BackendPool::new(
+            &[b1, b2],
+            &[],
+            None,
+            Some("eno0"),
+        ).unwrap();
+
+        let guard = pool.inner.read().await;
+        // b1 should resolve to the global bind interface "eno0"
+        assert_eq!(guard.entries[0].info.bind_interface.as_deref(), Some("eno0"));
+        // b2 should resolve to the backend-specific bind interface "eno1" (override)
+        assert_eq!(guard.entries[1].info.bind_interface.as_deref(), Some("eno1"));
     }
 }

@@ -32,6 +32,9 @@ inbounds:
   - type: http
     listen: "0.0.0.0:8081"
 
+# Global outbound interface to bind to (selection logic: backend specific -> global -> default)
+# bind_interface: "eno" # Linux interface (or "en0" on macOS)
+
 # All individual physical backends.
 # Each backend must define exactly one of:
 #   address:     "host:port"                 — TCP backend
@@ -44,6 +47,9 @@ backends:
 
   - address: "127.0.0.1:10801"
     name: "backend-us-2"
+    # Example: Bind to a specific network interface
+    # Forces all outbound connections through this interface (avoids using default route).
+    # bind_interface: "eno" # Linux interface (or "en0" on macOS)
 
 
   # Example: Unix domain socket backend

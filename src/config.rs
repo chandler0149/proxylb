@@ -25,6 +25,8 @@ pub struct Config {
     pub health_check: HealthCheckConfig,
     #[serde(default)]
     pub web: WebConfig,
+    /// Optional global network interface to bind when connecting outbound.
+    pub bind_interface: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +162,8 @@ pub struct BackendConfig {
     /// Whether this is a direct connection outbound backend (default: false).
     #[serde(default)]
     pub direct: bool,
+    /// Optional network interface to bind when connecting outbound (e.g. "eno" on Linux, "en0" on macOS).
+    pub bind_interface: Option<String>,
 }
 
 fn default_pool_size() -> usize {
@@ -445,8 +449,8 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false },
-                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, name: Some("b2".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false, bind_interface: None },
+                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, name: Some("b2".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false, bind_interface: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -454,6 +458,7 @@ mod tests {
             failover_order: Some(vec!["g1".to_string(), "b2".to_string()]),
             health_check: HealthCheckConfig::default(),
             web: WebConfig::default(),
+            bind_interface: None,
         };
         assert!(cfg.validate().is_ok());
     }
@@ -464,7 +469,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false, bind_interface: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -473,6 +478,7 @@ mod tests {
             failover_order: None,
             health_check: HealthCheckConfig::default(),
             web: WebConfig::default(),
+            bind_interface: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("cannot be used in multiple groups"));
@@ -484,7 +490,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false },
+                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false, bind_interface: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -492,6 +498,7 @@ mod tests {
             failover_order: Some(vec!["g1".to_string(), "b1".to_string()]),
             health_check: HealthCheckConfig::default(),
             web: WebConfig::default(),
+            bind_interface: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("cannot be used as a standalone target"));

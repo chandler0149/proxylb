@@ -58,7 +58,7 @@ pub async fn route_and_connect(
             if let Some(ref tc) = traffic {
                 tc.pool_misses.fetch_add(1, Ordering::Relaxed);
             }
-            direct_connect(target, backend_timeout).await
+            direct_connect(target, backend_timeout, info.bind_interface.as_deref()).await
         } else if info.is_shadowsocks() {
             // ── Shadowsocks backend ────────────────────────────────────────
             let ss_cfg = info.ss_config.as_ref().unwrap();
@@ -80,7 +80,7 @@ pub async fn route_and_connect(
                     }
                     match &info.endpoint {
                         crate::backend::BackendEndpoint::Tcp { host, port } => {
-                            ss_connect_fresh(host, *port, ss_cfg, ss_ctx, target, backend_timeout).await
+                            ss_connect_fresh(host, *port, ss_cfg, ss_ctx, target, backend_timeout, info.bind_interface.as_deref()).await
                         }
                         _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP"))
                     }
@@ -92,7 +92,7 @@ pub async fn route_and_connect(
                     }
                     match &info.endpoint {
                         crate::backend::BackendEndpoint::Tcp { host, port } => {
-                            ss_connect_fresh(host, *port, ss_cfg, ss_ctx, target, backend_timeout).await
+                            ss_connect_fresh(host, *port, ss_cfg, ss_ctx, target, backend_timeout, info.bind_interface.as_deref()).await
                         }
                         _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP"))
                     }
@@ -151,13 +151,13 @@ pub async fn route_and_connect(
     if backend_stream.is_none() {
         for (index, info) in &unhealthy_candidates {
             let result: std::io::Result<BackendStream> = if info.is_direct() {
-                direct_connect(target, backend_timeout).await
+                direct_connect(target, backend_timeout, info.bind_interface.as_deref()).await
             } else if info.is_shadowsocks() {
                 let ss_cfg = info.ss_config.as_ref().unwrap();
                 let ss_ctx = info.ss_context.as_ref().unwrap().clone();
                 match &info.endpoint {
                     crate::backend::BackendEndpoint::Tcp { host, port } => {
-                        ss_connect_fresh(host, *port, ss_cfg, ss_ctx, target, backend_timeout).await
+                        ss_connect_fresh(host, *port, ss_cfg, ss_ctx, target, backend_timeout, info.bind_interface.as_deref()).await
                     }
                     _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP")),
                 }

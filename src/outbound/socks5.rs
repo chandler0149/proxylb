@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::UnixStream;
 
 use crate::backend::BackendInfo;
 use super::{BackendStream, TargetAddr};
@@ -35,9 +35,8 @@ pub async fn socks5h_connect(
         BackendEndpoint::Tcp { host, port } => {
             let addr = format!("{}:{}", host, port);
 
-            let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+            let tcp = super::tcp_connect_raw(&addr, backend.bind_interface.as_deref(), timeout)
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend TCP connect timeout"))?
                 .map_err(|e| {
                     io::Error::new(e.kind(), format!("backend TCP connect to {}: {}", addr, e))
                 })?;

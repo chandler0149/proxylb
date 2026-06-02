@@ -1591,6 +1591,7 @@ dependencies = [
  "fast-socks5",
  "flume",
  "httparse",
+ "libc",
  "serde",
  "serde_json",
  "serde_yaml",

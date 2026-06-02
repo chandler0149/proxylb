@@ -99,3 +99,112 @@ impl AsyncWrite for BackendStream {
         }
     }
 }
+
+/// Helper function to platform-conditionally bind a socket descriptor to a network interface.
+#[cfg(target_os = "linux")]
+fn bind_socket_to_device(fd: std::os::unix::io::RawFd, interface: &str, _is_ipv6: bool) -> std::io::Result<()> {
+    use std::ffi::CString;
+    let iface_c = CString::new(interface)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let res = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            iface_c.as_ptr() as *const libc::c_void,
+            iface_c.to_bytes_with_nul().len() as libc::socklen_t,
+        )
+    };
+    if res == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bind_socket_to_device(fd: std::os::unix::io::RawFd, interface: &str, is_ipv6: bool) -> std::io::Result<()> {
+    use std::ffi::CString;
+    let iface_c = CString::new(interface)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let index = unsafe { libc::if_nametoindex(iface_c.as_ptr()) };
+    if index == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("network interface '{}' not found", interface),
+        ));
+    }
+
+    const IP_BOUND_IF: libc::c_int = 25;
+    const IPV6_BOUND_IF: libc::c_int = 125;
+
+    let res = unsafe {
+        if is_ipv6 {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                IPV6_BOUND_IF,
+                &index as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            )
+        } else {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                IP_BOUND_IF,
+                &index as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            )
+        }
+    };
+
+    if res == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn bind_socket_to_device(_fd: std::os::unix::io::RawFd, _interface: &str, _is_ipv6: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "outbound interface binding is only supported on Linux and macOS",
+    ))
+}
+
+/// Establish an outbound TCP connection bound to an optional network interface.
+pub async fn tcp_connect_raw<A: tokio::net::ToSocketAddrs>(
+    addr: A,
+    bind_interface: Option<&str>,
+    timeout: std::time::Duration,
+) -> io::Result<TcpStream> {
+    use std::os::unix::io::AsRawFd;
+    use tokio::net::TcpSocket;
+
+    let addrs = tokio::net::lookup_host(addr).await?;
+    let mut last_err = None;
+
+    for socket_addr in addrs {
+        let is_ipv6 = socket_addr.is_ipv6();
+        let socket = match socket_addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => TcpSocket::new_v6()?,
+        };
+
+        if let Some(iface) = bind_interface {
+            let fd = socket.as_raw_fd();
+            bind_socket_to_device(fd, iface, is_ipv6)?;
+        }
+
+        match tokio::time::timeout(timeout, socket.connect(socket_addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => last_err = Some(io::Error::new(io::ErrorKind::TimedOut, "connection timed out")),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::AddrNotAvailable, "could not resolve address or no addresses found")
+    }))
+}

@@ -31,11 +31,11 @@ pub async fn ss_connect_fresh(
     ctx: SharedContext,
     target: &TargetAddr,
     timeout: Duration,
+    bind_interface: Option<&str>,
 ) -> io::Result<BackendStream> {
     let addr = format!("{}:{}", host, port);
-    let tcp = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+    let tcp = super::tcp_connect_raw(&addr, bind_interface, timeout)
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "SS backend TCP connect timeout"))?
         .map_err(|e| {
             io::Error::new(e.kind(), format!("SS backend TCP connect to {}: {}", addr, e))
         })?;

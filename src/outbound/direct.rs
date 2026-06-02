@@ -4,7 +4,6 @@
 
 use std::io;
 use std::time::Duration;
-use tokio::net::TcpStream;
 
 use super::{BackendStream, TargetAddr};
 
@@ -12,21 +11,20 @@ use super::{BackendStream, TargetAddr};
 pub async fn direct_connect(
     target: &TargetAddr,
     timeout: Duration,
+    bind_interface: Option<&str>,
 ) -> io::Result<BackendStream> {
     let tcp = match target {
         TargetAddr::Domain(host, port) => {
             let addr = format!("{}:{}", host, port);
-            tokio::time::timeout(timeout, TcpStream::connect(&addr))
+            super::tcp_connect_raw(&addr, bind_interface, timeout)
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct connect timeout"))?
                 .map_err(|e| {
                     io::Error::new(e.kind(), format!("direct connect to {}: {}", addr, e))
                 })?
         }
         TargetAddr::Ip(addr) => {
-            tokio::time::timeout(timeout, TcpStream::connect(addr))
+            super::tcp_connect_raw(*addr, bind_interface, timeout)
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct connect timeout"))?
                 .map_err(|e| {
                     io::Error::new(e.kind(), format!("direct connect to {}: {}", addr, e))
                 })?
@@ -58,7 +56,7 @@ mod tests {
         });
 
         let target = TargetAddr::Domain("127.0.0.1".to_string(), port);
-        let mut client = direct_connect(&target, Duration::from_secs(5))
+        let mut client = direct_connect(&target, Duration::from_secs(5), None)
             .await
             .unwrap();
 
