@@ -36,41 +36,46 @@ inbounds:
 # bind_interface: "eno" # Linux interface (or "en0" on macOS)
 
 # All individual physical backends.
-# Each backend must define exactly one of:
-#   address:     "host:port"                 — TCP backend
-#   unix_socket: "/path/to/socks5.sock"      — Unix domain socket backend
+# Each backend must specify:
+#   type:             "socks5", "ss", "uds", or "direct"
+#   address:          "host:port" (for socks5/ss) or socket path (for uds)
+#   username/password: SOCKS5 credentials or Shadowsocks cipher-method/passphrase
 backends:
-  - address: "127.0.0.1:10800"
+  - type: socks5
+    address: "127.0.0.1:10800"
     name: "backend-us-1"
     username: "user1"
     password: "pass1"
 
-  - address: "127.0.0.1:10801"
+  - type: socks5
+    address: "127.0.0.1:10801"
     name: "backend-us-2"
     # Example: Bind to a specific network interface
     # Forces all outbound connections through this interface (avoids using default route).
     # bind_interface: "eno" # Linux interface (or "en0" on macOS)
 
-
   # Example: Unix domain socket backend
-  # socks5 over domain socket
-  - unix_socket: "/run/my-proxy/socks5.sock"
+  # SOCKS5 over Unix domain socket
+  - type: uds
+    address: "/run/my-proxy/socks5.sock"
     name: "local-uds"
 
   # Example: Direct outbound connection
   # Connects directly to the target address without using any remote proxy backend.
-  - direct: true
+  - type: direct
     name: "direct-out"
 
   # Example: Shadowsocks backend
   # The backend is a Shadowsocks server; proxylb speaks the SS client protocol.
-  # Pool refill pre-establishes TCP connections eagerly; the AEAD header (with
-  # the target address) is sent on first write when a real request arrives.
+  # For Shadowsocks backends:
+  #   username: cipher method (e.g. "chacha20-ietf-poly1305" or "aes-256-gcm")
+  #   password: shadowsocks pre-shared key
   #
-  # - address: "ss-server.example.com:8388"
+  # - type: ss
+  #   address: "ss-server.example.com:8388"
   #   name: "ss-backend-1"
-  #   ss_password: "my-shadowsocks-password"
-  #   ss_method: "chacha20-ietf-poly1305"   # or "aes-256-gcm", "aes-128-gcm"
+  #   username: "chacha20-ietf-poly1305"
+  #   password: "my-shadowsocks-password"
   #   pool_size: 10
 
 # Backend groups let you cluster individual backends.

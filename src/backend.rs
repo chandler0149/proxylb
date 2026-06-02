@@ -91,33 +91,39 @@ impl BackendInfo {
         index: usize,
         global_bind_interface: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let endpoint = if cfg.direct {
-            BackendEndpoint::Direct
-        } else {
-            match (&cfg.address, &cfg.unix_socket) {
-                (Some(addr), None) => {
-                    // Parse "host:port"
-                    if let Some(pos) = addr.rfind(':') {
-                        let host = addr[..pos].to_string();
-                        let port: u16 = addr[pos + 1..].parse().map_err(|_| {
-                            anyhow::anyhow!("invalid port in backend address: {}", addr)
-                        })?;
-                        BackendEndpoint::Tcp { host, port }
-                    } else {
-                        anyhow::bail!("backend address must be in host:port format: {}", addr);
-                    }
-                }
-                (None, Some(path)) => BackendEndpoint::Unix { path: path.clone() },
-                // Both Some or both None are caught by config validation before we get here.
-                _ => unreachable!("config validation ensures exactly one of address/unix_socket or direct"),
+        let is_direct = cfg.backend_type == "direct";
+
+        let endpoint = match cfg.backend_type.as_str() {
+            "direct" => BackendEndpoint::Direct,
+            "uds" => {
+                let path = cfg.address.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("uds backend must specify socket path in address")
+                })?;
+                BackendEndpoint::Unix { path: path.clone() }
             }
+            "socks5" | "ss" | "shadowsocks" => {
+                let addr = cfg.address.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("socks5/ss backend must specify address")
+                })?;
+                // Parse "host:port"
+                if let Some(pos) = addr.rfind(':') {
+                    let host = addr[..pos].to_string();
+                    let port: u16 = addr[pos + 1..].parse().map_err(|_| {
+                        anyhow::anyhow!("invalid port in backend address: {}", addr)
+                    })?;
+                    BackendEndpoint::Tcp { host, port }
+                } else {
+                    anyhow::bail!("backend address must be in host:port format: {}", addr);
+                }
+            }
+            other => anyhow::bail!("unknown backend type: {}", other),
         };
 
         let name = cfg
             .name
             .clone()
             .unwrap_or_else(|| {
-                if cfg.direct {
+                if is_direct {
                     format!("direct-{}", index)
                 } else {
                     format!("backend-{}", index)
@@ -125,42 +131,42 @@ impl BackendInfo {
             });
 
         // Build Shadowsocks config if this is an SS backend.
-        let (ss_config, ss_context) = match (&cfg.ss_password, &cfg.ss_method) {
-            (Some(pass), Some(method_str)) => {
-                // Extract host:port from the TCP endpoint — validation guarantees
-                // this is a TCP backend when ss_password is set.
-                let addr = cfg.address.as_deref().expect("ss backend must have address");
-                let dummy_sock: std::net::SocketAddr = addr
-                    .parse()
-                    .or_else(|_| {
-                        // Handle bare host:port by trying to parse into SocketAddr.
-                        // If that fails we construct one from parts.
-                        if let Some(pos) = addr.rfind(':') {
-                            let port: u16 = addr[pos + 1..].parse()?;
-                            let host_str = &addr[..pos];
-                            // Use a placeholder IP; the real address is in BackendEndpoint.
-                            let ip: std::net::IpAddr = host_str.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                            Ok(std::net::SocketAddr::new(ip, port))
-                        } else {
-                            Err(anyhow::anyhow!("invalid address"))
-                        }
-                    })
-                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        let (ss_config, ss_context) = if cfg.backend_type == "ss" || cfg.backend_type == "shadowsocks" {
+            let method_str = cfg.username.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("ss backend must specify method in username field")
+            })?;
+            let pass = cfg.password.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("ss backend must specify password in password field")
+            })?;
+            let addr = cfg.address.as_deref().expect("ss backend must have address");
+            let dummy_sock: std::net::SocketAddr = addr
+                .parse()
+                .or_else(|_| {
+                    if let Some(pos) = addr.rfind(':') {
+                        let port: u16 = addr[pos + 1..].parse()?;
+                        let host_str = &addr[..pos];
+                        let ip: std::net::IpAddr = host_str.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                        Ok(std::net::SocketAddr::new(ip, port))
+                    } else {
+                        Err(anyhow::anyhow!("invalid address"))
+                    }
+                })
+                .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
 
-                let method: shadowsocks::crypto::CipherKind = method_str
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("unsupported ss_method: {}", method_str))?;
+            let method: shadowsocks::crypto::CipherKind = method_str
+                .parse()
+                .map_err(|_| anyhow::anyhow!("unsupported ss_method: {}", method_str))?;
 
-                let ss_cfg = SsServerConfig::new(dummy_sock, pass.as_str(), method)
-                    .map_err(|e| anyhow::anyhow!("shadowsocks config error for backend '{}': {}", name, e))?;
+            let ss_cfg = SsServerConfig::new(dummy_sock, pass, method)
+                .map_err(|e| anyhow::anyhow!("shadowsocks config error for backend '{}': {}", name, e))?;
 
-                let ctx = SsContext::new_shared(shadowsocks::config::ServerType::Local);
-                (Some(Arc::new(ss_cfg)), Some(ctx))
-            }
-            _ => (None, None),
+            let ctx = SsContext::new_shared(shadowsocks::config::ServerType::Local);
+            (Some(Arc::new(ss_cfg)), Some(ctx))
+        } else {
+            (None, None)
         };
 
-        let pool_size = if cfg.direct { 0 } else { cfg.pool_size };
+        let pool_size = if is_direct { 0 } else { cfg.pool_size };
         let bind_interface = cfg
             .bind_interface
             .clone()
@@ -1105,15 +1111,12 @@ mod tests {
 
     fn make_cfg(addr: &str, name: &str) -> BackendConfig {
         BackendConfig {
+            backend_type: "socks5".to_string(),
             address: Some(addr.to_string()),
-            unix_socket: None,
             username: None,
             password: None,
             name: Some(name.to_string()),
             pool_size: 1,
-            ss_password: None,
-            ss_method: None,
-            direct: false,
             bind_interface: None,
         }
     }
@@ -1363,15 +1366,12 @@ mod tests {
 
         // Reload with b1 having updated pool_size and credentials
         let b1_updated = BackendConfig {
+            backend_type: "socks5".to_string(),
             address: Some("127.0.0.1:8081".to_string()),
-            unix_socket: None,
             username: Some("new-user".to_string()),
             password: Some("new-pass".to_string()),
             name: Some("b1".to_string()),
             pool_size: 3,
-            ss_password: None,
-            ss_method: None,
-            direct: false,
             bind_interface: None,
         };
 

@@ -127,42 +127,25 @@ impl Default for FilterConfig {
 
 /// A backend entry.
 ///
-/// Exactly one of `address` (TCP) or `unix_socket` (Unix domain socket path)
-/// must be set. Setting both or neither is a configuration error.
-///
-/// If `ss_password` and `ss_method` are both present the backend is treated as
-/// a **Shadowsocks** server; otherwise it is a plain SOCKS5h backend.
+/// If the backend `type` is "ss" or "shadowsocks", the backend is treated as
+/// a **Shadowsocks** server; otherwise it is a SOCKS5h/UDS backend.
 #[derive(Debug, Deserialize, Clone)]
 pub struct BackendConfig {
-    /// TCP backend address in the form "host:port".
-    /// Mutually exclusive with `unix_socket`.
+    /// Type of the backend: "socks5", "ss" (or "shadowsocks"), "uds", "direct"
+    #[serde(rename = "type")]
+    pub backend_type: String,
+    /// TCP address "host:port" or UDS socket path
     pub address: Option<String>,
-    /// Path to a Unix domain socket for the backend.
-    /// Mutually exclusive with `address`.
-    pub unix_socket: Option<String>,
-    /// Optional SOCKS5 username for backend authentication.
-    /// Ignored when the backend is a Shadowsocks server.
+    /// Optional SOCKS5 username or Shadowsocks cipher method
     pub username: Option<String>,
-    /// Optional SOCKS5 password for backend authentication.
-    /// Ignored when the backend is a Shadowsocks server.
+    /// Optional SOCKS5 password or Shadowsocks password
     pub password: Option<String>,
     /// Human-readable name for the backend (auto-generated if not set).
     pub name: Option<String>,
     /// Number of pre-connected connections to maintain in the pool (default: 10).
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
-
-    // ── Shadowsocks backend fields ───────────────────────────────────────────
-    /// Shadowsocks password (enables SS backend when combined with `ss_method`).
-    pub ss_password: Option<String>,
-    /// Shadowsocks cipher method, e.g. "chacha20-ietf-poly1305" or "aes-256-gcm".
-    pub ss_method: Option<String>,
-
-    // ── Direct outbound backend fields ───────────────────────────────────────
-    /// Whether this is a direct connection outbound backend (default: false).
-    #[serde(default)]
-    pub direct: bool,
-    /// Optional network interface to bind when connecting outbound (e.g. "eno" on Linux, "en0" on macOS).
+    /// Optional network interface to bind when connecting outbound.
     pub bind_interface: Option<String>,
 }
 
@@ -309,40 +292,32 @@ impl Config {
                 .map(|n| format!("backend '{}'", n))
                 .unwrap_or_else(|| format!("backend[{}]", i));
 
-            if backend.direct {
-                if backend.address.is_some() || backend.unix_socket.is_some() {
-                    anyhow::bail!(
-                        "{}: direct backend must not specify 'address' or 'unix_socket'",
-                        label
-                    );
-                }
-                if backend.ss_password.is_some() || backend.ss_method.is_some() {
-                    anyhow::bail!(
-                        "{}: direct backend must not specify Shadowsocks settings ('ss_password' or 'ss_method')",
-                        label
-                    );
-                }
-                if backend.username.is_some() || backend.password.is_some() {
-                    anyhow::bail!(
-                        "{}: direct backend must not specify SOCKS5 authentication credentials ('username' or 'password')",
-                        label
-                    );
-                }
-            } else {
-                match (&backend.address, &backend.unix_socket) {
-                    (Some(_), None) | (None, Some(_)) => {} // exactly one set — OK
-                    (Some(_), Some(_)) => {
-                        anyhow::bail!(
-                            "{}: 'address' and 'unix_socket' are mutually exclusive",
-                            label
-                        );
+            match backend.backend_type.as_str() {
+                "socks5" => {
+                    if backend.address.is_none() {
+                        anyhow::bail!("{}: SOCKS5 backend must specify 'address' (host:port)", label);
                     }
-                    (None, None) => {
-                        anyhow::bail!(
-                            "{}: one of 'address' or 'unix_socket' must be set",
-                            label
-                        );
+                }
+                "ss" | "shadowsocks" => {
+                    if backend.address.is_none() {
+                        anyhow::bail!("{}: Shadowsocks backend must specify 'address' (host:port)", label);
                     }
+                    if backend.username.is_none() || backend.password.is_none() {
+                        anyhow::bail!("{}: Shadowsocks backend must specify cipher method in 'username' and password in 'password'", label);
+                    }
+                }
+                "uds" => {
+                    if backend.address.is_none() {
+                        anyhow::bail!("{}: UDS SOCKS5 backend must specify 'address' (unix socket path)", label);
+                    }
+                }
+                "direct" => {
+                    if backend.address.is_some() || backend.username.is_some() || backend.password.is_some() {
+                        anyhow::bail!("{}: direct backend must not specify 'address', 'username', or 'password'", label);
+                    }
+                }
+                other => {
+                    anyhow::bail!("{}: unknown backend type '{}'", label, other);
                 }
             }
         }
@@ -416,22 +391,11 @@ impl Config {
                 .as_deref()
                 .map(|n| format!("backend '{}'", n))
                 .unwrap_or_else(|| format!("backend[{}]", i));
-            match (&backend.ss_password, &backend.ss_method) {
-                (Some(_), Some(m)) => {
+            if backend.backend_type == "ss" || backend.backend_type == "shadowsocks" {
+                if let Some(m) = &backend.username {
                     m.parse::<shadowsocks::crypto::CipherKind>()
                         .map_err(|_| anyhow::anyhow!("{}: unsupported ss_method '{}'", label, m))?;
                 }
-                (Some(_), None) => {
-                    anyhow::bail!("{}: 'ss_method' is required when 'ss_password' is set", label);
-                }
-                (None, Some(_)) => {
-                    anyhow::bail!("{}: 'ss_password' is required when 'ss_method' is set", label);
-                }
-                (None, None) => {} // plain SOCKS5 backend
-            }
-            // Shadowsocks backends must use TCP (not Unix sockets).
-            if backend.ss_password.is_some() && backend.unix_socket.is_some() {
-                anyhow::bail!("{}: Shadowsocks backend must use 'address', not 'unix_socket'", label);
             }
         }
 
@@ -449,8 +413,8 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false, bind_interface: None },
-                BackendConfig { address: Some("127.0.0.1:8082".to_string()), unix_socket: None, name: Some("b2".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false, bind_interface: None },
+                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None },
+                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8082".to_string()), name: Some("b2".to_string()), username: None, password: None, pool_size: 1, bind_interface: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -469,7 +433,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false, bind_interface: None },
+                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -490,7 +454,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { address: Some("127.0.0.1:8081".to_string()), unix_socket: None, name: Some("b1".to_string()), username: None, password: None, pool_size: 1, ss_password: None, ss_method: None, direct: false, bind_interface: None },
+                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -520,7 +484,8 @@ inbounds:
   - type: http
     listen: "127.0.0.1:8080"
 backends:
-  - address: "127.0.0.1:8081"
+  - type: socks5
+    address: "127.0.0.1:8081"
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.validate().is_ok());
@@ -559,11 +524,11 @@ backends:
         let yaml = r#"
 backends:
   - name: "direct-out"
-    direct: true
+    type: direct
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.validate().is_ok());
-        assert_eq!(cfg.backends[0].direct, true);
+        assert_eq!(cfg.backends[0].backend_type, "direct");
     }
 
     #[test]
@@ -571,7 +536,7 @@ backends:
         let yaml = r#"
 backends:
   - name: "direct-out"
-    direct: true
+    type: direct
     address: "127.0.0.1:1080"
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
@@ -583,9 +548,9 @@ backends:
         let yaml = r#"
 backends:
   - name: "direct-out"
-    direct: true
-    ss_password: "password"
-    ss_method: "aes-256-gcm"
+    type: direct
+    username: "aes-256-gcm"
+    password: "password"
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.validate().is_err());
