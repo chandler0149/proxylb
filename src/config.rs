@@ -147,6 +147,8 @@ pub struct BackendConfig {
     pub pool_size: usize,
     /// Optional network interface to bind when connecting outbound.
     pub bind_interface: Option<String>,
+    /// Whether the backend is enabled initially (default: true).
+    pub enabled: Option<bool>,
 }
 
 fn default_pool_size() -> usize {
@@ -413,8 +415,8 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None },
-                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8082".to_string()), name: Some("b2".to_string()), username: None, password: None, pool_size: 1, bind_interface: None },
+                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None, enabled: None },
+                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8082".to_string()), name: Some("b2".to_string()), username: None, password: None, pool_size: 1, bind_interface: None, enabled: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -433,7 +435,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None },
+                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None, enabled: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -454,7 +456,7 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None },
+                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None, enabled: None },
             ],
             groups: vec![
                 GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
@@ -554,5 +556,27 @@ backends:
 "#;
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_socks5_uds_inbound_parsing() {
+        let yaml = r#"
+inbounds:
+  - type: socks5
+    listen: "unix:///tmp/proxylb-socks.sock"
+backends:
+  - type: direct
+    name: "direct-out"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
+        let inbounds = cfg.all_inbounds();
+        assert_eq!(inbounds.len(), 1);
+        match &inbounds[0] {
+            InboundItemConfig::Socks5 { listen, .. } => {
+                assert_eq!(listen, "unix:///tmp/proxylb-socks.sock");
+            }
+            _ => panic!("Expected Socks5 inbound"),
+        }
     }
 }

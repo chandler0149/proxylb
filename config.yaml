@@ -46,6 +46,7 @@ backends:
     name: "backend-us-1"
     username: "user1"
     password: "pass1"
+    # enabled: true # Whether this backend is initially active (default: true)
 
   - type: socks5
     address: "127.0.0.1:10801"

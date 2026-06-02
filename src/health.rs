@@ -89,7 +89,10 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
 
     let mut handles = Vec::with_capacity(backends.len());
 
-    for (index, info, _healthy) in backends {
+    for (index, info, _healthy, enabled) in backends {
+        if !enabled {
+            continue;
+        }
         let pool = pool.clone();
         let target = target.clone();
         let info = info.clone();

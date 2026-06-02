@@ -69,11 +69,49 @@ struct ApiResponse {
 
 /// Create the axum router.
 pub fn create_router(pool: BackendPool) -> Router {
+    use axum::routing::post;
     Router::new()
         .route("/", get(dashboard_html))
         .route("/api/status", get(api_status))
+        .route("/api/backends/:name/enable", post(api_enable_backend))
+        .route("/api/backends/:name/disable", post(api_disable_backend))
         .with_state(pool)
 }
+
+/// POST /api/backends/:name/enable
+async fn api_enable_backend(
+    State(pool): State<BackendPool>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match pool.set_backend_enabled(&name, true).await {
+        Ok(found) => {
+            if found {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::NOT_FOUND
+            }
+        }
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// POST /api/backends/:name/disable
+async fn api_disable_backend(
+    State(pool): State<BackendPool>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    match pool.set_backend_enabled(&name, false).await {
+        Ok(found) => {
+            if found {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::NOT_FOUND
+            }
+        }
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 
 /// Run the web status server.
 pub async fn run_web_server(listen_addr: String, pool: BackendPool) -> anyhow::Result<()> {
@@ -187,6 +225,12 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             background: rgba(0, 176, 255, 0.1);
             color: var(--accent-blue);
             border: 1px solid rgba(0, 176, 255, 0.2);
+        }}
+
+        .inbound-badge.socks5-uds {{
+            background: rgba(233, 30, 99, 0.1);
+            color: #e91e63;
+            border: 1px solid rgba(233, 30, 99, 0.2);
         }}
 
         .inbound-badge.shadowsocks {{
@@ -674,6 +718,12 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
             border: 1px solid rgba(255, 61, 113, 0.25);
         }}
 
+        .status-disabled {{
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-secondary);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }}
+
         .card .status-dot {{
             width: 7px;
             height: 7px;
@@ -688,6 +738,11 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
         .status-unhealthy .status-dot {{
             background: var(--accent-red);
             box-shadow: 0 0 6px var(--accent-red);
+        }}
+
+        .status-disabled .status-dot {{
+            background: var(--text-secondary);
+            box-shadow: none;
         }}
 
         .metrics {{
@@ -1301,9 +1356,9 @@ async fn dashboard_html(State(pool): State<BackendPool>) -> impl IntoResponse {
                             </div>
                             <div class="card-address">${{b.address}}</div>
                         </div>
-                        <span class="status-badge ${{b.healthy ? 'status-healthy' : 'status-unhealthy'}}">
+                        <span class="status-badge ${{!b.enabled ? 'status-disabled' : (b.healthy ? 'status-healthy' : 'status-unhealthy')}}">
                             <span class="status-dot"></span>
-                            ${{b.healthy ? 'Healthy' : 'Unhealthy'}}
+                            ${{!b.enabled ? 'Disabled' : (b.healthy ? 'Healthy' : 'Unhealthy')}}
                         </span>
                     </div>
                     <div class="metrics">

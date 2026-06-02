@@ -83,6 +83,7 @@ pub struct BackendInfo {
     /// Shared Shadowsocks context — one per backend, reused across pool connections.
     pub ss_context: Option<SharedContext>,
     pub bind_interface: Option<String>,
+    pub enabled: Option<bool>,
 }
 
 impl BackendInfo {
@@ -181,6 +182,7 @@ impl BackendInfo {
             ss_config,
             ss_context,
             bind_interface,
+            enabled: cfg.enabled,
         })
     }
 
@@ -213,6 +215,7 @@ pub struct HealthCheckResult {
 #[derive(Debug, Clone)]
 pub struct BackendStatus {
     pub healthy: bool,
+    pub enabled: bool,
     pub last_check: Option<Instant>,
     pub last_latency: Option<Duration>,
     pub consecutive_failures: u32,
@@ -224,6 +227,7 @@ impl Default for BackendStatus {
         Self {
             // Assume healthy initially — the first health check will confirm.
             healthy: true,
+            enabled: true,
             last_check: None,
             last_latency: None,
             consecutive_failures: 0,
@@ -243,6 +247,7 @@ pub struct BackendEntry {
     pub pool_rx: flume::Receiver<BackendStream>,
     /// Cancels this entry's `refill_pool_task` when the backend is removed.
     pub cancel: CancellationToken,
+    pub enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Serializable backend status for the web API.
@@ -251,6 +256,7 @@ pub struct BackendStatusView {
     pub name: String,
     pub address: String,
     pub healthy: bool,
+    pub enabled: bool,
     pub last_latency_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub history: Vec<HealthCheckResult>,
@@ -428,7 +434,7 @@ fn calculate_candidates(
             Target::Backend(idx) => {
                 if let Some(entry) = entries.get(*idx) {
                     let status = entry.status.lock().unwrap();
-                    if status.healthy && !added_healthy.contains(idx) {
+                    if status.enabled && status.healthy && !added_healthy.contains(idx) {
                         healthy_candidates.push((*idx, entry.info.clone()));
                         added_healthy.insert(*idx);
                     }
@@ -441,7 +447,7 @@ fn calculate_candidates(
                     for &idx in &group.backend_indices {
                         if let Some(entry) = entries.get(idx) {
                             let status = entry.status.lock().unwrap();
-                            if status.healthy && !added_healthy.contains(&idx) {
+                            if status.enabled && status.healthy && !added_healthy.contains(&idx) {
                                 group_healthy.push((idx, entry.info.clone(), status.last_latency));
                             }
                         }
@@ -484,7 +490,7 @@ fn calculate_candidates(
             Target::Backend(idx) => {
                 if let Some(entry) = entries.get(*idx) {
                     let status = entry.status.lock().unwrap();
-                    if !status.healthy && !added_healthy.contains(idx) && !added_unhealthy.contains(idx) {
+                    if status.enabled && !status.healthy && !added_healthy.contains(idx) && !added_unhealthy.contains(idx) {
                         unhealthy_candidates.push((*idx, entry.info.clone()));
                         added_unhealthy.insert(*idx);
                     }
@@ -497,7 +503,7 @@ fn calculate_candidates(
                     for &idx in &group.backend_indices {
                         if let Some(entry) = entries.get(idx) {
                             let status = entry.status.lock().unwrap();
-                            if !status.healthy && !added_healthy.contains(&idx) && !added_unhealthy.contains(&idx) {
+                            if status.enabled && !status.healthy && !added_healthy.contains(&idx) && !added_unhealthy.contains(&idx) {
                                 group_unhealthy.push((idx, entry.info.clone(), status.last_latency));
                             }
                         }
@@ -545,18 +551,24 @@ impl BackendPool {
             let info = BackendInfo::from_config(cfg, i, global_bind_interface)?;
             let cancel = CancellationToken::new();
             let (tx, rx) = flume::bounded(info.pool_size.max(1));
+            let initial_enabled = info.enabled.unwrap_or(true);
+            let enabled_atomic = Arc::new(std::sync::atomic::AtomicBool::new(initial_enabled));
+
+            let mut status = BackendStatus::default();
+            status.enabled = initial_enabled;
 
             let entry = BackendEntry {
                 info: info.clone(),
-                status: std::sync::Mutex::new(BackendStatus::default()),
+                status: std::sync::Mutex::new(status),
                 traffic: Arc::new(TrafficCounters::default()),
-                pool_rx: rx,
+                pool_rx: rx.clone(),
                 cancel: cancel.clone(),
+                enabled: enabled_atomic.clone(),
             };
             entries.push(entry);
 
             // Spawn refill task for this backend.
-            tokio::spawn(refill_pool_task(info, tx, cancel));
+            tokio::spawn(refill_pool_task(info, enabled_atomic, tx, rx, cancel));
         }
 
         let (groups, failover_order) = build_groups_and_failover_order(&entries, group_configs, failover_order_cfg);
@@ -576,9 +588,7 @@ impl BackendPool {
             cached,
             inbound_stats: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
-    }
-
-    /// Register a new inbound listener dynamically or return existing stats if already registered.
+    }    /// Register a new inbound listener dynamically or return existing stats if already registered.
     pub fn register_inbound(
         &self,
         name: String,
@@ -659,6 +669,14 @@ impl BackendPool {
                     || entry.info.password != new_info.password
                     || entry.info.pool_size != new_info.pool_size;
 
+                if let Some(new_enabled) = new_info.enabled {
+                    entry.enabled.store(new_enabled, std::sync::atomic::Ordering::Relaxed);
+                    entry.status.lock().unwrap().enabled = new_enabled;
+                    if !new_enabled {
+                        while entry.pool_rx.try_recv().is_ok() {}
+                    }
+                }
+
                 entry.info = new_info.clone();
 
                 if creds_or_pool_changed {
@@ -669,11 +687,11 @@ impl BackendPool {
                     let new_cancel = CancellationToken::new();
                     let (tx, rx) = flume::bounded(new_info.pool_size.max(1));
 
-                    entry.pool_rx = rx;
+                    entry.pool_rx = rx.clone();
                     entry.cancel = new_cancel.clone();
 
                     // Spawn the new refill task with new configuration and channel
-                    tokio::spawn(refill_pool_task(new_info, tx, new_cancel));
+                    tokio::spawn(refill_pool_task(new_info, entry.enabled.clone(), tx, rx, new_cancel));
                 }
 
                 new_entries.push(entry);
@@ -682,15 +700,22 @@ impl BackendPool {
                 // Brand-new backend.
                 let cancel = CancellationToken::new();
                 let (tx, rx) = flume::bounded(new_info.pool_size.max(1));
+                let initial_enabled = new_info.enabled.unwrap_or(true);
+                let enabled_atomic = Arc::new(std::sync::atomic::AtomicBool::new(initial_enabled));
+
+                let mut status = BackendStatus::default();
+                status.enabled = initial_enabled;
+
                 let entry = BackendEntry {
                     info: new_info.clone(),
-                    status: std::sync::Mutex::new(BackendStatus::default()),
+                    status: std::sync::Mutex::new(status),
                     traffic: Arc::new(TrafficCounters::default()),
-                    pool_rx: rx,
+                    pool_rx: rx.clone(),
                     cancel: cancel.clone(),
+                    enabled: enabled_atomic.clone(),
                 };
                 new_entries.push(entry);
-                tokio::spawn(refill_pool_task(new_info, tx, cancel));
+                tokio::spawn(refill_pool_task(new_info, enabled_atomic, tx, rx, cancel));
                 added += 1;
             }
         }
@@ -741,14 +766,17 @@ impl BackendPool {
         guard.entries.get(index).map(|e| Arc::clone(&e.traffic))
     }
 
-    /// Get the info of all backends with their index and current health.
-    /// Returns (index, BackendInfo, is_healthy) for each backend in priority order.
-    pub async fn get_backends_in_order(&self) -> Vec<(usize, BackendInfo, bool)> {
+    /// Get the info of all backends with their index, current health, and enabled state.
+    /// Returns (index, BackendInfo, is_healthy, is_enabled) for each backend in priority order.
+    pub async fn get_backends_in_order(&self) -> Vec<(usize, BackendInfo, bool, bool)> {
         let guard = self.inner.read().await;
         guard.entries
             .iter()
             .enumerate()
-            .map(|(i, e)| (i, e.info.clone(), e.status.lock().unwrap().healthy))
+            .map(|(i, e)| {
+                let status = e.status.lock().unwrap();
+                (i, e.info.clone(), status.healthy, status.enabled)
+            })
             .collect()
     }
 
@@ -815,6 +843,40 @@ impl BackendPool {
         }
     }
 
+    /// Dynamically enable or disable a backend by name.
+    /// Returns `Ok(true)` if found, `Ok(false)` if not found.
+    pub async fn set_backend_enabled(&self, name: &str, enabled: bool) -> anyhow::Result<bool> {
+        let guard = self.inner.read().await;
+        let mut found = false;
+        for entry in &guard.entries {
+            if entry.info.name == name {
+                // Set the atomic flag for the refill task
+                entry.enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+                
+                // Update the status for the health/candidate selection
+                let mut status = entry.status.lock().unwrap();
+                status.enabled = enabled;
+
+                if !enabled {
+                    // Drain the connection pool immediately from the control thread.
+                    // This instantly unblocks any blocking `tx.send_async` in the refill task.
+                    while entry.pool_rx.try_recv().is_ok() {}
+                }
+                
+                found = true;
+                break;
+            }
+        }
+
+        if found {
+            drop(guard);
+            self.recalculate_candidates().await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Recalculate candidates and cache them.
     pub async fn recalculate_candidates(&self) {
         let guard = self.inner.read().await;
@@ -839,6 +901,7 @@ impl BackendPool {
                 name: e.info.name.clone(),
                 address: e.info.endpoint.display(),
                 healthy: status.healthy,
+                enabled: status.enabled,
                 last_latency_ms: status.last_latency.map(|d| d.as_millis() as u64),
                 consecutive_failures: status.consecutive_failures,
                 history: status.history.iter().cloned().collect(),
@@ -871,6 +934,7 @@ impl BackendPool {
                 name: e.info.name.clone(),
                 address: e.info.endpoint.display(),
                 healthy: status.healthy,
+                enabled: status.enabled,
                 last_latency_ms: status.last_latency.map(|d| d.as_millis() as u64),
                 consecutive_failures: status.consecutive_failures,
                 history: status.history.iter().cloned().collect(),
@@ -970,7 +1034,13 @@ pub async fn run_candidate_selector(pool: BackendPool, cancel: tokio_util::sync:
 /// setup.
 ///
 /// Exits cleanly when `cancel` is cancelled (backend removed during hot reload).
-async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>, cancel: CancellationToken) {
+async fn refill_pool_task(
+    info: BackendInfo,
+    enabled: Arc<std::sync::atomic::AtomicBool>,
+    tx: flume::Sender<BackendStream>,
+    rx: flume::Receiver<BackendStream>,
+    cancel: CancellationToken,
+) {
     if info.is_direct() {
         // Direct connections are established on demand and cannot be pre-connected/pooled.
         return;
@@ -979,6 +1049,19 @@ async fn refill_pool_task(info: BackendInfo, tx: flume::Sender<BackendStream>, c
     let retry_interval = Duration::from_secs(5);
 
     loop {
+        if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            // Drain all pre-connected connections from the channel so they are dropped and closed immediately.
+            while rx.try_recv().is_ok() {}
+
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+            continue;
+        }
         // ── Shadowsocks backend: pre-connect TCP only ────────────────────────
         if info.is_shadowsocks() {
             let result: std::io::Result<BackendStream> = match &info.endpoint {
@@ -1118,6 +1201,7 @@ mod tests {
             name: Some(name.to_string()),
             pool_size: 1,
             bind_interface: None,
+            enabled: None,
         }
     }
 
@@ -1373,6 +1457,7 @@ mod tests {
             name: Some("b1".to_string()),
             pool_size: 3,
             bind_interface: None,
+            enabled: None,
         };
 
         let (added, removed, kept) = pool.reload(
@@ -1420,5 +1505,47 @@ mod tests {
         assert_eq!(guard.entries[0].info.bind_interface.as_deref(), Some("eno0"));
         // b2 should resolve to the backend-specific bind interface "eno1" (override)
         assert_eq!(guard.entries[1].info.bind_interface.as_deref(), Some("eno1"));
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enable_disable() {
+        let b1 = make_cfg("127.0.0.1:8081", "b1");
+        let b2 = make_cfg("127.0.0.1:8082", "b2");
+
+        let pool = BackendPool::new(
+            &[b1, b2],
+            &[],
+            None,
+            None,
+        ).unwrap();
+
+        // 1. Initially, both should be enabled and in candidates list.
+        let (healthy, _) = pool.get_candidates().await;
+        assert_eq!(healthy.len(), 2);
+        assert_eq!(healthy[0].1.name, "b1");
+        assert_eq!(healthy[1].1.name, "b2");
+
+        // 2. Disable b1
+        let found = pool.set_backend_enabled("b1", false).await.unwrap();
+        assert!(found);
+
+        // b1 should be removed from candidates immediately.
+        let (healthy, _) = pool.get_candidates().await;
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].1.name, "b2");
+
+        // 3. Enable b1 again
+        let found = pool.set_backend_enabled("b1", true).await.unwrap();
+        assert!(found);
+
+        // b1 should return immediately.
+        let (healthy, _) = pool.get_candidates().await;
+        assert_eq!(healthy.len(), 2);
+        assert_eq!(healthy[0].1.name, "b1");
+        assert_eq!(healthy[1].1.name, "b2");
+
+        // 4. Try enabling/disabling a non-existent backend
+        let found = pool.set_backend_enabled("nonexistent", false).await.unwrap();
+        assert!(!found);
     }
 }
