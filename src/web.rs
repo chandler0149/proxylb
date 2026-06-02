@@ -11,51 +11,24 @@ use axum::{
     Router,
 };
 use serde::Serialize;
+use memory_stats::memory_stats;
+
 
 use crate::backend::BackendPool;
 
 /// Memory statistics.
 #[derive(Serialize, Clone, Copy, Debug)]
-pub struct MemoryStats {
-    pub rss: u64,
-    pub vmsize: u64,
+pub struct MemStats {
+    pub rss: usize,
+    pub vmsize: usize,
 }
 
-#[cfg(target_os = "linux")]
-pub fn get_memory_usage() -> MemoryStats {
-    use std::fs::File;
-    use std::io::{BufRead, BufReader};
-
-    let mut rss = 0;
-    let mut vmsize = 0;
-
-    if let Ok(file) = File::open("/proc/self/status") {
-        let reader = BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok) {
-            if line.starts_with("VmRSS:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(kb) = parts[1].parse::<u64>() {
-                        rss = kb * 1024;
-                    }
-                }
-            } else if line.starts_with("VmSize:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(kb) = parts[1].parse::<u64>() {
-                        vmsize = kb * 1024;
-                    }
-                }
-            }
-        }
+pub fn get_memory_usage() -> MemStats {
+    if let Some(usage) = memory_stats() {
+        MemStats { rss: usage.physical_mem, vmsize: usage.virtual_mem }
+    } else {
+        MemStats { rss: 0, vmsize: 0 }
     }
-
-    MemoryStats { rss, vmsize }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn get_memory_usage() -> MemoryStats {
-    MemoryStats { rss: 0, vmsize: 0 }
 }
 
 /// JSON API response.
@@ -63,7 +36,7 @@ pub fn get_memory_usage() -> MemoryStats {
 struct ApiResponse {
     backends: Vec<crate::backend::BackendStatusView>,
     tree: Vec<crate::backend::TreeItem>,
-    memory: MemoryStats,
+    memory: MemStats,
     inbounds: Vec<crate::backend::InboundStatsView>,
 }
 
