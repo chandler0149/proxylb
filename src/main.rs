@@ -38,8 +38,7 @@ struct Args {
     log_level: String,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Initialize async (non-blocking) tracing.
@@ -57,6 +56,75 @@ async fn main() -> anyhow::Result<()> {
         "configuration loaded"
     );
 
+    // Extract CPU affinity configuration.
+    let mut worker_cores = None;
+    let mut ancillary_cores = None;
+    if let Some(ref affinity) = config.cpu_affinity {
+        worker_cores = affinity.worker_cores.clone();
+        ancillary_cores = affinity.ancillary_cores.clone();
+    }
+
+    // Builder for worker runtime.
+    let mut worker_builder = tokio::runtime::Builder::new_multi_thread();
+    worker_builder.enable_all();
+    if let Some(ref cores) = worker_cores {
+        if !cores.is_empty() {
+            let next_core_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cores = cores.clone();
+            worker_builder.on_thread_start(move || {
+                let idx = next_core_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(&core_num) = cores.get(idx % cores.len()) {
+                    if let Some(core_ids) = core_affinity::get_core_ids() {
+                        if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
+                            if core_affinity::set_for_current(core_id) {
+                                tracing::info!("Bound tokio worker thread to CPU core {}", core_num);
+                            } else {
+                                tracing::warn!("Failed to bind tokio worker thread to CPU core {}", core_num);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+    let worker_runtime = worker_builder.build()?;
+    let worker_handle = worker_runtime.handle().clone();
+
+    // Builder for ancillary runtime.
+    let mut ancillary_builder = tokio::runtime::Builder::new_multi_thread();
+    ancillary_builder.enable_all();
+    if let Some(ref cores) = ancillary_cores {
+        if !cores.is_empty() {
+            let next_core_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let cores = cores.clone();
+            ancillary_builder.on_thread_start(move || {
+                let idx = next_core_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(&core_num) = cores.get(idx % cores.len()) {
+                    if let Some(core_ids) = core_affinity::get_core_ids() {
+                        if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
+                            if core_affinity::set_for_current(core_id) {
+                                tracing::info!("Bound tokio ancillary thread to CPU core {}", core_num);
+                            } else {
+                                tracing::warn!("Failed to bind tokio ancillary thread to CPU core {}", core_num);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+    let ancillary_runtime = ancillary_builder.build()?;
+    let ancillary_handle = ancillary_runtime.handle().clone();
+
+    worker_runtime.block_on(main_async(config, args, worker_handle, ancillary_handle))
+}
+
+async fn main_async(
+    config: config::Config,
+    args: Args,
+    worker_handle: tokio::runtime::Handle,
+    ancillary_handle: tokio::runtime::Handle,
+) -> anyhow::Result<()> {
     // Initialize backend pool.
     let pool = backend::BackendPool::new(
         &config.backends,
@@ -71,13 +139,13 @@ async fn main() -> anyhow::Result<()> {
         let health_pool = pool.clone();
         let health_config = config.health_check.clone();
         let token = health_cancel.clone();
-        tokio::spawn(async move {
+        ancillary_handle.spawn(async move {
             health::run_health_checker(health_pool, health_config, token).await;
         });
 
         let selector_pool = pool.clone();
         let token = health_cancel.clone();
-        tokio::spawn(async move {
+        ancillary_handle.spawn(async move {
             backend::run_candidate_selector(selector_pool, token).await;
         });
     }
@@ -86,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
     if config.web.enabled {
         let web_pool = pool.clone();
         let web_listen = config.web.listen.clone();
-        tokio::spawn(async move {
+        ancillary_handle.spawn(async move {
             if let Err(e) = web::run_web_server(web_listen, web_pool).await {
                 tracing::error!(error = %e, "web server failed");
             }
@@ -106,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
                     listen.clone(),
                     "socks5".to_string(),
                 );
-                handles.push(tokio::spawn(async move {
+                handles.push(worker_handle.spawn(async move {
                     if let Err(e) = inbound::socks5::run_socks5_inbound(listen, inbound_pool, stats, filter_enabled).await {
                         tracing::error!(error = %e, "SOCKS5 inbound failed");
                     }
@@ -119,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
                     listen.clone(),
                     "shadowsocks".to_string(),
                 );
-                handles.push(tokio::spawn(async move {
+                handles.push(worker_handle.spawn(async move {
                     if let Err(e) =
                         inbound::shadowsocks::run_shadowsocks_inbound(listen, password, method, inbound_pool, stats, filter_enabled)
                             .await
@@ -135,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
                     listen.clone(),
                     "http".to_string(),
                 );
-                handles.push(tokio::spawn(async move {
+                handles.push(worker_handle.spawn(async move {
                     if let Err(e) = inbound::http::run_http_inbound(listen, inbound_pool, stats, filter_enabled).await {
                         tracing::error!(error = %e, "HTTP inbound failed");
                     }
@@ -168,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
                     &pool,
                     &mut health_cancel,
                     &initial_inbounds,
+                    &ancillary_handle,
                 )
                 .await;
             }
@@ -188,6 +257,7 @@ async fn perform_hot_reload(
     pool: &backend::BackendPool,
     health_cancel: &mut CancellationToken,
     initial_inbounds: &[config::InboundItemConfig],
+    ancillary_handle: &tokio::runtime::Handle,
 ) {
     let new_config = match config::Config::load(config_path) {
         Ok(c) => c,
@@ -228,12 +298,12 @@ async fn perform_hot_reload(
             let health_pool = pool.clone();
             let health_config = new_config.health_check.clone();
             let token = health_cancel.clone();
-            tokio::spawn(async move {
+            ancillary_handle.spawn(async move {
                 health::run_health_checker(health_pool, health_config, token).await;
             });
             let selector_pool = pool.clone();
             let token = health_cancel.clone();
-            tokio::spawn(async move {
+            ancillary_handle.spawn(async move {
                 backend::run_candidate_selector(selector_pool, token).await;
             });
             return;
@@ -246,13 +316,13 @@ async fn perform_hot_reload(
         let health_pool = pool.clone();
         let health_config = new_config.health_check.clone();
         let token = health_cancel.clone();
-        tokio::spawn(async move {
+        ancillary_handle.spawn(async move {
             health::run_health_checker(health_pool, health_config, token).await;
         });
 
         let selector_pool = pool.clone();
         let token = health_cancel.clone();
-        tokio::spawn(async move {
+        ancillary_handle.spawn(async move {
             backend::run_candidate_selector(selector_pool, token).await;
         });
     }

@@ -50,6 +50,7 @@ flume = "0.12"
 # Task cancellation (CancellationToken) for hot reload
 tokio-util = { version = "0.7.18", features = ["rt"] }
 arc-swap = "1.9.1"
+core_affinity = "0.8.3"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.7"

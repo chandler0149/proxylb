@@ -128,3 +128,10 @@ health_check:
 web:
   enabled: true
   listen: "0.0.0.0:9090"
+
+# CPU Affinity settings
+# Bind Tokio worker threads (main proxy traffic relay tasks) and ancillary threads
+# (health check, candidate selection, status dashboard) to specific CPU cores.
+cpu_affinity:
+  worker_cores: [0, 1]      # Core IDs to pin worker threads (hot path)
+  ancillary_cores: [2]     # Core IDs to pin ancillary/background tasks

@@ -27,6 +27,14 @@ pub struct Config {
     pub web: WebConfig,
     /// Optional global network interface to bind when connecting outbound.
     pub bind_interface: Option<String>,
+    #[serde(default)]
+    pub cpu_affinity: Option<CpuAffinityConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct CpuAffinityConfig {
+    pub worker_cores: Option<Vec<usize>>,
+    pub ancillary_cores: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -420,6 +428,7 @@ mod tests {
             health_check: HealthCheckConfig::default(),
             web: WebConfig::default(),
             bind_interface: None,
+            cpu_affinity: None,
         };
         assert!(cfg.validate().is_ok());
     }
@@ -440,6 +449,7 @@ mod tests {
             health_check: HealthCheckConfig::default(),
             web: WebConfig::default(),
             bind_interface: None,
+            cpu_affinity: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("cannot be used in multiple groups"));
@@ -460,6 +470,7 @@ mod tests {
             health_check: HealthCheckConfig::default(),
             web: WebConfig::default(),
             bind_interface: None,
+            cpu_affinity: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("cannot be used as a standalone target"));
@@ -643,5 +654,21 @@ backends:
         assert_eq!(cfg.backends[0].address.as_deref().unwrap(), "unix:///tmp/ss.sock");
         assert_eq!(cfg.backends[1].backend_type, "socks5");
         assert_eq!(cfg.backends[1].address.as_deref().unwrap(), "unix:///tmp/socks5.sock");
+    }
+
+    #[test]
+    fn test_cpu_affinity_parsing() {
+        let yaml = r#"
+backends:
+  - type: direct
+cpu_affinity:
+  worker_cores: [0, 1, 2]
+  ancillary_cores: [3, 4]
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
+        let affinity = cfg.cpu_affinity.unwrap();
+        assert_eq!(affinity.worker_cores.unwrap(), vec![0, 1, 2]);
+        assert_eq!(affinity.ancillary_cores.unwrap(), vec![3, 4]);
     }
 }
