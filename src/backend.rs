@@ -13,7 +13,6 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use shadowsocks::config::ServerConfig as SsServerConfig;
 use shadowsocks::context::{Context as SsContext, SharedContext};
-use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use arc_swap::ArcSwap;
@@ -96,25 +95,31 @@ impl BackendInfo {
 
         let endpoint = match cfg.backend_type.as_str() {
             "direct" => BackendEndpoint::Direct,
-            "uds" => {
-                let path = cfg.address.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("uds backend must specify socket path in address")
-                })?;
-                BackendEndpoint::Unix { path: path.clone() }
-            }
-            "socks5" | "ss" | "shadowsocks" => {
+            "socks5" | "ss" | "shadowsocks" | "uds" => {
                 let addr = cfg.address.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("socks5/ss backend must specify address")
+                    anyhow::anyhow!("backend must specify address")
                 })?;
-                // Parse "host:port"
-                if let Some(pos) = addr.rfind(':') {
-                    let host = addr[..pos].to_string();
-                    let port: u16 = addr[pos + 1..].parse().map_err(|_| {
-                        anyhow::anyhow!("invalid port in backend address: {}", addr)
-                    })?;
-                    BackendEndpoint::Tcp { host, port }
+                if addr.starts_with("unix://") {
+                    let path = addr.strip_prefix("unix://").unwrap().to_string();
+                    BackendEndpoint::Unix { path }
+                } else if addr.starts_with('/') || addr.starts_with("./") || addr.starts_with("../") || cfg.backend_type == "uds" {
+                    let path = if let Some(stripped) = addr.strip_prefix("unix://") {
+                        stripped.to_string()
+                    } else {
+                        addr.clone()
+                    };
+                    BackendEndpoint::Unix { path }
                 } else {
-                    anyhow::bail!("backend address must be in host:port format: {}", addr);
+                    // Parse "host:port"
+                    if let Some(pos) = addr.rfind(':') {
+                        let host = addr[..pos].to_string();
+                        let port: u16 = addr[pos + 1..].parse().map_err(|_| {
+                            anyhow::anyhow!("invalid port in backend address: {}", addr)
+                        })?;
+                        BackendEndpoint::Tcp { host, port }
+                    } else {
+                        anyhow::bail!("backend address must be in host:port or unix://path format: {}", addr);
+                    }
                 }
             }
             other => anyhow::bail!("unknown backend type: {}", other),
@@ -140,19 +145,22 @@ impl BackendInfo {
                 anyhow::anyhow!("ss backend must specify password in password field")
             })?;
             let addr = cfg.address.as_deref().expect("ss backend must have address");
-            let dummy_sock: std::net::SocketAddr = addr
-                .parse()
-                .or_else(|_| {
-                    if let Some(pos) = addr.rfind(':') {
-                        let port: u16 = addr[pos + 1..].parse()?;
-                        let host_str = &addr[..pos];
-                        let ip: std::net::IpAddr = host_str.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                        Ok(std::net::SocketAddr::new(ip, port))
-                    } else {
-                        Err(anyhow::anyhow!("invalid address"))
-                    }
-                })
-                .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+            let dummy_sock: std::net::SocketAddr = if addr.starts_with("unix://") || addr.starts_with('/') || addr.starts_with("./") || addr.starts_with("../") {
+                "0.0.0.0:0".parse().unwrap()
+            } else {
+                addr.parse()
+                    .or_else(|_| {
+                        if let Some(pos) = addr.rfind(':') {
+                            let port: u16 = addr[pos + 1..].parse()?;
+                            let host_str = &addr[..pos];
+                            let ip: std::net::IpAddr = host_str.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                            Ok(std::net::SocketAddr::new(ip, port))
+                        } else {
+                            Err(anyhow::anyhow!("invalid address"))
+                        }
+                    })
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+            };
 
             let method: shadowsocks::crypto::CipherKind = method_str
                 .parse()
@@ -1070,30 +1078,9 @@ async fn refill_pool_task(
             }
             continue;
         }
-        // ── Shadowsocks backend: pre-connect TCP only ────────────────────────
+        // ── Shadowsocks backend: pre-connect TCP or Unix socket ──────────────
         if info.is_shadowsocks() {
-            let result: std::io::Result<BackendStream> = match &info.endpoint {
-                BackendEndpoint::Tcp { host, port } => {
-                    let addr = format!("{}:{}", host, port);
-                    match crate::outbound::tcp_connect_raw(&addr, info.bind_interface.as_deref(), Duration::from_secs(10)).await {
-                        Ok(stream) => {
-                            if let Err(e) = stream.set_nodelay(true) {
-                                Err(e)
-                            } else {
-                                Ok(BackendStream::Tcp(stream))
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-                BackendEndpoint::Unix { .. } => {
-                    // Validated to be unreachable for SS backends.
-                    unreachable!("Shadowsocks backend must use TCP")
-                }
-                BackendEndpoint::Direct => {
-                    unreachable!("direct backend has no refill pool task")
-                }
-            };
+            let result = crate::outbound::connect_endpoint(&info.endpoint, info.bind_interface.as_deref(), Duration::from_secs(10)).await;
 
             match result {
                 Ok(stream) => {
@@ -1107,7 +1094,7 @@ async fn refill_pool_task(
                             if res.is_err() {
                                 return; // Receiver dropped.
                             }
-                            tracing::trace!(backend = %info.name, "SS pool refilled with pre-connected TCP");
+                            tracing::trace!(backend = %info.name, "SS pool refilled");
                         }
                     }
                 }
@@ -1115,7 +1102,7 @@ async fn refill_pool_task(
                     tracing::debug!(
                         backend = %info.name,
                         error = %e,
-                        "SS backend TCP connect failed; retrying in {}s",
+                        "SS backend connect failed; retrying in {}s",
                         retry_interval.as_secs()
                     );
                     tokio::select! {
@@ -1131,36 +1118,15 @@ async fn refill_pool_task(
             continue;
         }
 
-        // ── SOCKS5 backend: TCP connect + auth handshake ─────────────────────
-        let result: std::io::Result<BackendStream> = match &info.endpoint {
-            BackendEndpoint::Tcp { host, port } => {
-                let addr = format!("{}:{}", host, port);
-                async {
-                    let stream = crate::outbound::tcp_connect_raw(&addr, info.bind_interface.as_deref(), Duration::from_secs(10)).await?;
-                    stream.set_nodelay(true)?;
-                    socks5h_authenticate(BackendStream::Tcp(stream), &info).await
-                }
-                .await
-            }
-            BackendEndpoint::Unix { path } => {
-                let path = path.clone();
-                async {
-                    let stream = UnixStream::connect(&path).await?;
-                    socks5h_authenticate(BackendStream::Unix(stream), &info).await
-                }
-                .await
-            }
-            BackendEndpoint::Direct => {
-                unreachable!("direct backend has no refill pool task")
-            }
-        };
+        // ── SOCKS5 backend: TCP/Unix connect + auth handshake ────────────────
+        let result = async {
+            let stream = crate::outbound::connect_endpoint(&info.endpoint, info.bind_interface.as_deref(), Duration::from_secs(10)).await?;
+            socks5h_authenticate(stream, &info).await
+        }
+        .await;
 
         match result {
             Ok(stream) => {
-                // send_async blocks (async) until there is space in the channel,
-                // providing natural back-pressure without an explicit reserve step.
-                // We race it against cancellation so a removed backend doesn't
-                // keep a thread alive waiting for a full pool to drain.
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
@@ -1169,7 +1135,7 @@ async fn refill_pool_task(
                     }
                     res = tx.send_async(stream) => {
                         if res.is_err() {
-                            return; // Receiver dropped — pool is shutting down.
+                            return; // Receiver dropped.
                         }
                         tracing::trace!(backend = %info.name, "pool refilled with new connection");
                     }
@@ -1555,5 +1521,79 @@ mod tests {
         // 4. Try enabling/disabling a non-existent backend
         let found = pool.set_backend_enabled("nonexistent", false).await.unwrap();
         assert!(!found);
+    }
+
+    #[test]
+    fn test_uds_backend_endpoint_resolution() {
+        // Test UDS resolution for socks5
+        let cfg_s5 = BackendConfig {
+            backend_type: "socks5".to_string(),
+            address: Some("unix:///tmp/s5.sock".to_string()),
+            username: None,
+            password: None,
+            name: None,
+            pool_size: 1,
+            bind_interface: None,
+            enabled: None,
+        };
+        let info = BackendInfo::from_config(&cfg_s5, 0, None).unwrap();
+        match &info.endpoint {
+            BackendEndpoint::Unix { path } => assert_eq!(path, "/tmp/s5.sock"),
+            _ => panic!("Expected UDS endpoint"),
+        }
+
+        // Test UDS resolution for shadowsocks (ss)
+        let cfg_ss = BackendConfig {
+            backend_type: "ss".to_string(),
+            address: Some("unix:///tmp/ss.sock".to_string()),
+            username: Some("chacha20-ietf-poly1305".to_string()),
+            password: Some("pass".to_string()),
+            name: None,
+            pool_size: 1,
+            bind_interface: None,
+            enabled: None,
+        };
+        let info = BackendInfo::from_config(&cfg_ss, 0, None).unwrap();
+        match &info.endpoint {
+            BackendEndpoint::Unix { path } => assert_eq!(path, "/tmp/ss.sock"),
+            _ => panic!("Expected UDS endpoint"),
+        }
+
+        // Test legacy uds type
+        let cfg_legacy = BackendConfig {
+            backend_type: "uds".to_string(),
+            address: Some("/tmp/legacy.sock".to_string()),
+            username: None,
+            password: None,
+            name: None,
+            pool_size: 1,
+            bind_interface: None,
+            enabled: None,
+        };
+        let info = BackendInfo::from_config(&cfg_legacy, 0, None).unwrap();
+        match &info.endpoint {
+            BackendEndpoint::Unix { path } => assert_eq!(path, "/tmp/legacy.sock"),
+            _ => panic!("Expected UDS endpoint"),
+        }
+
+        // Test TCP resolution
+        let cfg_tcp = BackendConfig {
+            backend_type: "socks5".to_string(),
+            address: Some("127.0.0.1:1080".to_string()),
+            username: None,
+            password: None,
+            name: None,
+            pool_size: 1,
+            bind_interface: None,
+            enabled: None,
+        };
+        let info = BackendInfo::from_config(&cfg_tcp, 0, None).unwrap();
+        match &info.endpoint {
+            BackendEndpoint::Tcp { host, port } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(*port, 1080);
+            }
+            _ => panic!("Expected TCP endpoint"),
+        }
     }
 }

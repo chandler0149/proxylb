@@ -109,41 +109,20 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                     direct_connect(&target.addr, timeout, info.bind_interface.as_deref()).await?
                 } else if info.is_shadowsocks() {
                     // ── Shadowsocks backend health check ───────────────────────────
-                    // Pool holds raw TCP streams; wrap with SS crypto for the probe.
                     let ss_cfg = info.ss_config.as_ref().unwrap();
                     let ss_ctx = info.ss_context.as_ref().unwrap().clone();
 
                     match pc {
-                        Some(PooledConn { stream: Some(BackendStream::Tcp(raw_tcp)), ref traffic }) => {
+                        Some(PooledConn { stream: Some(pooled), ref traffic }) => {
                             traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
-                            ss_connect_pooled(raw_tcp, ss_cfg, ss_ctx, &target.addr)
-                        }
-                        Some(PooledConn { stream: Some(_other), ref traffic }) => {
-                            // Shouldn't happen; treat as a miss.
-                            traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
-                            match &info.endpoint {
-                                crate::backend::BackendEndpoint::Tcp { host, port } => {
-                                    ss_connect_fresh(host, *port, ss_cfg, ss_ctx, &target.addr, timeout, info.bind_interface.as_deref()).await?
-                                }
-                                _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP")),
-                            }
+                            ss_connect_pooled(pooled, ss_cfg, ss_ctx, &target.addr)
                         }
                         Some(PooledConn { stream: None, ref traffic }) => {
                             traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
-                            match &info.endpoint {
-                                crate::backend::BackendEndpoint::Tcp { host, port } => {
-                                    ss_connect_fresh(host, *port, ss_cfg, ss_ctx, &target.addr, timeout, info.bind_interface.as_deref()).await?
-                                }
-                                _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP")),
-                            }
+                            ss_connect_fresh(&info.endpoint, ss_cfg, ss_ctx, &target.addr, timeout, info.bind_interface.as_deref()).await?
                         }
                         None => {
-                            match &info.endpoint {
-                                crate::backend::BackendEndpoint::Tcp { host, port } => {
-                                    ss_connect_fresh(host, *port, ss_cfg, ss_ctx, &target.addr, timeout, info.bind_interface.as_deref()).await?
-                                }
-                                _ => return Err(std::io::Error::new(std::io::ErrorKind::Other, "SS backend must be TCP")),
-                            }
+                            ss_connect_fresh(&info.endpoint, ss_cfg, ss_ctx, &target.addr, timeout, info.bind_interface.as_deref()).await?
                         }
                     }
                 } else {

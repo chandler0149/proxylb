@@ -11,7 +11,6 @@ use shadowsocks::config::ServerConfig as SsServerConfig;
 use shadowsocks::context::SharedContext;
 use shadowsocks::relay::socks5::Address as SsAddress;
 use shadowsocks::relay::tcprelay::proxy_stream::client::ProxyClientStream;
-use tokio::net::TcpStream;
 
 use super::{BackendStream, TargetAddr};
 
@@ -25,36 +24,32 @@ fn to_ss_address(target: &TargetAddr) -> SsAddress {
 
 /// Connect **fresh** to a Shadowsocks server and wrap the stream for `target`.
 pub async fn ss_connect_fresh(
-    host: &str,
-    port: u16,
+    endpoint: &crate::backend::BackendEndpoint,
     svr_cfg: &Arc<SsServerConfig>,
     ctx: SharedContext,
     target: &TargetAddr,
     timeout: Duration,
     bind_interface: Option<&str>,
 ) -> io::Result<BackendStream> {
-    let addr = format!("{}:{}", host, port);
-    let tcp = super::tcp_connect_raw(&addr, bind_interface, timeout)
-        .await
-        .map_err(|e| {
-            io::Error::new(e.kind(), format!("SS backend TCP connect to {}: {}", addr, e))
-        })?;
-    tcp.set_nodelay(true)?;
-
+    let raw = crate::outbound::connect_endpoint(endpoint, bind_interface, timeout).await?;
     let ss_addr = to_ss_address(target);
-    let client_stream = ProxyClientStream::from_stream(ctx, tcp, svr_cfg.as_ref(), ss_addr);
+    let client_stream = ProxyClientStream::from_stream(ctx, raw, svr_cfg.as_ref(), ss_addr);
     Ok(BackendStream::Boxed(Box::pin(client_stream)))
 }
 
-/// Wrap an **already-established** raw TCP stream (from the connection pool)
+/// Wrap an **already-established** raw stream (from the connection pool)
 /// with the Shadowsocks AEAD layer for `target`.
-pub fn ss_connect_pooled(
-    raw: TcpStream,
+pub fn ss_connect_pooled<S>(
+    raw: S,
     svr_cfg: &Arc<SsServerConfig>,
     ctx: SharedContext,
     target: &TargetAddr,
-) -> BackendStream {
+) -> BackendStream
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
     let ss_addr = to_ss_address(target);
     let client_stream = ProxyClientStream::from_stream(ctx, raw, svr_cfg.as_ref(), ss_addr);
     BackendStream::Boxed(Box::pin(client_stream))
 }
+

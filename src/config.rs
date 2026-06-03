@@ -295,22 +295,17 @@ impl Config {
                 .unwrap_or_else(|| format!("backend[{}]", i));
 
             match backend.backend_type.as_str() {
-                "socks5" => {
+                "socks5" | "uds" => {
                     if backend.address.is_none() {
-                        anyhow::bail!("{}: SOCKS5 backend must specify 'address' (host:port)", label);
+                        anyhow::bail!("{}: SOCKS5 backend must specify 'address'", label);
                     }
                 }
                 "ss" | "shadowsocks" => {
                     if backend.address.is_none() {
-                        anyhow::bail!("{}: Shadowsocks backend must specify 'address' (host:port)", label);
+                        anyhow::bail!("{}: Shadowsocks backend must specify 'address'", label);
                     }
                     if backend.username.is_none() || backend.password.is_none() {
                         anyhow::bail!("{}: Shadowsocks backend must specify cipher method in 'username' and password in 'password'", label);
-                    }
-                }
-                "uds" => {
-                    if backend.address.is_none() {
-                        anyhow::bail!("{}: UDS SOCKS5 backend must specify 'address' (unix socket path)", label);
                     }
                 }
                 "direct" => {
@@ -578,5 +573,75 @@ backends:
             }
             _ => panic!("Expected Socks5 inbound"),
         }
+    }
+
+    #[test]
+    fn test_shadowsocks_uds_inbound_parsing() {
+        let yaml = r#"
+inbounds:
+  - type: shadowsocks
+    listen: "unix:///tmp/proxylb-ss.sock"
+    password: "pass"
+    method: "chacha20-ietf-poly1305"
+backends:
+  - type: direct
+    name: "direct-out"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
+        let inbounds = cfg.all_inbounds();
+        assert_eq!(inbounds.len(), 1);
+        match &inbounds[0] {
+            InboundItemConfig::Shadowsocks { listen, password, method, .. } => {
+                assert_eq!(listen, "unix:///tmp/proxylb-ss.sock");
+                assert_eq!(password, "pass");
+                assert_eq!(method, "chacha20-ietf-poly1305");
+            }
+            _ => panic!("Expected Shadowsocks inbound"),
+        }
+    }
+
+    #[test]
+    fn test_http_uds_inbound_parsing() {
+        let yaml = r#"
+inbounds:
+  - type: http
+    listen: "unix:///tmp/proxylb-http.sock"
+backends:
+  - type: direct
+    name: "direct-out"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
+        let inbounds = cfg.all_inbounds();
+        assert_eq!(inbounds.len(), 1);
+        match &inbounds[0] {
+            InboundItemConfig::Http { listen, .. } => {
+                assert_eq!(listen, "unix:///tmp/proxylb-http.sock");
+            }
+            _ => panic!("Expected HTTP inbound"),
+        }
+    }
+
+    #[test]
+    fn test_uds_backends_parsing() {
+        let yaml = r#"
+backends:
+  - name: "ss-uds"
+    type: ss
+    address: "unix:///tmp/ss.sock"
+    username: "chacha20-ietf-poly1305"
+    password: "pass"
+  - name: "socks5-uds"
+    type: socks5
+    address: "unix:///tmp/socks5.sock"
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.backends.len(), 2);
+        assert_eq!(cfg.backends[0].backend_type, "ss");
+        assert_eq!(cfg.backends[0].address.as_deref().unwrap(), "unix:///tmp/ss.sock");
+        assert_eq!(cfg.backends[1].backend_type, "socks5");
+        assert_eq!(cfg.backends[1].address.as_deref().unwrap(), "unix:///tmp/socks5.sock");
     }
 }

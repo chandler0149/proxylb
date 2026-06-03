@@ -208,3 +208,29 @@ pub async fn tcp_connect_raw<A: tokio::net::ToSocketAddrs>(
         io::Error::new(io::ErrorKind::AddrNotAvailable, "could not resolve address or no addresses found")
     }))
 }
+
+/// Establish an outbound connection (TCP or Unix Domain Socket) to a backend endpoint.
+pub async fn connect_endpoint(
+    endpoint: &crate::backend::BackendEndpoint,
+    bind_interface: Option<&str>,
+    timeout: std::time::Duration,
+) -> io::Result<BackendStream> {
+    match endpoint {
+        crate::backend::BackendEndpoint::Tcp { host, port } => {
+            let addr = format!("{}:{}", host, port);
+            let tcp = tcp_connect_raw(&addr, bind_interface, timeout).await?;
+            tcp.set_nodelay(true)?;
+            Ok(BackendStream::Tcp(tcp))
+        }
+        crate::backend::BackendEndpoint::Unix { path } => {
+            let unix = tokio::time::timeout(timeout, UnixStream::connect(path))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("UDS connect timeout to {}", path)))??;
+            Ok(BackendStream::Unix(unix))
+        }
+        crate::backend::BackendEndpoint::Direct => {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "Direct backend has no endpoint address"))
+        }
+    }
+}
+

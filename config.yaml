@@ -20,6 +20,9 @@ inbounds:
       enabled: false # Custom override to allow private targets for this listener
 
   - type: socks5
+    listen: "unix:///tmp/proxylb-socks5.sock" # SOCKS5 inbound running over Unix Domain Socket
+
+  - type: socks5
     listen: "0.0.0.0:1082"
     filter:
       enabled: false 
@@ -29,8 +32,16 @@ inbounds:
     password: "another-password"
     method: "chacha20-ietf-poly1305"
 
+  - type: shadowsocks
+    listen: "unix:///tmp/proxylb-ss.sock" # Shadowsocks inbound running over Unix Domain Socket
+    password: "another-password"
+    method: "chacha20-ietf-poly1305"
+
   - type: http
     listen: "0.0.0.0:8081"
+
+  - type: http
+    listen: "unix:///tmp/proxylb-http.sock" # HTTP inbound running over Unix Domain Socket
 
 # Global outbound interface to bind to (selection logic: backend specific -> global -> default)
 # bind_interface: "eno" # Linux interface (or "en0" on macOS)
@@ -38,7 +49,7 @@ inbounds:
 # All individual physical backends.
 # Each backend must specify:
 #   type:             "socks5", "ss", "uds", or "direct"
-#   address:          "host:port" (for socks5/ss) or socket path (for uds)
+#   address:          "host:port", absolute path, or "unix://path" to support UDS/TCP transport
 #   username/password: SOCKS5 credentials or Shadowsocks cipher-method/passphrase
 backends:
   - type: socks5
@@ -55,23 +66,30 @@ backends:
     # Forces all outbound connections through this interface (avoids using default route).
     # bind_interface: "eno" # Linux interface (or "en0" on macOS)
 
-  # Example: Unix domain socket backend
-  # SOCKS5 over Unix domain socket
+  # Example: SOCKS5 over Unix domain socket backend
+  - type: socks5
+    address: "unix:///run/my-proxy/socks5.sock"
+    name: "local-socks5-uds"
+
+  # Example: Legacy UDS backend type (remains compatible)
   - type: uds
-    address: "/run/my-proxy/socks5.sock"
-    name: "local-uds"
+    address: "/run/my-proxy/socks5-legacy.sock"
+    name: "local-legacy-uds"
 
   # Example: Direct outbound connection
   # Connects directly to the target address without using any remote proxy backend.
   - type: direct
     name: "direct-out"
 
-  # Example: Shadowsocks backend
-  # The backend is a Shadowsocks server; proxylb speaks the SS client protocol.
-  # For Shadowsocks backends:
-  #   username: cipher method (e.g. "chacha20-ietf-poly1305" or "aes-256-gcm")
-  #   password: shadowsocks pre-shared key
-  #
+  # Example: Shadowsocks backend running over Unix domain socket
+  - type: ss
+    address: "unix:///run/my-proxy/ss.sock"
+    name: "local-ss-uds"
+    username: "chacha20-ietf-poly1305" # cipher method
+    password: "my-shadowsocks-password"
+    pool_size: 10
+
+  # Example: Shadowsocks backend running over TCP
   # - type: ss
   #   address: "ss-server.example.com:8388"
   #   name: "ss-backend-1"
@@ -97,7 +115,7 @@ groups:
 # If omitted, default behavior falls back in sequential order: all groups first, followed by ungrouped backends.
 failover_order:
   - "group-us"
-  - "local-uds"
+  - "local-socks5-uds"
   - "direct-out"
 
 # Health check settings

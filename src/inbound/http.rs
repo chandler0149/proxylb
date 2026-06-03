@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 use crate::backend::BackendPool;
 use crate::outbound::TargetAddr;
@@ -19,8 +19,21 @@ pub async fn run_http_inbound(
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
 ) -> anyhow::Result<()> {
+    if let Some(path) = listen_addr.strip_prefix("unix://") {
+        run_http_uds_inbound(path.to_string(), pool, stats, filter_enabled).await
+    } else {
+        run_http_tcp_inbound(listen_addr, pool, stats, filter_enabled).await
+    }
+}
+
+pub async fn run_http_tcp_inbound(
+    listen_addr: String,
+    pool: BackendPool,
+    stats: Arc<crate::backend::InboundStats>,
+    filter_enabled: bool,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&listen_addr).await?;
-    tracing::info!(listen = %listen_addr, "HTTP inbound listener started");
+    tracing::info!(listen = %listen_addr, "HTTP TCP inbound listener started");
 
     loop {
         match listener.accept().await {
@@ -29,31 +42,71 @@ pub async fn run_http_inbound(
                 let stats = Arc::clone(&stats);
                 tokio::spawn(async move {
                     let _ = stream.set_nodelay(true);
-                    if let Err(e) = handle_http_connection(stream, client_addr, pool, stats, filter_enabled).await {
+                    let client_str = client_addr.to_string();
+                    if let Err(e) = handle_http_connection(stream, client_str.clone(), pool, stats, filter_enabled).await {
                         tracing::debug!(
-                            client = %client_addr,
+                            client = %client_str,
                             error = %e,
-                            "HTTP connection failed"
+                            "HTTP TCP connection failed"
                         );
                     }
                 });
             }
             Err(e) => {
-                tracing::warn!(error = %e, "HTTP accept error");
+                tracing::warn!(error = %e, "HTTP TCP accept error");
+            }
+        }
+    }
+}
+
+pub async fn run_http_uds_inbound(
+    socket_path: String,
+    pool: BackendPool,
+    stats: Arc<crate::backend::InboundStats>,
+    filter_enabled: bool,
+) -> anyhow::Result<()> {
+    let path = std::path::Path::new(&socket_path);
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let listener = tokio::net::UnixListener::bind(path)?;
+    tracing::info!(socket = %socket_path, "HTTP UDS inbound listener started");
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, client_addr)) => {
+                let pool = pool.clone();
+                let stats = Arc::clone(&stats);
+                tokio::spawn(async move {
+                    let client_str = format!("unix:{:?}", client_addr);
+                    if let Err(e) = handle_http_connection(stream, client_str.clone(), pool, stats, filter_enabled).await {
+                        tracing::debug!(
+                            client = %client_str,
+                            error = %e,
+                            "HTTP UDS connection failed"
+                        );
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "HTTP UDS accept error");
             }
         }
     }
 }
 
 /// Handle a single HTTP connection.
-async fn handle_http_connection(
-    mut client_stream: TcpStream,
-    client_addr: std::net::SocketAddr,
+async fn handle_http_connection<S>(
+    mut client_stream: S,
+    client_addr: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
-) -> anyhow::Result<()> {
-
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // Read HTTP headers up to \r\n\r\n.
     let (buf, pos) = match read_headers(&mut client_stream).await {
         Ok(res) => res,
@@ -80,8 +133,6 @@ async fn handle_http_connection(
         return Ok(());
     }
 
-
-
     tracing::debug!(client = %client_addr, method = %method, target = %target, "HTTP CONNECT request" );
 
     // Try backends in order with fallback.
@@ -99,7 +150,6 @@ async fn handle_http_connection(
         }
     };
 
-
     // If CONNECT, respond with 200 Connection Established.
     // Otherwise, we forward the read buffer (headers + any extra read data) to the SOCKS5h backend first.
     if method == "CONNECT" {
@@ -114,7 +164,10 @@ async fn handle_http_connection(
 }
 
 /// Read HTTP headers until \r\n\r\n, up to max 8192 bytes.
-async fn read_headers(stream: &mut TcpStream) -> std::io::Result<(Vec<u8>, usize)> {
+async fn read_headers<S>(stream: &mut S) -> std::io::Result<(Vec<u8>, usize)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut buf = vec![0u8; 1024];
     let mut bytes_read = 0;
     loop {

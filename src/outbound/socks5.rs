@@ -5,11 +5,9 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 use crate::backend::BackendInfo;
 use super::{BackendStream, TargetAddr};
@@ -29,57 +27,11 @@ pub async fn socks5h_connect(
     target: &TargetAddr,
     timeout: Duration,
 ) -> io::Result<BackendStream> {
-    use crate::backend::BackendEndpoint;
-
-    match &backend.endpoint {
-        BackendEndpoint::Tcp { host, port } => {
-            let addr = format!("{}:{}", host, port);
-
-            let tcp = super::tcp_connect_raw(&addr, backend.bind_interface.as_deref(), timeout)
-                .await
-                .map_err(|e| {
-                    io::Error::new(e.kind(), format!("backend TCP connect to {}: {}", addr, e))
-                })?;
-
-            tcp.set_nodelay(true)?;
-
-            let stream = socks5h_authenticate(BackendStream::Tcp(tcp), backend).await?;
-            socks5h_connect_target(stream, target).await
-        }
-        BackendEndpoint::Unix { path } => {
-            socks5h_connect_unix(path, backend, target, timeout).await
-        }
-        BackendEndpoint::Direct => {
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "Direct backend has no SOCKS5 endpoint"))
-        }
-    }
-}
-
-/// Connect via a Unix domain socket, authenticate, then issue the CONNECT.
-pub async fn socks5h_connect_unix(
-    socket_path: &str,
-    backend: &BackendInfo,
-    target: &TargetAddr,
-    timeout: Duration,
-) -> io::Result<BackendStream> {
-    let unix = tokio::time::timeout(timeout, UnixStream::connect(Path::new(socket_path)))
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("backend UDS connect timeout: {}", socket_path),
-            )
-        })?
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("backend UDS connect to {}: {}", socket_path, e),
-            )
-        })?;
-
-    let stream = socks5h_authenticate(BackendStream::Unix(unix), backend).await?;
+    let stream = crate::outbound::connect_endpoint(&backend.endpoint, backend.bind_interface.as_deref(), timeout).await?;
+    let stream = socks5h_authenticate(stream, backend).await?;
     socks5h_connect_target(stream, target).await
 }
+
 
 /// Phase 1: SOCKS5 auth negotiation on an already-connected stream.
 pub async fn socks5h_authenticate<S>(mut stream: S, backend: &BackendInfo) -> io::Result<S>
