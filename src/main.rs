@@ -10,6 +10,7 @@ mod inbound;
 mod outbound;
 mod relay;
 mod web;
+mod route_watcher;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -125,12 +126,17 @@ async fn main_async(
     worker_handle: tokio::runtime::Handle,
     ancillary_handle: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
+    // Initialize route change monitoring.
+    let (route_tx, route_rx) = tokio::sync::watch::channel(0u64);
+    route_watcher::start_route_watcher(&ancillary_handle, route_tx);
+
     // Initialize backend pool.
     let pool = backend::BackendPool::new(
         &config.backends,
         &config.groups,
         config.failover_order.as_ref(),
         config.bind_interface.as_deref(),
+        route_rx.clone(),
     )?;
 
     // Spawn health checker and candidate selector background tasks with a shared cancellation token.
@@ -139,8 +145,9 @@ async fn main_async(
         let health_pool = pool.clone();
         let health_config = config.health_check.clone();
         let token = health_cancel.clone();
+        let route_rx_clone = route_rx.clone();
         ancillary_handle.spawn(async move {
-            health::run_health_checker(health_pool, health_config, token).await;
+            health::run_health_checker(health_pool, health_config, token, route_rx_clone).await;
         });
 
         let selector_pool = pool.clone();
@@ -298,8 +305,9 @@ async fn perform_hot_reload(
             let health_pool = pool.clone();
             let health_config = new_config.health_check.clone();
             let token = health_cancel.clone();
+            let route_rx = pool.rt_chg_signal.clone();
             ancillary_handle.spawn(async move {
-                health::run_health_checker(health_pool, health_config, token).await;
+                health::run_health_checker(health_pool, health_config, token, route_rx).await;
             });
             let selector_pool = pool.clone();
             let token = health_cancel.clone();
@@ -316,8 +324,9 @@ async fn perform_hot_reload(
         let health_pool = pool.clone();
         let health_config = new_config.health_check.clone();
         let token = health_cancel.clone();
+        let route_rx = pool.rt_chg_signal.clone();
         ancillary_handle.spawn(async move {
-            health::run_health_checker(health_pool, health_config, token).await;
+            health::run_health_checker(health_pool, health_config, token, route_rx).await;
         });
 
         let selector_pool = pool.clone();

@@ -4,7 +4,7 @@
 //! command execution disabled — we intercept the target address and
 //! forward through our SOCKS5h backend pool instead of connecting directly.
 
-
+#[allow(deprecated)]
 use fast_socks5::server::{Config, DenyAuthentication, Socks5Socket};
 use fast_socks5::util::target_addr::TargetAddr as FastTargetAddr;
 use fast_socks5::consts;
@@ -108,6 +108,9 @@ pub async fn run_socks5_inbound(
 /// so it performs the auth handshake and reads the CONNECT request, but does NOT
 /// connect to the target or do DNS resolution. We then take the target address
 /// and forward through our SOCKS5h backend pool instead of connecting directly.
+/// 
+
+#[allow(deprecated)]
 async fn handle_socks5_connection<S>(
     stream: S,
     pool: BackendPool,

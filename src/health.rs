@@ -35,6 +35,7 @@ pub async fn run_health_checker(
     pool: BackendPool,
     config: HealthCheckConfig,
     cancel: CancellationToken,
+    mut route_rx: tokio::sync::watch::Receiver<u64>,
 ) {
     let interval = Duration::from_secs(config.interval_secs);
     let timeout = Duration::from_secs(config.timeout_secs);
@@ -55,9 +56,6 @@ pub async fn run_health_checker(
         "health checker started"
     );
 
-    let (tx_trigger, mut rx_trigger) = tokio::sync::mpsc::channel::<()>(10);
-    start_route_watcher(tx_trigger);
-
     let mut ticker = time::interval(interval);
     let mut last_check = Instant::now() - Duration::from_secs(3600); // long time ago
 
@@ -68,7 +66,10 @@ pub async fn run_health_checker(
                 tracing::debug!("health checker cancelled");
                 return;
             }
-            _ = rx_trigger.recv() => {
+            res = route_rx.changed() => {
+                if res.is_err() {
+                    return;
+                }
                 // Debounce/Throttle: run at most once every 2 seconds
                 let now = Instant::now();
                 if now.duration_since(last_check) >= Duration::from_secs(2) {
@@ -290,75 +291,3 @@ fn parse_check_target(target_str: &str) -> anyhow::Result<ProbeTarget> {
     })
 }
 
-#[cfg(target_os = "linux")]
-fn start_route_watcher(tx: tokio::sync::mpsc::Sender<()>) {
-    std::thread::spawn(move || {
-        unsafe {
-            let fd = libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE);
-            if fd < 0 {
-                tracing::warn!("Failed to create netlink socket for route monitoring");
-                return;
-            }
-
-            let mut addr: libc::sockaddr_nl = std::mem::zeroed();
-            addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-            // RTMGRP_IPV4_ROUTE (0x40) | RTMGRP_IPV6_ROUTE (0x80) | RTMGRP_LINK (1)
-            addr.nl_groups = 0x40 | 0x80 | 1;
-
-            let addr_ptr = &addr as *const libc::sockaddr_nl as *const libc::sockaddr;
-            let addr_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-
-            if libc::bind(fd, addr_ptr, addr_len) < 0 {
-                tracing::warn!("Failed to bind netlink socket for route monitoring");
-                libc::close(fd);
-                return;
-            }
-
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
-                if n <= 0 {
-                    libc::close(fd);
-                    break;
-                }
-                if tx.try_send(()).is_err() {
-                    if tx.is_closed() {
-                        libc::close(fd);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-}
-
-#[cfg(target_os = "macos")]
-fn start_route_watcher(tx: tokio::sync::mpsc::Sender<()>) {
-    std::thread::spawn(move || {
-        unsafe {
-            let fd = libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC);
-            if fd < 0 {
-                tracing::warn!("Failed to create routing socket for route monitoring");
-                return;
-            }
-
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
-                if n <= 0 {
-                    libc::close(fd);
-                    break;
-                }
-                if tx.try_send(()).is_err() {
-                    if tx.is_closed() {
-                        libc::close(fd);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn start_route_watcher(_tx: tokio::sync::mpsc::Sender<()>) {}

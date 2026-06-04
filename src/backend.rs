@@ -255,7 +255,8 @@ pub struct BackendEntry {
     pub pool_rx: flume::Receiver<BackendStream>,
     /// Cancels this entry's `refill_pool_task` when the backend is removed.
     pub cancel: CancellationToken,
-    pub enabled: Arc<std::sync::atomic::AtomicBool>,
+    pub enabled_tx: tokio::sync::watch::Sender<bool>,
+    pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
 }
 
 /// Serializable backend status for the web API.
@@ -360,6 +361,7 @@ pub struct BackendPool {
     inner: Arc<RwLock<BackendPoolInner>>,
     cached: Arc<ArcSwap<CachedCandidates>>,
     pub inbound_stats: Arc<std::sync::Mutex<Vec<Arc<InboundStats>>>>,
+    pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
 }
 
 fn build_groups_and_failover_order(
@@ -553,6 +555,7 @@ impl BackendPool {
         group_configs: &[GroupConfig],
         failover_order_cfg: Option<&Vec<String>>,
         global_bind_interface: Option<&str>,
+        rt_chg_signal: tokio::sync::watch::Receiver<u64>,
     ) -> anyhow::Result<Self> {
         let mut entries = Vec::with_capacity(configs.len());
         for (i, cfg) in configs.iter().enumerate() {
@@ -560,7 +563,7 @@ impl BackendPool {
             let cancel = CancellationToken::new();
             let (tx, rx) = flume::bounded(info.pool_size.max(1));
             let initial_enabled = info.enabled.unwrap_or(true);
-            let enabled_atomic = Arc::new(std::sync::atomic::AtomicBool::new(initial_enabled));
+            let (enabled_tx, enabled_signal) = tokio::sync::watch::channel(initial_enabled);
 
             let mut status = BackendStatus::default();
             status.enabled = initial_enabled;
@@ -571,12 +574,13 @@ impl BackendPool {
                 traffic: Arc::new(TrafficCounters::default()),
                 pool_rx: rx.clone(),
                 cancel: cancel.clone(),
-                enabled: enabled_atomic.clone(),
+                enabled_tx,
+                rt_chg_signal: rt_chg_signal.clone(),
             };
             entries.push(entry);
 
             // Spawn refill task for this backend.
-            tokio::spawn(refill_pool_task(info, enabled_atomic, tx, rx, cancel));
+            tokio::spawn(refill_pool_task(info, enabled_signal, tx, rx, cancel, rt_chg_signal.clone()));
         }
 
         let (groups, failover_order) = build_groups_and_failover_order(&entries, group_configs, failover_order_cfg);
@@ -595,8 +599,11 @@ impl BackendPool {
             })),
             cached,
             inbound_stats: Arc::new(std::sync::Mutex::new(Vec::new())),
+            rt_chg_signal,
         })
-    }    /// Register a new inbound listener dynamically or return existing stats if already registered.
+    }
+
+    /// Register a new inbound listener dynamically or return existing stats if already registered.
     pub fn register_inbound(
         &self,
         name: String,
@@ -678,7 +685,7 @@ impl BackendPool {
                     || entry.info.pool_size != new_info.pool_size;
 
                 if let Some(new_enabled) = new_info.enabled {
-                    entry.enabled.store(new_enabled, std::sync::atomic::Ordering::Relaxed);
+                    let _ = entry.enabled_tx.send(new_enabled);
                     entry.status.lock().unwrap().enabled = new_enabled;
                     if !new_enabled {
                         while entry.pool_rx.try_recv().is_ok() {}
@@ -698,8 +705,9 @@ impl BackendPool {
                     entry.pool_rx = rx.clone();
                     entry.cancel = new_cancel.clone();
 
+                    let enabled_signal = entry.enabled_tx.subscribe();
                     // Spawn the new refill task with new configuration and channel
-                    tokio::spawn(refill_pool_task(new_info, entry.enabled.clone(), tx, rx, new_cancel));
+                    tokio::spawn(refill_pool_task(new_info, enabled_signal, tx, rx, new_cancel, entry.rt_chg_signal.clone()));
                 }
 
                 new_entries.push(entry);
@@ -709,7 +717,7 @@ impl BackendPool {
                 let cancel = CancellationToken::new();
                 let (tx, rx) = flume::bounded(new_info.pool_size.max(1));
                 let initial_enabled = new_info.enabled.unwrap_or(true);
-                let enabled_atomic = Arc::new(std::sync::atomic::AtomicBool::new(initial_enabled));
+                let (enabled_tx, enabled_signal) = tokio::sync::watch::channel(initial_enabled);
 
                 let mut status = BackendStatus::default();
                 status.enabled = initial_enabled;
@@ -720,10 +728,11 @@ impl BackendPool {
                     traffic: Arc::new(TrafficCounters::default()),
                     pool_rx: rx.clone(),
                     cancel: cancel.clone(),
-                    enabled: enabled_atomic.clone(),
+                    enabled_tx,
+                    rt_chg_signal: self.rt_chg_signal.clone(),
                 };
                 new_entries.push(entry);
-                tokio::spawn(refill_pool_task(new_info, enabled_atomic, tx, rx, cancel));
+                tokio::spawn(refill_pool_task(new_info, enabled_signal, tx, rx, cancel, self.rt_chg_signal.clone()));
                 added += 1;
             }
         }
@@ -867,18 +876,18 @@ impl BackendPool {
                     break;
                 }
 
-                // Set the atomic flag for the refill task
-                entry.enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
-                
-                // Update the status for the health/candidate selection
-                let mut status = entry.status.lock().unwrap();
-                status.enabled = enabled;
+                 // Set the flag via the watch channel
+                 let _ = entry.enabled_tx.send(enabled);
+                 
+                 // Update the status for the health/candidate selection
+                 let mut status = entry.status.lock().unwrap();
+                 status.enabled = enabled;
 
-                if !enabled {
-                    // Drain the connection pool immediately from the control thread.
-                    // This instantly unblocks any blocking `tx.send_async` in the refill task.
-                    while entry.pool_rx.try_recv().is_ok() {}
-                }
+                 if !enabled {
+                     // Drain the connection pool immediately from the control thread.
+                     // This instantly unblocks any blocking `tx.send_async` in the refill task.
+                     while entry.pool_rx.try_recv().is_ok() {}
+                 }
                 
                 changed = true;
                 break;
@@ -1037,6 +1046,11 @@ pub async fn run_candidate_selector(pool: BackendPool, cancel: tokio_util::sync:
     }
 }
 
+/// Drain all pre-connected connections from the pool channel.
+fn drain_pool(rx: &flume::Receiver<BackendStream>) {
+    while rx.try_recv().is_ok() {}
+}
+
 /// Background task that keeps the connection pool filled for a backend.
 ///
 /// **SOCKS5 backends**: performs TCP connect + auth handshake, storing an
@@ -1052,107 +1066,76 @@ pub async fn run_candidate_selector(pool: BackendPool, cancel: tokio_util::sync:
 /// Exits cleanly when `cancel` is cancelled (backend removed during hot reload).
 async fn refill_pool_task(
     info: BackendInfo,
-    enabled: Arc<std::sync::atomic::AtomicBool>,
+    mut enabled_signal: tokio::sync::watch::Receiver<bool>,
     tx: flume::Sender<BackendStream>,
     rx: flume::Receiver<BackendStream>,
     cancel: CancellationToken,
+    mut rt_chg_signal: tokio::sync::watch::Receiver<u64>,
 ) {
     if info.is_direct() {
-        // Direct connections are established on demand and cannot be pre-connected/pooled.
         return;
     }
 
     let retry_interval = Duration::from_secs(5);
 
     loop {
-        if !enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            // Drain all pre-connected connections from the channel so they are dropped and closed immediately.
-            while rx.try_recv().is_ok() {}
-
+        // ── Disabled: drain and wait for re-enable ───────────────────────────
+        if !*enabled_signal.borrow() {
+            drain_pool(&rx);
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => {
-                    return;
-                }
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-            }
-            continue;
-        }
-        // ── Shadowsocks backend: pre-connect TCP or Unix socket ──────────────
-        if info.is_shadowsocks() {
-            let result = crate::outbound::connect_endpoint(&info.endpoint, info.bind_interface.as_deref(), Duration::from_secs(10)).await;
-
-            match result {
-                Ok(stream) => {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            tracing::trace!(backend = %info.name, "SS refill task cancelled");
-                            return;
-                        }
-                        res = tx.send_async(stream) => {
-                            if res.is_err() {
-                                return; // Receiver dropped.
-                            }
-                            tracing::trace!(backend = %info.name, "SS pool refilled");
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        backend = %info.name,
-                        error = %e,
-                        "SS backend connect failed; retrying in {}s",
-                        retry_interval.as_secs()
-                    );
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            tracing::trace!(backend = %info.name, "SS refill task cancelled during retry backoff");
-                            return;
-                        }
-                        _ = tokio::time::sleep(retry_interval) => {}
-                    }
-                }
+                _ = cancel.cancelled() => return,
+                res = enabled_signal.changed() => if res.is_err() { return; },
+                res = rt_chg_signal.changed() => if res.is_err() { return; },
             }
             continue;
         }
 
-        // ── SOCKS5 backend: TCP/Unix connect + auth handshake ────────────────
-        let result = async {
-            let stream = crate::outbound::connect_endpoint(&info.endpoint, info.bind_interface.as_deref(), Duration::from_secs(10)).await?;
-            socks5h_authenticate(stream, &info).await
-        }
-        .await;
+        // ── Connect (+ optional SOCKS5 auth) ────────────────────────────────
+        let connect = crate::outbound::connect_endpoint(
+            &info.endpoint, info.bind_interface.as_deref(), Duration::from_secs(10),
+        ).await;
+        let result = match connect {
+            Err(e) => Err(e),
+            Ok(stream) if info.is_shadowsocks() => Ok(stream),
+            Ok(stream) => socks5h_authenticate(stream, &info).await,
+        };
 
         match result {
+            // ── Success: try to enqueue, but respect signals ─────────────
             Ok(stream) => {
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {
-                        tracing::trace!(backend = %info.name, "refill task cancelled");
-                        return;
+                    _ = cancel.cancelled() => return,
+                    res = enabled_signal.changed() => {
+                        if res.is_err() { return; }
+                        if !*enabled_signal.borrow() { drain_pool(&rx); }
+                    }
+                    res = rt_chg_signal.changed() => {
+                        if res.is_err() { return; }
+                        drain_pool(&rx);
+                        tracing::info!(backend = %info.name, "connection pool drained due to route change");
                     }
                     res = tx.send_async(stream) => {
-                        if res.is_err() {
-                            return; // Receiver dropped.
-                        }
-                        tracing::trace!(backend = %info.name, "pool refilled with new connection");
+                        if res.is_err() { return; }
+                        tracing::trace!(backend = %info.name, "pool refilled");
                     }
                 }
             }
+            // ── Failure: log and backoff, but respect signals ────────────
             Err(e) => {
                 tracing::debug!(
-                    backend = %info.name,
-                    error = %e,
-                    "failed to refill connection pool; retrying in {}s",
-                    retry_interval.as_secs()
+                    backend = %info.name, error = %e,
+                    "connect failed; retrying in {}s", retry_interval.as_secs()
                 );
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {
-                        tracing::trace!(backend = %info.name, "refill task cancelled during retry backoff");
-                        return;
+                    _ = cancel.cancelled() => return,
+                    res = enabled_signal.changed() => if res.is_err() { return; },
+                    res = rt_chg_signal.changed() => {
+                        if res.is_err() { return; }
+                        drain_pool(&rx);
+                        tracing::info!(backend = %info.name, "connection pool drained due to route change");
                     }
                     _ = tokio::time::sleep(retry_interval) => {}
                 }
@@ -1179,6 +1162,16 @@ mod tests {
         }
     }
 
+    fn new_test_pool(
+        configs: &[BackendConfig],
+        group_configs: &[GroupConfig],
+        failover_order_cfg: Option<&Vec<String>>,
+        global_bind_interface: Option<&str>,
+    ) -> anyhow::Result<BackendPool> {
+        let (_tx, rx) = tokio::sync::watch::channel(0u64);
+        BackendPool::new(configs, group_configs, failover_order_cfg, global_bind_interface, rx)
+    }
+
     #[tokio::test]
     async fn test_urltest_and_failover_strategy() {
         let b1 = make_cfg("127.0.0.1:8081", "b1");
@@ -1199,7 +1192,7 @@ mod tests {
             backends: vec!["b2".to_string(), "b3".to_string()],
         };
 
-        let pool = BackendPool::new(
+        let pool = new_test_pool(
             &[b1, b2, b3],
             &[g1, g2],
             Some(&vec!["group-urltest".to_string(), "group-failover".to_string()]),
@@ -1241,7 +1234,7 @@ mod tests {
 
         // 3. Mark b3 healthy too. Group 2 uses failover strategy.
         // Let's test failover order with a different pool where group-failover is first.
-        let pool_fo = BackendPool::new(
+        let pool_fo = new_test_pool(
             &[
                 make_cfg("127.0.0.1:8081", "b1"),
                 make_cfg("127.0.0.1:8082", "b2"),
@@ -1279,7 +1272,7 @@ mod tests {
             backends: vec!["b1".to_string(), "b2".to_string()],
         };
 
-        let pool = BackendPool::new(
+        let pool = new_test_pool(
             &[b1, b2],
             &[g],
             Some(&vec!["group-lb".to_string()]),
@@ -1343,7 +1336,7 @@ mod tests {
 
         // When we build the pool WITHOUT failover_order, the default failover order must be:
         // g-fo (Failover group) first, then g-lb (LoadBalance group) and b3 (standalone)
-        let pool = BackendPool::new(
+        let pool = new_test_pool(
             &[b1, b2, b3],
             &[g1, g2],
             None, // No explicit failover order
@@ -1369,7 +1362,7 @@ mod tests {
             backends: vec!["b1".to_string()],
         };
 
-        let pool = BackendPool::new(
+        let pool = new_test_pool(
             &[b1.clone()],
             &[g1.clone()],
             Some(&vec!["group-1".to_string()]),
@@ -1408,7 +1401,7 @@ mod tests {
     async fn test_reload_restarts_refill_task_on_config_change() {
         let b1 = make_cfg("127.0.0.1:8081", "b1");
 
-        let pool = BackendPool::new(
+        let pool = new_test_pool(
             &[b1.clone()],
             &[],
             None,
@@ -1467,7 +1460,7 @@ mod tests {
         b2.bind_interface = Some("eno1".to_string());
 
         // Pool constructed with a global bind interface "eno0"
-        let pool = BackendPool::new(
+        let pool = new_test_pool(
             &[b1, b2],
             &[],
             None,
@@ -1486,7 +1479,7 @@ mod tests {
         let b1 = make_cfg("127.0.0.1:8081", "b1");
         let b2 = make_cfg("127.0.0.1:8082", "b2");
 
-        let pool = BackendPool::new(
+        let pool = new_test_pool(
             &[b1, b2],
             &[],
             None,
