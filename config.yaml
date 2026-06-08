@@ -90,12 +90,12 @@ backends:
     pool_size: 10
 
   # Example: Shadowsocks backend running over TCP
-  # - type: ss
-  #   address: "ss-server.example.com:8388"
-  #   name: "ss-backend-1"
-  #   username: "chacha20-ietf-poly1305"
-  #   password: "my-shadowsocks-password"
-  #   pool_size: 10
+  - type: ss
+    address: "ss-server.example.com:8388"
+    name: "ss-backend-1"
+    username: "chacha20-ietf-poly1305"
+    password: "my-shadowsocks-password"
+    pool_size: 10
 
 # Backend groups let you cluster individual backends.
 # Strategy options:
