@@ -376,6 +376,27 @@ function App() {
             VM Size: {data?.memory?.vmsize ? formatBytes(data.memory.vmsize) : 'Linux only'}
           </div>
         </div>
+
+        {/* AdBlock Guard */}
+        <div className={`summary-card ${data?.adblock?.enabled ? 'adblock-enabled' : 'adblock-disabled'}`}>
+          <div className="summary-card-header">
+            <span className="summary-card-title">AdBlock Guard</span>
+            <div className="beacon-container">
+              <span className="summary-card-subtext">
+                {data?.adblock?.enabled ? 'Active' : 'Disabled'}
+              </span>
+              <div className={`beacon ${data?.adblock?.enabled ? 'beacon-green' : 'beacon-red'}`}>
+                <span className="beacon-pulse"></span>
+              </div>
+            </div>
+          </div>
+          <div className="summary-card-value">
+            {data?.adblock?.blocked_requests || 0}
+          </div>
+          <div className="summary-card-subtext">
+            Blocked / {((data?.adblock?.block_rules_count || 0) + (data?.adblock?.allow_rules_count || 0)).toLocaleString()} rules
+          </div>
+        </div>
       </div>
 
       {/* 2. Inbound stats sorted by data usage */}

@@ -11,6 +11,7 @@ mod outbound;
 mod relay;
 mod web;
 mod route_watcher;
+mod adblock;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -137,7 +138,19 @@ async fn main_async(
         config.failover_order.as_ref(),
         config.bind_interface.as_deref(),
         route_rx.clone(),
+        &config.adblock,
     )?;
+
+    // Spawn adblock background manager task if enabled
+    let mut adblock_cancel = CancellationToken::new();
+    if config.adblock.enabled {
+        adblock::start_adblock_manager(
+            pool.adblock_manager.clone(),
+            pool.clone(),
+            config.adblock.clone(),
+            adblock_cancel.clone(),
+        ).await;
+    }
 
     // Spawn health checker and candidate selector background tasks with a shared cancellation token.
     let mut health_cancel = CancellationToken::new();
@@ -242,6 +255,7 @@ async fn main_async(
                     &args.config,
                     &pool,
                     &mut health_cancel,
+                    &mut adblock_cancel,
                     &initial_inbounds,
                     &ancillary_handle,
                 )
@@ -263,6 +277,7 @@ async fn perform_hot_reload(
     config_path: &PathBuf,
     pool: &backend::BackendPool,
     health_cancel: &mut CancellationToken,
+    adblock_cancel: &mut CancellationToken,
     initial_inbounds: &[config::InboundItemConfig],
     ancillary_handle: &tokio::runtime::Handle,
 ) {
@@ -276,6 +291,21 @@ async fn perform_hot_reload(
 
     // Warn about inbound listener changes that require a restart.
     warn_if_inbounds_changed(initial_inbounds, &new_config.all_inbounds());
+
+    // Update adblock enabled state.
+    pool.adblock_manager.enabled.store(std::sync::Arc::new(new_config.adblock.enabled));
+
+    // Cancel old adblock task and spawn a new one if enabled.
+    adblock_cancel.cancel();
+    *adblock_cancel = CancellationToken::new();
+    if new_config.adblock.enabled {
+        adblock::start_adblock_manager(
+            pool.adblock_manager.clone(),
+            pool.clone(),
+            new_config.adblock.clone(),
+            adblock_cancel.clone(),
+        ).await;
+    }
 
     // Stop the health checker BEFORE swapping the pool so it cannot race
     // mark_healthy / mark_unhealthy against indices that are mid-rewrite.

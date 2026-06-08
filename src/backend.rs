@@ -362,6 +362,7 @@ pub struct BackendPool {
     cached: Arc<ArcSwap<CachedCandidates>>,
     pub inbound_stats: Arc<std::sync::Mutex<Vec<Arc<InboundStats>>>>,
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
+    pub adblock_manager: Arc<crate::adblock::AdBlockManager>,
 }
 
 fn build_groups_and_failover_order(
@@ -556,6 +557,7 @@ impl BackendPool {
         failover_order_cfg: Option<&Vec<String>>,
         global_bind_interface: Option<&str>,
         rt_chg_signal: tokio::sync::watch::Receiver<u64>,
+        adblock_config: &crate::config::AdBlockConfig,
     ) -> anyhow::Result<Self> {
         let mut entries = Vec::with_capacity(configs.len());
         for (i, cfg) in configs.iter().enumerate() {
@@ -591,6 +593,8 @@ impl BackendPool {
             unhealthy: cached_unhealthy.clone(),
         }));
 
+        let adblock_manager = Arc::new(crate::adblock::AdBlockManager::new(adblock_config.enabled));
+
         Ok(Self {
             inner: Arc::new(RwLock::new(BackendPoolInner {
                 entries,
@@ -600,6 +604,7 @@ impl BackendPool {
             cached,
             inbound_stats: Arc::new(std::sync::Mutex::new(Vec::new())),
             rt_chg_signal,
+            adblock_manager,
         })
     }
 
@@ -1169,7 +1174,7 @@ mod tests {
         global_bind_interface: Option<&str>,
     ) -> anyhow::Result<BackendPool> {
         let (_tx, rx) = tokio::sync::watch::channel(0u64);
-        BackendPool::new(configs, group_configs, failover_order_cfg, global_bind_interface, rx)
+        BackendPool::new(configs, group_configs, failover_order_cfg, global_bind_interface, rx, &crate::config::AdBlockConfig::default())
     }
 
     #[tokio::test]

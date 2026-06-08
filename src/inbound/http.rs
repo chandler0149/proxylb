@@ -133,6 +133,12 @@ where
         return Ok(());
     }
 
+    if pool.adblock_manager.is_blocked(&target) {
+        tracing::warn!(target = %target, "HTTP connection blocked by adblock");
+        let _ = client_stream.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nBlocked by AdBlock rules.\r\n").await;
+        return Ok(());
+    }
+
     tracing::debug!(client = %client_addr, method = %method, target = %target, "HTTP CONNECT request" );
 
     // Try backends in order with fallback.

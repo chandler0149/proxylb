@@ -29,6 +29,25 @@ pub struct Config {
     pub bind_interface: Option<String>,
     #[serde(default)]
     pub cpu_affinity: Option<CpuAffinityConfig>,
+    #[serde(default)]
+    pub adblock: AdBlockConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AdBlockConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default = "default_update_interval_hours")]
+    pub update_interval_hours: u64,
+}
+
+fn default_update_interval_hours() -> u64 {
+    24
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -429,6 +448,7 @@ mod tests {
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
+            adblock: AdBlockConfig::default(),
         };
         assert!(cfg.validate().is_ok());
     }
@@ -450,6 +470,7 @@ mod tests {
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
+            adblock: AdBlockConfig::default(),
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("cannot be used in multiple groups"));
@@ -471,6 +492,7 @@ mod tests {
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
+            adblock: AdBlockConfig::default(),
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("cannot be used as a standalone target"));

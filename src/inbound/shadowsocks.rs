@@ -186,6 +186,11 @@ where
         return Err(anyhow::anyhow!("private address target is rejected by filter"));
     }
 
+    if pool.adblock_manager.is_blocked(&target) {
+        tracing::warn!(target = %target, "Shadowsocks connection blocked by adblock");
+        return Err(anyhow::anyhow!("connection blocked by AdBlock rules"));
+    }
+
     // Try backends in order with fallback.
     let (backend_stream, chosen_traffic) = match crate::inbound::route_and_connect(&pool, &target).await {
         Ok((s, t)) => (s, t),

@@ -29,6 +29,14 @@ pub fn get_memory_usage() -> MemStats {
     }
 }
 
+#[derive(Serialize)]
+struct AdBlockStatusView {
+    enabled: bool,
+    block_rules_count: usize,
+    allow_rules_count: usize,
+    blocked_requests: u64,
+}
+
 /// JSON API response.
 #[derive(Serialize)]
 struct ApiResponse {
@@ -36,6 +44,7 @@ struct ApiResponse {
     tree: Vec<crate::backend::TreeItem>,
     memory: MemStats,
     inbounds: Vec<crate::backend::InboundStatsView>,
+    adblock: AdBlockStatusView,
 }
 
 /// Create the axum router.
@@ -113,10 +122,20 @@ async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
     let tree = pool.status_tree().await;
     let memory = get_memory_usage();
     let inbounds = pool.get_inbound_stats();
+    
+    let engine = pool.adblock_manager.engine.load();
+    let adblock = AdBlockStatusView {
+        enabled: **pool.adblock_manager.enabled.load(),
+        block_rules_count: engine.block_rules_count,
+        allow_rules_count: engine.allow_rules_count,
+        blocked_requests: pool.adblock_manager.blocked_requests.load(std::sync::atomic::Ordering::Relaxed),
+    };
+
     Json(ApiResponse {
         backends,
         tree,
         memory,
         inbounds,
+        adblock,
     })
 }

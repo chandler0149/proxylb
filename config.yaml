@@ -135,3 +135,21 @@ web:
 cpu_affinity:
   worker_cores: [0, 1]      # Core IDs to pin worker threads (hot path)
   ancillary_cores: [2]     # Core IDs to pin ancillary/background tasks
+
+# AdBlock Guard settings
+# ---------------------
+# Enables domain name filtering on inbound requests.
+# Supports AdGuard Home, ABP (Adblock Plus), and standard hosts file formats.
+adblock:
+  enabled: true
+  # Optional: proxy backend or group name to fetch rule updates through.
+  # If omitted, updates will be downloaded via direct connection.
+  backend: "direct-out"
+  # Remote rule lists to download and update periodically.
+  urls:
+    - "https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/SpiderFilter/sections/adservers.txt"
+  # Local rule files on the disk.
+  files:
+    - "/etc/proxylb/custom-blocklist.txt"
+  # Periodic update check interval for remote URLs (in hours).
+  update_interval_hours: 24

@@ -160,6 +160,14 @@ where
         return Ok(());
     }
 
+    if pool.adblock_manager.is_blocked(&target) {
+        tracing::warn!(target = %target, "SOCKS5 connection blocked by adblock");
+        let mut client_stream = socks5_socket.into_inner();
+        let reply = build_socks5_reply(consts::SOCKS5_REPLY_CONNECTION_NOT_ALLOWED);
+        let _ = client_stream.write_all(&reply).await;
+        return Ok(());
+    }
+
 
     // Get the raw stream back from the socks5 socket.
     let mut client_stream = socks5_socket.into_inner();
