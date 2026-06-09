@@ -25,7 +25,7 @@ RUN apt-get update && \
 COPY --from=frontend-builder /usr/src/app/web/dist /var/www/html
 
 # Copy Nginx config
-COPY nginx.conf /etc/nginx/sites-available/default
+COPY nginx.conf /etc/nginx/nginx.conf
 
 # Copy Rust backend binary
 COPY --from=backend-builder /usr/src/app/target/release/proxylb /usr/local/bin/proxylb

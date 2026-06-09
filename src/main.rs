@@ -69,19 +69,24 @@ fn main() -> anyhow::Result<()> {
     // Builder for worker runtime.
     let mut worker_builder = tokio::runtime::Builder::new_multi_thread();
     worker_builder.enable_all();
+    worker_builder.thread_name("proxylb-worker");
     if let Some(ref cores) = worker_cores {
         if !cores.is_empty() {
             let next_core_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let cores = cores.clone();
             worker_builder.on_thread_start(move || {
-                let idx = next_core_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if let Some(&core_num) = cores.get(idx % cores.len()) {
-                    if let Some(core_ids) = core_affinity::get_core_ids() {
-                        if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
-                            if core_affinity::set_for_current(core_id) {
-                                tracing::info!("Bound tokio worker thread to CPU core {}", core_num);
-                            } else {
-                                tracing::warn!("Failed to bind tokio worker thread to CPU core {}", core_num);
+                let thread = std::thread::current();
+                let name = thread.name().unwrap_or("");
+                if name.starts_with("proxylb-worker") {
+                    let idx = next_core_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(&core_num) = cores.get(idx % cores.len()) {
+                        if let Some(core_ids) = core_affinity::get_core_ids() {
+                            if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
+                                if core_affinity::set_for_current(core_id) {
+                                    tracing::info!("Bound tokio worker thread ({}) to CPU core {}", name, core_num);
+                                } else {
+                                    tracing::warn!("Failed to bind tokio worker thread ({}) to CPU core {}", name, core_num);
+                                }
                             }
                         }
                     }
@@ -95,19 +100,24 @@ fn main() -> anyhow::Result<()> {
     // Builder for ancillary runtime.
     let mut ancillary_builder = tokio::runtime::Builder::new_multi_thread();
     ancillary_builder.enable_all();
+    ancillary_builder.thread_name("proxylb-ancillary");
     if let Some(ref cores) = ancillary_cores {
         if !cores.is_empty() {
             let next_core_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let cores = cores.clone();
             ancillary_builder.on_thread_start(move || {
-                let idx = next_core_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if let Some(&core_num) = cores.get(idx % cores.len()) {
-                    if let Some(core_ids) = core_affinity::get_core_ids() {
-                        if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
-                            if core_affinity::set_for_current(core_id) {
-                                tracing::info!("Bound tokio ancillary thread to CPU core {}", core_num);
-                            } else {
-                                tracing::warn!("Failed to bind tokio ancillary thread to CPU core {}", core_num);
+                let thread = std::thread::current();
+                let name = thread.name().unwrap_or("");
+                if name.starts_with("proxylb-ancillary") {
+                    let idx = next_core_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(&core_num) = cores.get(idx % cores.len()) {
+                        if let Some(core_ids) = core_affinity::get_core_ids() {
+                            if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
+                                if core_affinity::set_for_current(core_id) {
+                                    tracing::info!("Bound tokio ancillary thread ({}) to CPU core {}", name, core_num);
+                                } else {
+                                    tracing::warn!("Failed to bind tokio ancillary thread ({}) to CPU core {}", name, core_num);
+                                }
                             }
                         }
                     }
@@ -139,17 +149,24 @@ async fn main_async(
         config.bind_interface.as_deref(),
         route_rx.clone(),
         &config.adblock,
+        ancillary_handle.clone(),
     )?;
 
     // Spawn adblock background manager task if enabled
     let mut adblock_cancel = CancellationToken::new();
     if config.adblock.enabled {
-        adblock::start_adblock_manager(
-            pool.adblock_manager.clone(),
-            pool.clone(),
-            config.adblock.clone(),
-            adblock_cancel.clone(),
-        ).await;
+        let adblock_pool = pool.clone();
+        let adblock_config = config.adblock.clone();
+        let token = adblock_cancel.clone();
+        let adblock_manager = pool.adblock_manager.clone();
+        ancillary_handle.spawn(async move {
+            adblock::start_adblock_manager(
+                adblock_manager,
+                adblock_pool,
+                adblock_config,
+                token,
+            ).await;
+        });
     }
 
     // Spawn health checker and candidate selector background tasks with a shared cancellation token.
@@ -299,12 +316,18 @@ async fn perform_hot_reload(
     adblock_cancel.cancel();
     *adblock_cancel = CancellationToken::new();
     if new_config.adblock.enabled {
-        adblock::start_adblock_manager(
-            pool.adblock_manager.clone(),
-            pool.clone(),
-            new_config.adblock.clone(),
-            adblock_cancel.clone(),
-        ).await;
+        let adblock_pool = pool.clone();
+        let adblock_config = new_config.adblock.clone();
+        let token = adblock_cancel.clone();
+        let adblock_manager = pool.adblock_manager.clone();
+        ancillary_handle.spawn(async move {
+            adblock::start_adblock_manager(
+                adblock_manager,
+                adblock_pool,
+                adblock_config,
+                token,
+            ).await;
+        });
     }
 
     // Stop the health checker BEFORE swapping the pool so it cannot race

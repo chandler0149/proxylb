@@ -405,6 +405,8 @@ pub async fn start_adblock_manager(
     tokio::spawn(async move {
         let interval = Duration::from_secs(config_clone.update_interval_hours * 3600);
         let mut ticker = tokio::time::interval(interval);
+        // Consume the first immediate tick so we wait for the actual interval in the loop.
+        ticker.tick().await;
 
         loop {
             let mut remote_contents = Vec::new();

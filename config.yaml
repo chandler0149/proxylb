@@ -127,7 +127,7 @@ health_check:
 # Web status dashboard
 web:
   enabled: true
-  listen: "0.0.0.0:9090"
+  listen: "127.0.0.1:9090"
 
 # CPU Affinity settings
 # Bind Tokio worker threads (main proxy traffic relay tasks) and ancillary threads
@@ -136,6 +136,8 @@ cpu_affinity:
   worker_cores: [0, 1]      # Core IDs to pin worker threads (hot path)
   ancillary_cores: [2]     # Core IDs to pin ancillary/background tasks
 
+
+# Experimental section
 # AdBlock Guard settings
 # ---------------------
 # Enables domain name filtering on inbound requests.

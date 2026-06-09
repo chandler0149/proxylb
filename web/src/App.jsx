@@ -3,7 +3,7 @@ import './App.css';
 
 function App() {
   const [apiHost, setApiHost] = useState(() => {
-    return localStorage.getItem('proxylb_api_host') || 'http://192.168.1.240:2020';
+    return localStorage.getItem('proxylb_api_host') || window.location.origin;
   });
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);

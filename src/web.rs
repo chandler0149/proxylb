@@ -110,10 +110,109 @@ async fn api_disable_backend(
 /// Run the web status server.
 pub async fn run_web_server(listen_addr: String, pool: BackendPool) -> anyhow::Result<()> {
     let app = create_router(pool);
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-    tracing::info!(listen = %listen_addr, "web status REST API started");
-    axum::serve(listener, app).await?;
+    if listen_addr.starts_with("unix://") {
+        let mut path = listen_addr.strip_prefix("unix://").unwrap().to_string();
+        if !path.starts_with('/') {
+            path = format!("/{}", path);
+        }
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        tracing::info!(listen = %path, "web status REST API started (UDS)");
+        axum::serve(listener, app).await?;
+    } else if listen_addr.starts_with("unix:") {
+        let mut path = listen_addr.strip_prefix("unix:").unwrap().to_string();
+        if !path.starts_with('/') {
+            path = format!("/{}", path);
+        }
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = tokio::fs::remove_file(&path).await;
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        tracing::info!(listen = %path, "web status REST API started (UDS)");
+        axum::serve(listener, app).await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+        tracing::info!(listen = %listen_addr, "web status REST API started");
+        axum::serve(listener, app).await?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendPool;
+    use crate::config::AdBlockConfig;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn test_run_web_server_uds() {
+        let (_tx, rx) = watch::channel(0u64);
+        let pool = BackendPool::new(
+            &[],
+            &[],
+            None,
+            None,
+            rx,
+            &AdBlockConfig::default(),
+            tokio::runtime::Handle::current(),
+        ).unwrap();
+
+        let socket_path = "/tmp/test_api_web.sock";
+        let listen_addr = format!("unix://{}", socket_path);
+
+        // Spawn the server in the background
+        let pool_clone = pool.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_web_server(listen_addr, pool_clone).await;
+        });
+
+        // Wait a bit for the server to start
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Verify socket file exists
+        assert!(std::path::Path::new(socket_path).exists());
+
+        // Cleanup
+        handle.abort();
+        let _ = tokio::fs::remove_file(socket_path).await;
+    }
+
+    #[tokio::test]
+    async fn test_run_web_server_uds_relative() {
+        let (_tx, rx) = watch::channel(0u64);
+        let pool = BackendPool::new(
+            &[],
+            &[],
+            None,
+            None,
+            rx,
+            &AdBlockConfig::default(),
+            tokio::runtime::Handle::current(),
+        ).unwrap();
+
+        let listen_addr = "unix://tmp/proxylb_api.sock".to_string();
+
+        // Spawn the server in the background
+        let pool_clone = pool.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_web_server(listen_addr, pool_clone).await;
+        });
+
+        // Wait a bit for the server to start
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Verify socket file exists
+        assert!(std::path::Path::new("/tmp/proxylb_api.sock").exists());
+
+        // Cleanup
+        handle.abort();
+        let _ = tokio::fs::remove_file("/tmp/proxylb_api.sock").await;
+    }
 }
 
 /// JSON API endpoint: GET /api/status

@@ -363,6 +363,7 @@ pub struct BackendPool {
     pub inbound_stats: Arc<std::sync::Mutex<Vec<Arc<InboundStats>>>>,
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
     pub adblock_manager: Arc<crate::adblock::AdBlockManager>,
+    pub ancillary_handle: tokio::runtime::Handle,
 }
 
 fn build_groups_and_failover_order(
@@ -558,6 +559,7 @@ impl BackendPool {
         global_bind_interface: Option<&str>,
         rt_chg_signal: tokio::sync::watch::Receiver<u64>,
         adblock_config: &crate::config::AdBlockConfig,
+        ancillary_handle: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
         let mut entries = Vec::with_capacity(configs.len());
         for (i, cfg) in configs.iter().enumerate() {
@@ -582,7 +584,7 @@ impl BackendPool {
             entries.push(entry);
 
             // Spawn refill task for this backend.
-            tokio::spawn(refill_pool_task(info, enabled_signal, tx, rx, cancel, rt_chg_signal.clone()));
+            ancillary_handle.spawn(refill_pool_task(info, enabled_signal, tx, rx, cancel, rt_chg_signal.clone()));
         }
 
         let (groups, failover_order) = build_groups_and_failover_order(&entries, group_configs, failover_order_cfg);
@@ -605,6 +607,7 @@ impl BackendPool {
             inbound_stats: Arc::new(std::sync::Mutex::new(Vec::new())),
             rt_chg_signal,
             adblock_manager,
+            ancillary_handle,
         })
     }
 
@@ -712,7 +715,7 @@ impl BackendPool {
 
                     let enabled_signal = entry.enabled_tx.subscribe();
                     // Spawn the new refill task with new configuration and channel
-                    tokio::spawn(refill_pool_task(new_info, enabled_signal, tx, rx, new_cancel, entry.rt_chg_signal.clone()));
+                    self.ancillary_handle.spawn(refill_pool_task(new_info, enabled_signal, tx, rx, new_cancel, entry.rt_chg_signal.clone()));
                 }
 
                 new_entries.push(entry);
@@ -737,7 +740,7 @@ impl BackendPool {
                     rt_chg_signal: self.rt_chg_signal.clone(),
                 };
                 new_entries.push(entry);
-                tokio::spawn(refill_pool_task(new_info, enabled_signal, tx, rx, cancel, self.rt_chg_signal.clone()));
+                self.ancillary_handle.spawn(refill_pool_task(new_info, enabled_signal, tx, rx, cancel, self.rt_chg_signal.clone()));
                 added += 1;
             }
         }
@@ -1174,7 +1177,7 @@ mod tests {
         global_bind_interface: Option<&str>,
     ) -> anyhow::Result<BackendPool> {
         let (_tx, rx) = tokio::sync::watch::channel(0u64);
-        BackendPool::new(configs, group_configs, failover_order_cfg, global_bind_interface, rx, &crate::config::AdBlockConfig::default())
+        BackendPool::new(configs, group_configs, failover_order_cfg, global_bind_interface, rx, &crate::config::AdBlockConfig::default(), tokio::runtime::Handle::current())
     }
 
     #[tokio::test]
