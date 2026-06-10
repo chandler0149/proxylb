@@ -43,20 +43,8 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Initialize async (non-blocking) tracing.
-    // The worker guard MUST be kept alive for the entire lifetime of main();
-    // dropping it early will shut down the background I/O thread and lose
-    // buffered log lines.
-    let _log_guard: WorkerGuard = init_tracing(&args.log_level);
-
-    tracing::info!("ProxyLB starting...");
-
-    // Load config.
+    // Load config first to read CPU affinity settings.
     let config = config::Config::load(&args.config)?;
-    tracing::info!(
-        backends = config.backends.len(),
-        "configuration loaded"
-    );
 
     // Extract CPU affinity configuration.
     let mut worker_cores = None;
@@ -65,6 +53,15 @@ fn main() -> anyhow::Result<()> {
         worker_cores = affinity.worker_cores.clone();
         ancillary_cores = affinity.ancillary_cores.clone();
     }
+
+    // Initialize async (non-blocking) tracing with background thread pinned to ancillary core.
+    let _log_guard: WorkerGuard = init_tracing(&args.log_level, &ancillary_cores);
+
+    tracing::info!("ProxyLB starting...");
+    tracing::info!(
+        backends = config.backends.len(),
+        "configuration loaded"
+    );
 
     // Builder for worker runtime.
     let mut worker_builder = tokio::runtime::Builder::new_multi_thread();
@@ -400,6 +397,36 @@ fn warn_if_inbounds_changed(old: &[config::InboundItemConfig], new: &[config::In
     }
 }
 
+struct AffinityWriter<W: std::io::Write> {
+    inner: W,
+    cores: Option<Vec<usize>>,
+    pinned: std::sync::atomic::AtomicBool,
+}
+
+impl<W: std::io::Write> std::io::Write for AffinityWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.pinned.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(ref cores) = self.cores {
+                if !cores.is_empty() {
+                    if let Some(core_num) = cores.first() {
+                        if let Some(core_ids) = core_affinity::get_core_ids() {
+                            if let Some(core_id) = core_ids.into_iter().find(|c| c.id == *core_num) {
+                                let _ = core_affinity::set_for_current(core_id);
+                            }
+                        }
+                    }
+                }
+            }
+            self.pinned.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Initialise a non-blocking tracing subscriber that writes to stderr.
 ///
 /// A dedicated background thread performs all I/O so that log calls on the
@@ -408,8 +435,13 @@ fn warn_if_inbounds_changed(old: &[config::InboundItemConfig], new: &[config::In
 /// The returned [`WorkerGuard`] **must** be stored in a binding that lives for
 /// the entire duration of `main`; dropping it earlier shuts down the I/O
 /// thread and may lose buffered log lines.
-fn init_tracing(log_level: &str) -> tracing_appender::non_blocking::WorkerGuard {
-    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
+fn init_tracing(log_level: &str, ancillary_cores: &Option<Vec<usize>>) -> tracing_appender::non_blocking::WorkerGuard {
+    let writer = AffinityWriter {
+        inner: std::io::stderr(),
+        cores: ancillary_cores.clone(),
+        pinned: std::sync::atomic::AtomicBool::new(false),
+    };
+    let (non_blocking, guard) = tracing_appender::non_blocking(writer);
 
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
