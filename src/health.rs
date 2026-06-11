@@ -45,7 +45,7 @@ pub async fn run_health_checker(
         Ok(t) => t,
         Err(e) => {
             tracing::error!(target = %config.check_target, error = %e, "failed to parse health check target; using default");
-            parse_check_target("http://www.google.com:80/").unwrap()
+            parse_check_target("http://www.gstatic.com/generate_204").unwrap()
         }
     };
 
