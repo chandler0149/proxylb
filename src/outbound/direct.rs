@@ -22,13 +22,9 @@ pub async fn direct_connect(
                     io::Error::new(e.kind(), format!("direct connect to {}: {}", addr, e))
                 })?
         }
-        TargetAddr::Ip(addr) => {
-            super::tcp_connect_raw(*addr, bind_interface, timeout)
-                .await
-                .map_err(|e| {
-                    io::Error::new(e.kind(), format!("direct connect to {}: {}", addr, e))
-                })?
-        }
+        TargetAddr::Ip(addr) => super::tcp_connect_raw(*addr, bind_interface, timeout)
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("direct connect to {}: {}", addr, e)))?,
     };
     tcp.set_nodelay(true)?;
     Ok(BackendStream::Tcp(tcp))

@@ -24,14 +24,13 @@ fn to_ss_address(target: &TargetAddr) -> SsAddress {
 
 /// Connect **fresh** to a Shadowsocks server and wrap the stream for `target`.
 pub async fn ss_connect_fresh(
-    endpoint: &crate::backend::BackendEndpoint,
+    backend: &crate::backend::BackendInfo,
     svr_cfg: &Arc<SsServerConfig>,
     ctx: SharedContext,
     target: &TargetAddr,
     timeout: Duration,
-    bind_interface: Option<&str>,
 ) -> io::Result<BackendStream> {
-    let raw = crate::outbound::connect_endpoint(endpoint, bind_interface, timeout).await?;
+    let raw = crate::outbound::connect_endpoint(backend, timeout).await?;
     let ss_addr = to_ss_address(target);
     let client_stream = ProxyClientStream::from_stream(ctx, raw, svr_cfg.as_ref(), ss_addr);
     Ok(BackendStream::Boxed(Box::pin(client_stream)))
@@ -52,4 +51,3 @@ where
     let client_stream = ProxyClientStream::from_stream(ctx, raw, svr_cfg.as_ref(), ss_addr);
     BackendStream::Boxed(Box::pin(client_stream))
 }
-

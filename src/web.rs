@@ -8,9 +8,9 @@ use axum::{
     routing::get,
     Router,
 };
-use serde::Serialize;
 use memory_stats::memory_stats;
-use tower_http::cors::{CorsLayer, Any};
+use serde::Serialize;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::backend::BackendPool;
 
@@ -23,7 +23,10 @@ pub struct MemStats {
 
 pub fn get_memory_usage() -> MemStats {
     if let Some(usage) = memory_stats() {
-        MemStats { rss: usage.physical_mem, vmsize: usage.virtual_mem }
+        MemStats {
+            rss: usage.physical_mem,
+            vmsize: usage.virtual_mem,
+        }
     } else {
         MemStats { rss: 0, vmsize: 0 }
     }
@@ -160,7 +163,8 @@ mod tests {
             rx,
             &AdBlockConfig::default(),
             tokio::runtime::Handle::current(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let socket_path = "/tmp/test_api_web.sock";
         let listen_addr = format!("unix://{}", socket_path);
@@ -193,7 +197,8 @@ mod tests {
             rx,
             &AdBlockConfig::default(),
             tokio::runtime::Handle::current(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let listen_addr = "unix://tmp/proxylb_api.sock".to_string();
 
@@ -221,13 +226,16 @@ async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
     let tree = pool.status_tree().await;
     let memory = get_memory_usage();
     let inbounds = pool.get_inbound_stats();
-    
+
     let engine = pool.adblock_manager.engine.load();
     let adblock = AdBlockStatusView {
         enabled: **pool.adblock_manager.enabled.load(),
         block_rules_count: engine.block_rules_count,
         allow_rules_count: engine.allow_rules_count,
-        blocked_requests: pool.adblock_manager.blocked_requests.load(std::sync::atomic::Ordering::Relaxed),
+        blocked_requests: pool
+            .adblock_manager
+            .blocked_requests
+            .load(std::sync::atomic::Ordering::Relaxed),
     };
 
     Json(ApiResponse {

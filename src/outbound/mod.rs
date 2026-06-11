@@ -2,14 +2,14 @@
 //!
 //! Submodules implement SOCKS5 client, Shadowsocks client, and Direct TCP outbounds.
 
-pub mod socks5;
-pub mod shadowsocks;
 pub mod direct;
+pub mod shadowsocks;
+pub mod socks5;
 
 // Re-export key outbound client functions for clean top-level usage
-pub use socks5::{socks5h_authenticate, socks5h_connect, socks5h_connect_target};
-pub use shadowsocks::{ss_connect_fresh, ss_connect_pooled};
 pub use direct::direct_connect;
+pub use shadowsocks::{ss_connect_fresh, ss_connect_pooled};
+pub use socks5::{socks5h_authenticate, socks5h_connect, socks5h_connect_target};
 
 use std::io;
 use std::net::SocketAddr;
@@ -102,7 +102,11 @@ impl AsyncWrite for BackendStream {
 
 /// Helper function to platform-conditionally bind a socket descriptor to a network interface.
 #[cfg(target_os = "linux")]
-fn bind_socket_to_device(fd: std::os::unix::io::RawFd, interface: &str, _is_ipv6: bool) -> std::io::Result<()> {
+fn bind_socket_to_device(
+    fd: std::os::unix::io::RawFd,
+    interface: &str,
+    _is_ipv6: bool,
+) -> std::io::Result<()> {
     use std::ffi::CString;
     let iface_c = CString::new(interface)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -123,7 +127,11 @@ fn bind_socket_to_device(fd: std::os::unix::io::RawFd, interface: &str, _is_ipv6
 }
 
 #[cfg(target_os = "macos")]
-fn bind_socket_to_device(fd: std::os::unix::io::RawFd, interface: &str, is_ipv6: bool) -> std::io::Result<()> {
+fn bind_socket_to_device(
+    fd: std::os::unix::io::RawFd,
+    interface: &str,
+    is_ipv6: bool,
+) -> std::io::Result<()> {
     use std::ffi::CString;
     let iface_c = CString::new(interface)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -166,7 +174,11 @@ fn bind_socket_to_device(fd: std::os::unix::io::RawFd, interface: &str, is_ipv6:
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn bind_socket_to_device(_fd: std::os::unix::io::RawFd, _interface: &str, _is_ipv6: bool) -> std::io::Result<()> {
+fn bind_socket_to_device(
+    _fd: std::os::unix::io::RawFd,
+    _interface: &str,
+    _is_ipv6: bool,
+) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "outbound interface binding is only supported on Linux and macOS",
@@ -200,37 +212,78 @@ pub async fn tcp_connect_raw<A: tokio::net::ToSocketAddrs>(
         match tokio::time::timeout(timeout, socket.connect(socket_addr)).await {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(e)) => last_err = Some(e),
-            Err(_) => last_err = Some(io::Error::new(io::ErrorKind::TimedOut, "connection timed out")),
+            Err(_) => {
+                last_err = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "connection timed out",
+                ))
+            }
         }
     }
 
     Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::AddrNotAvailable, "could not resolve address or no addresses found")
+        io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "could not resolve address or no addresses found",
+        )
     }))
 }
 
 /// Establish an outbound connection (TCP or Unix Domain Socket) to a backend endpoint.
 pub async fn connect_endpoint(
-    endpoint: &crate::backend::BackendEndpoint,
-    bind_interface: Option<&str>,
+    info: &crate::backend::BackendInfo,
     timeout: std::time::Duration,
 ) -> io::Result<BackendStream> {
-    match endpoint {
+    let bind_interface = info.bind_interface.as_deref();
+    let stream = match &info.endpoint {
         crate::backend::BackendEndpoint::Tcp { host, port } => {
             let addr = format!("{}:{}", host, port);
             let tcp = tcp_connect_raw(&addr, bind_interface, timeout).await?;
             tcp.set_nodelay(true)?;
-            Ok(BackendStream::Tcp(tcp))
+            BackendStream::Tcp(tcp)
         }
         crate::backend::BackendEndpoint::Unix { path } => {
             let unix = tokio::time::timeout(timeout, UnixStream::connect(path))
                 .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("UDS connect timeout to {}", path)))??;
-            Ok(BackendStream::Unix(unix))
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("UDS connect timeout to {}", path),
+                    )
+                })??;
+            BackendStream::Unix(unix)
         }
         crate::backend::BackendEndpoint::Direct => {
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "Direct backend has no endpoint address"))
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Direct backend has no endpoint address",
+            ));
         }
+    };
+
+    if let Some(tls) = &info.tls_connector {
+        let server_name = info
+            .server_name
+            .clone()
+            .unwrap_or_else(|| match &info.endpoint {
+                crate::backend::BackendEndpoint::Tcp { host, .. } => host.clone(),
+                _ => "localhost".to_string(),
+            });
+
+        // Use rustls::pki_types::ServerName
+        let server_name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from(server_name.clone())
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid SNI: {}", server_name),
+                    )
+                })?
+                .to_owned();
+
+        let tls_stream = tls.connect(server_name, stream).await?;
+        Ok(BackendStream::Boxed(Box::pin(tls_stream)))
+    } else {
+        Ok(stream)
     }
 }
-

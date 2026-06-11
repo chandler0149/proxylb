@@ -16,6 +16,12 @@ inbound:
 inbounds:
   - type: socks5
     listen: "0.0.0.0:1081"
+    username: "inbound-user"     # Optional: SOCKS5 Username authentication
+    password: "inbound-password" # Optional: SOCKS5 Password authentication
+    # tls: auto                 # Optional: Auto-generate self-signed cert
+    # tls:                      # Optional: Manual TLS Server config (SOCKS5-over-TLS)
+    #   cert: "/etc/proxylb/certs/server.crt"
+    #   key: "/etc/proxylb/certs/server.key"
     filter:
       enabled: false # Custom override to allow private targets for this listener
 
@@ -31,6 +37,10 @@ inbounds:
     listen: "0.0.0.0:8389"
     password: "another-password"
     method: "chacha20-ietf-poly1305"
+    # tls: auto                 # Optional: Auto-generate self-signed cert
+    # tls:                      # Optional: Manual TLS Server config (Shadowsocks-over-TLS/wrapper)
+    #   cert: "/etc/proxylb/certs/server.crt"
+    #   key: "/etc/proxylb/certs/server.key"
 
   - type: shadowsocks
     listen: "unix:///tmp/proxylb-ss.sock" # Shadowsocks inbound running over Unix Domain Socket
@@ -39,6 +49,12 @@ inbounds:
 
   - type: http
     listen: "0.0.0.0:8081"
+    username: "http-user"        # Optional: HTTP Proxy authentication
+    password: "http-password"    # Optional: HTTP Proxy authentication
+    # tls: auto                 # Optional: Auto-generate self-signed cert
+    # tls:                      # Optional: Manual TLS Server config (HTTPS Proxy)
+    #   cert: "/etc/proxylb/certs/server.crt"
+    #   key: "/etc/proxylb/certs/server.key"
 
   - type: http
     listen: "unix:///tmp/proxylb-http.sock" # HTTP inbound running over Unix Domain Socket
@@ -96,6 +112,17 @@ backends:
     username: "chacha20-ietf-poly1305"
     password: "my-shadowsocks-password"
     pool_size: 10
+
+  # Example: SOCKS5 backend with TLS client encryption
+  - type: socks5
+    address: "tls-socks5-server.example.com:10802"
+    name: "backend-tls-1"
+    username: "user"
+    password: "pass"
+    tls:
+      server_name: "tls-socks5-server.example.com"
+      insecure: false # set to true to disable certificate validation (not recommended)
+    pool_size: 5
 
 # Backend groups let you cluster individual backends.
 # Strategy options:

@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::backend::BackendInfo;
 use super::{BackendStream, TargetAddr};
+use crate::backend::BackendInfo;
 
 /// SOCKS5 protocol constants.
 const SOCKS5_VERSION: u8 = 0x05;
@@ -27,11 +27,10 @@ pub async fn socks5h_connect(
     target: &TargetAddr,
     timeout: Duration,
 ) -> io::Result<BackendStream> {
-    let stream = crate::outbound::connect_endpoint(&backend.endpoint, backend.bind_interface.as_deref(), timeout).await?;
+    let stream = crate::outbound::connect_endpoint(backend, timeout).await?;
     let stream = socks5h_authenticate(stream, backend).await?;
     socks5h_connect_target(stream, target).await
 }
-
 
 /// Phase 1: SOCKS5 auth negotiation on an already-connected stream.
 pub async fn socks5h_authenticate<S>(mut stream: S, backend: &BackendInfo) -> io::Result<S>
@@ -130,7 +129,10 @@ where
     if resp_header[1] != 0x00 {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
-            format!("SOCKS5 CONNECT failed with reply code: {:#x}", resp_header[1]),
+            format!(
+                "SOCKS5 CONNECT failed with reply code: {:#x}",
+                resp_header[1]
+            ),
         ));
     }
 

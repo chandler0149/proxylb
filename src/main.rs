@@ -3,15 +3,16 @@
 //! Accepts SOCKS5 and Shadowsocks inbound connections, forwards them through
 //! an ordered list of SOCKS5h backends with health checking and failover.
 
+mod adblock;
 mod backend;
 mod config;
 mod health;
 mod inbound;
 mod outbound;
 mod relay;
-mod web;
 mod route_watcher;
-mod adblock;
+pub mod tls;
+mod web;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -24,8 +25,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
 
 /// ProxyLB — SOCKS5 Proxy Load Balancer with Shadowsocks support.
 #[derive(Parser, Debug)]
@@ -58,10 +59,7 @@ fn main() -> anyhow::Result<()> {
     let _log_guard: WorkerGuard = init_tracing(&args.log_level, &ancillary_cores);
 
     tracing::info!("ProxyLB starting...");
-    tracing::info!(
-        backends = config.backends.len(),
-        "configuration loaded"
-    );
+    tracing::info!(backends = config.backends.len(), "configuration loaded");
 
     // Builder for worker runtime.
     let mut worker_builder = tokio::runtime::Builder::new_multi_thread();
@@ -80,9 +78,17 @@ fn main() -> anyhow::Result<()> {
                         if let Some(core_ids) = core_affinity::get_core_ids() {
                             if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
                                 if core_affinity::set_for_current(core_id) {
-                                    tracing::info!("Bound tokio worker thread ({}) to CPU core {}", name, core_num);
+                                    tracing::info!(
+                                        "Bound tokio worker thread ({}) to CPU core {}",
+                                        name,
+                                        core_num
+                                    );
                                 } else {
-                                    tracing::warn!("Failed to bind tokio worker thread ({}) to CPU core {}", name, core_num);
+                                    tracing::warn!(
+                                        "Failed to bind tokio worker thread ({}) to CPU core {}",
+                                        name,
+                                        core_num
+                                    );
                                 }
                             }
                         }
@@ -111,9 +117,17 @@ fn main() -> anyhow::Result<()> {
                         if let Some(core_ids) = core_affinity::get_core_ids() {
                             if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
                                 if core_affinity::set_for_current(core_id) {
-                                    tracing::info!("Bound tokio ancillary thread ({}) to CPU core {}", name, core_num);
+                                    tracing::info!(
+                                        "Bound tokio ancillary thread ({}) to CPU core {}",
+                                        name,
+                                        core_num
+                                    );
                                 } else {
-                                    tracing::warn!("Failed to bind tokio ancillary thread ({}) to CPU core {}", name, core_num);
+                                    tracing::warn!(
+                                        "Failed to bind tokio ancillary thread ({}) to CPU core {}",
+                                        name,
+                                        core_num
+                                    );
                                 }
                             }
                         }
@@ -157,12 +171,8 @@ async fn main_async(
         let token = adblock_cancel.clone();
         let adblock_manager = pool.adblock_manager.clone();
         ancillary_handle.spawn(async move {
-            adblock::start_adblock_manager(
-                adblock_manager,
-                adblock_pool,
-                adblock_config,
-                token,
-            ).await;
+            adblock::start_adblock_manager(adblock_manager, adblock_pool, adblock_config, token)
+                .await;
         });
     }
 
@@ -201,7 +211,13 @@ async fn main_async(
     for inbound_item in config.all_inbounds() {
         let inbound_pool = pool.clone();
         match inbound_item {
-            config::InboundItemConfig::Socks5 { listen, filter } => {
+            config::InboundItemConfig::Socks5 {
+                listen,
+                filter,
+                tls: tls_cfg,
+                username,
+                password,
+            } => {
                 let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
                 let stats = pool.register_inbound(
                     format!("SOCKS5 ({})", listen),
@@ -209,12 +225,28 @@ async fn main_async(
                     "socks5".to_string(),
                 );
                 handles.push(worker_handle.spawn(async move {
-                    if let Err(e) = inbound::socks5::run_socks5_inbound(listen, inbound_pool, stats, filter_enabled).await {
+                    if let Err(e) = inbound::socks5::run_socks5_inbound(
+                        listen,
+                        inbound_pool,
+                        stats,
+                        filter_enabled,
+                        tls_cfg,
+                        username,
+                        password,
+                    )
+                    .await
+                    {
                         tracing::error!(error = %e, "SOCKS5 inbound failed");
                     }
                 }));
             }
-            config::InboundItemConfig::Shadowsocks { listen, password, method, filter } => {
+            config::InboundItemConfig::Shadowsocks {
+                listen,
+                password,
+                method,
+                filter,
+                tls: tls_cfg,
+            } => {
                 let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
                 let stats = pool.register_inbound(
                     format!("Shadowsocks ({})", listen),
@@ -222,15 +254,28 @@ async fn main_async(
                     "shadowsocks".to_string(),
                 );
                 handles.push(worker_handle.spawn(async move {
-                    if let Err(e) =
-                        inbound::shadowsocks::run_shadowsocks_inbound(listen, password, method, inbound_pool, stats, filter_enabled)
-                            .await
+                    if let Err(e) = inbound::shadowsocks::run_shadowsocks_inbound(
+                        listen,
+                        password,
+                        method,
+                        inbound_pool,
+                        stats,
+                        filter_enabled,
+                        tls_cfg,
+                    )
+                    .await
                     {
                         tracing::error!(error = %e, "Shadowsocks inbound failed");
                     }
                 }));
             }
-            config::InboundItemConfig::Http { listen, filter } => {
+            config::InboundItemConfig::Http {
+                listen,
+                filter,
+                tls: tls_cfg,
+                username,
+                password,
+            } => {
                 let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
                 let stats = pool.register_inbound(
                     format!("HTTP ({})", listen),
@@ -238,7 +283,17 @@ async fn main_async(
                     "http".to_string(),
                 );
                 handles.push(worker_handle.spawn(async move {
-                    if let Err(e) = inbound::http::run_http_inbound(listen, inbound_pool, stats, filter_enabled).await {
+                    if let Err(e) = inbound::http::run_http_inbound(
+                        listen,
+                        inbound_pool,
+                        stats,
+                        filter_enabled,
+                        tls_cfg,
+                        username,
+                        password,
+                    )
+                    .await
+                    {
                         tracing::error!(error = %e, "HTTP inbound failed");
                     }
                 }));
@@ -253,8 +308,7 @@ async fn main_async(
     tracing::info!("ProxyLB is running. Send SIGHUP to reload config, Ctrl+C to stop.");
 
     // Set up SIGHUP listener (Unix-only).
-    let mut sighup =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
     // Main event loop: wait for SIGHUP (reload) or SIGINT/Ctrl+C (shutdown).
     loop {
@@ -307,7 +361,9 @@ async fn perform_hot_reload(
     warn_if_inbounds_changed(initial_inbounds, &new_config.all_inbounds());
 
     // Update adblock enabled state.
-    pool.adblock_manager.enabled.store(std::sync::Arc::new(new_config.adblock.enabled));
+    pool.adblock_manager
+        .enabled
+        .store(std::sync::Arc::new(new_config.adblock.enabled));
 
     // Cancel old adblock task and spawn a new one if enabled.
     adblock_cancel.cancel();
@@ -318,12 +374,8 @@ async fn perform_hot_reload(
         let token = adblock_cancel.clone();
         let adblock_manager = pool.adblock_manager.clone();
         ancillary_handle.spawn(async move {
-            adblock::start_adblock_manager(
-                adblock_manager,
-                adblock_pool,
-                adblock_config,
-                token,
-            ).await;
+            adblock::start_adblock_manager(adblock_manager, adblock_pool, adblock_config, token)
+                .await;
         });
     }
 
@@ -332,12 +384,15 @@ async fn perform_hot_reload(
     health_cancel.cancel();
 
     // Swap the backend pool.
-    match pool.reload(
-        &new_config.backends,
-        &new_config.groups,
-        new_config.failover_order.as_ref(),
-        new_config.bind_interface.as_deref(),
-    ).await {
+    match pool
+        .reload(
+            &new_config.backends,
+            &new_config.groups,
+            new_config.failover_order.as_ref(),
+            new_config.bind_interface.as_deref(),
+        )
+        .await
+    {
         Ok((added, removed, kept)) => {
             tracing::info!(
                 added,
@@ -410,14 +465,16 @@ impl<W: std::io::Write> std::io::Write for AffinityWriter<W> {
                 if !cores.is_empty() {
                     if let Some(core_num) = cores.first() {
                         if let Some(core_ids) = core_affinity::get_core_ids() {
-                            if let Some(core_id) = core_ids.into_iter().find(|c| c.id == *core_num) {
+                            if let Some(core_id) = core_ids.into_iter().find(|c| c.id == *core_num)
+                            {
                                 let _ = core_affinity::set_for_current(core_id);
                             }
                         }
                     }
                 }
             }
-            self.pinned.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.pinned
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.inner.write(buf)
     }
@@ -435,7 +492,10 @@ impl<W: std::io::Write> std::io::Write for AffinityWriter<W> {
 /// The returned [`WorkerGuard`] **must** be stored in a binding that lives for
 /// the entire duration of `main`; dropping it earlier shuts down the I/O
 /// thread and may lose buffered log lines.
-fn init_tracing(log_level: &str, ancillary_cores: &Option<Vec<usize>>) -> tracing_appender::non_blocking::WorkerGuard {
+fn init_tracing(
+    log_level: &str,
+    ancillary_cores: &Option<Vec<usize>>,
+) -> tracing_appender::non_blocking::WorkerGuard {
     let writer = AffinityWriter {
         inner: std::io::stderr(),
         cores: ancillary_cores.clone(),
@@ -446,8 +506,7 @@ fn init_tracing(log_level: &str, ancillary_cores: &Option<Vec<usize>>) -> tracin
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)),
         )
         .with_target(false)
         .with_timer(tracing_subscriber::fmt::time::time())

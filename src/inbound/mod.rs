@@ -1,6 +1,6 @@
+pub mod http;
 pub mod shadowsocks;
 pub mod socks5;
-pub mod http;
 
 use crate::outbound::TargetAddr;
 use std::sync::Arc;
@@ -32,17 +32,25 @@ pub fn cold_path() {}
 pub async fn route_and_connect(
     pool: &crate::backend::BackendPool,
     target: &TargetAddr,
-) -> Result<(crate::outbound::BackendStream, Arc<crate::backend::TrafficCounters>), anyhow::Error> {
+) -> Result<
+    (
+        crate::outbound::BackendStream,
+        Arc<crate::backend::TrafficCounters>,
+    ),
+    anyhow::Error,
+> {
+    use crate::outbound::{
+        direct_connect, socks5h_connect, socks5h_connect_target, ss_connect_fresh,
+        ss_connect_pooled, BackendStream,
+    };
     use std::sync::atomic::Ordering;
     use std::time::Duration;
-    use crate::outbound::{socks5h_connect, socks5h_connect_target, ss_connect_fresh, ss_connect_pooled, direct_connect, BackendStream};
 
     let backend_timeout = Duration::from_secs(10);
     let (healthy_candidates, unhealthy_candidates) = pool.get_candidates().await;
 
     let mut backend_stream: Option<crate::outbound::BackendStream> = None;
     let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
-
 
     // First pass: try healthy backends.
     for (index, info) in &healthy_candidates {
@@ -78,7 +86,7 @@ pub async fn route_and_connect(
                     if let Some(ref tc) = traffic {
                         tc.pool_misses.fetch_add(1, Ordering::Relaxed);
                     }
-                    ss_connect_fresh(&info.endpoint, ss_cfg, ss_ctx, target, backend_timeout, info.bind_interface.as_deref()).await
+                    ss_connect_fresh(&info, ss_cfg, ss_ctx, target, backend_timeout).await
                 }
             }
         } else {
@@ -138,7 +146,7 @@ pub async fn route_and_connect(
             } else if info.is_shadowsocks() {
                 let ss_cfg = info.ss_config.as_ref().unwrap();
                 let ss_ctx = info.ss_context.as_ref().unwrap().clone();
-                ss_connect_fresh(&info.endpoint, ss_cfg, ss_ctx, target, backend_timeout, info.bind_interface.as_deref()).await
+                ss_connect_fresh(&info, ss_cfg, ss_ctx, target, backend_timeout).await
             } else {
                 socks5h_connect(info, target, backend_timeout).await
             };
@@ -219,11 +227,6 @@ where
     Ok(())
 }
 
-
-
-
-
-
 /// Helper function to check if a target address points to a private/loopback address.
 pub async fn is_private_target(target: &TargetAddr) -> bool {
     match target {
@@ -234,7 +237,6 @@ pub async fn is_private_target(target: &TargetAddr) -> bool {
         }
     }
 }
-
 
 /// Helper function to check if an IpAddr is private or loopback/local.
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
@@ -275,8 +277,12 @@ mod tests {
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
         assert!(is_private_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
-        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)))); // ::1
-        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)))); // fc00::1
+        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0, 0, 1
+        )))); // ::1
+        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 1
+        )))); // fc00::1
 
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));

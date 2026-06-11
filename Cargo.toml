@@ -51,6 +51,9 @@ flume = "0.12"
 tokio-util = { version = "0.7.18", features = ["rt"] }
 arc-swap = "1.9.1"
 core_affinity = "0.8.3"
+rustls-pemfile = "2.2.0"
+base64 = "0.22.1"
+rcgen = "0.14.8"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.7"
