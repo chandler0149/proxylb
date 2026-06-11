@@ -54,6 +54,9 @@ pub async fn run_http_tcp_inbound(
     username: Option<String>,
     password: Option<String>,
 ) -> anyhow::Result<()> {
+    let tls_cfg = tls_cfg.map(Arc::new);
+    let username = username.map(Arc::new);
+    let password = password.map(Arc::new);
     let listener = TcpListener::bind(&listen_addr).await?;
     tracing::info!(listen = %listen_addr, "HTTP TCP inbound listener started");
 
@@ -104,6 +107,9 @@ pub async fn run_http_uds_inbound(
     username: Option<String>,
     password: Option<String>,
 ) -> anyhow::Result<()> {
+    let tls_cfg = tls_cfg.map(Arc::new);
+    let username = username.map(Arc::new);
+    let password = password.map(Arc::new);
     let path = std::path::Path::new(&socket_path);
     if path.exists() {
         let _ = std::fs::remove_file(path);
@@ -156,15 +162,15 @@ async fn handle_http_connection<S>(
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
-    tls_cfg: Option<crate::config::TlsServerConfig>,
-    username: Option<String>,
-    password: Option<String>,
+    tls_cfg: Option<Arc<crate::config::TlsServerConfig>>,
+    username: Option<Arc<String>>,
+    password: Option<Arc<String>>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let mut client_stream: crate::outbound::BackendStream = if let Some(tls) = tls_cfg {
-        let acceptor = crate::tls::create_tls_acceptor(&tls)?;
+    let mut client_stream: crate::outbound::BackendStream = if let Some(ref tls) = tls_cfg {
+        let acceptor = crate::tls::create_tls_acceptor(tls)?;
         let tls_stream = acceptor.accept(stream).await?;
         crate::outbound::BackendStream::Boxed(Box::pin(tls_stream))
     } else {

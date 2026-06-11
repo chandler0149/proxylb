@@ -61,6 +61,7 @@ pub async fn run_shadowsocks_tcp_inbound(
     filter_enabled: bool,
     tls_cfg: Option<crate::config::TlsServerConfig>,
 ) -> anyhow::Result<()> {
+    let tls_cfg = tls_cfg.map(Arc::new);
     let method: CipherKind = method_str
         .parse()
         .map_err(|_| anyhow::anyhow!("unsupported cipher: {}", method_str))?;
@@ -128,6 +129,7 @@ pub async fn run_shadowsocks_uds_inbound(
     filter_enabled: bool,
     tls_cfg: Option<crate::config::TlsServerConfig>,
 ) -> anyhow::Result<()> {
+    let tls_cfg = tls_cfg.map(Arc::new);
     let method: CipherKind = method_str
         .parse()
         .map_err(|_| anyhow::anyhow!("unsupported cipher: {}", method_str))?;
@@ -201,13 +203,13 @@ async fn handle_ss_connection<S>(
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
-    tls_cfg: Option<crate::config::TlsServerConfig>,
+    tls_cfg: Option<Arc<crate::config::TlsServerConfig>>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let stream = if let Some(tls) = tls_cfg {
-        let acceptor = crate::tls::create_tls_acceptor(&tls)?;
+    let stream = if let Some(ref tls) = tls_cfg {
+        let acceptor = crate::tls::create_tls_acceptor(tls)?;
         let tls_stream = acceptor.accept(stream).await?;
         crate::outbound::BackendStream::Boxed(Box::pin(tls_stream))
     } else {

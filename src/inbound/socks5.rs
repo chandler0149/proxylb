@@ -25,6 +25,9 @@ pub async fn run_socks5_uds_inbound(
     username: Option<String>,
     password: Option<String>,
 ) -> anyhow::Result<()> {
+    let tls_cfg = tls_cfg.map(Arc::new);
+    let username = username.map(Arc::new);
+    let password = password.map(Arc::new);
     if let Some(parent) = std::path::Path::new(&listen_path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -80,6 +83,9 @@ pub async fn run_socks5_tcp_inbound(
     username: Option<String>,
     password: Option<String>,
 ) -> anyhow::Result<()> {
+    let tls_cfg = tls_cfg.map(Arc::new);
+    let username = username.map(Arc::new);
+    let password = password.map(Arc::new);
     let listener = TcpListener::bind(&listen_addr).await?;
     tracing::info!(listen = %listen_addr, "SOCKS5 TCP inbound listener started");
 
@@ -168,16 +174,16 @@ async fn handle_socks5_connection<S>(
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
-    tls_cfg: Option<crate::config::TlsServerConfig>,
-    username: Option<String>,
-    password: Option<String>,
+    tls_cfg: Option<Arc<crate::config::TlsServerConfig>>,
+    username: Option<Arc<String>>,
+    password: Option<Arc<String>>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // Apply TLS if configured.
-    let stream = if let Some(tls) = tls_cfg {
-        let acceptor = crate::tls::create_tls_acceptor(&tls)?;
+    let stream = if let Some(ref tls) = tls_cfg {
+        let acceptor = crate::tls::create_tls_acceptor(tls)?;
         let tls_stream = acceptor.accept(stream).await?;
         crate::outbound::BackendStream::Boxed(Box::pin(tls_stream))
     } else {
@@ -189,8 +195,8 @@ where
         config.set_execute_command(false);
         config.set_dns_resolve(false);
         let config = config.with_authentication(SimpleUserPassword {
-            username: u,
-            password: p,
+            username: u.as_ref().clone(),
+            password: p.as_ref().clone(),
         });
         let socks5_socket = Socks5Socket::new(stream, std::sync::Arc::new(config));
         handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled).await
