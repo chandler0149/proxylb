@@ -880,9 +880,15 @@ impl BackendPool {
     }
 
     /// Get the order of backends to try, separated into healthy and unhealthy lists.
+    #[allow(dead_code)]
     pub async fn get_candidates(&self) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
         let guard = self.cached.load();
         (guard.healthy.clone(), guard.unhealthy.clone())
+    }
+
+    /// Get a reference-counted clone of the cached candidates (allocation-free).
+    pub fn get_candidates_ref(&self) -> Arc<CachedCandidates> {
+        self.cached.load_full()
     }
 
     /// Mark a backend as healthy with measured latency.

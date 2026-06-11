@@ -47,13 +47,13 @@ pub async fn route_and_connect(
     use std::time::Duration;
 
     let backend_timeout = Duration::from_secs(10);
-    let (healthy_candidates, unhealthy_candidates) = pool.get_candidates().await;
+    let candidates = pool.get_candidates_ref();
 
     let mut backend_stream: Option<crate::outbound::BackendStream> = None;
     let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
 
     // First pass: try healthy backends.
-    for (index, info) in &healthy_candidates {
+    for (index, info) in &candidates.healthy {
         // Single RwLock read: yields both the pooled stream (if any) and the traffic Arc.
         let pc = pool.get_pooled_connection(*index).await;
         let (pool_stream, traffic) = match pc {
@@ -140,7 +140,7 @@ pub async fn route_and_connect(
 
     // Second pass: try unhealthy backends as last resort.
     if backend_stream.is_none() {
-        for (index, info) in &unhealthy_candidates {
+        for (index, info) in &candidates.unhealthy {
             let result: std::io::Result<BackendStream> = if info.is_direct() {
                 direct_connect(target, backend_timeout, info.bind_interface.as_deref()).await
             } else if info.is_shadowsocks() {
