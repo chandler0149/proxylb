@@ -30,7 +30,7 @@ use tracing_subscriber::EnvFilter;
 
 /// ProxyLB — SOCKS5 Proxy Load Balancer with Shadowsocks support.
 #[derive(Parser, Debug)]
-#[command(name = "proxylb", version, about)]
+#[command(name = "proxylb", version = concat!(env!("CARGO_PKG_VERSION"), "-", env!("GIT_HASH")), about)]
 struct Args {
     /// Path to the YAML configuration file.
     #[arg(short, long, default_value = "config.yaml")]

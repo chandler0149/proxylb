@@ -72,7 +72,7 @@ async fn api_info() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
         "name": "ProxyLB API",
-        "version": "1.2.0"
+        "version": concat!(env!("CARGO_PKG_VERSION"), "-", env!("GIT_HASH"))
     }))
 }
 

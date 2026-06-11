@@ -18,7 +18,10 @@ pub async fn direct_connect(
             super::tcp_connect_raw((host.as_str(), *port), bind_interface, timeout)
                 .await
                 .map_err(|e| {
-                    io::Error::new(e.kind(), format!("direct connect to {}:{}: {}", host, port, e))
+                    io::Error::new(
+                        e.kind(),
+                        format!("direct connect to {}:{}: {}", host, port, e),
+                    )
                 })?
         }
         TargetAddr::Ip(addr) => super::tcp_connect_raw(*addr, bind_interface, timeout)
