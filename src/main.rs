@@ -25,7 +25,6 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 /// ProxyLB — SOCKS5 Proxy Load Balancer with Shadowsocks support.
@@ -47,6 +46,12 @@ fn main() -> anyhow::Result<()> {
     // Load config first to read CPU affinity settings.
     let config = config::Config::load(&args.config)?;
 
+    // Store zero-copy flag.
+    crate::relay::ZERO_COPY_ENABLED.store(
+        config.advanced.zero_copy,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
     // Extract CPU affinity configuration.
     let mut worker_cores = None;
     let mut ancillary_cores = None;
@@ -56,7 +61,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Initialize async (non-blocking) tracing with background thread pinned to ancillary core.
-    let _log_guard: WorkerGuard = init_tracing(&args.log_level, &ancillary_cores);
+    let _log_guard = if args.log_level.eq_ignore_ascii_case("off") {
+        None
+    } else {
+        Some(init_tracing(&args.log_level, &ancillary_cores))
+    };
 
     tracing::info!("ProxyLB starting...");
     tracing::info!(backends = config.backends.len(), "configuration loaded");
@@ -139,7 +148,15 @@ fn main() -> anyhow::Result<()> {
     let ancillary_runtime = ancillary_builder.build()?;
     let ancillary_handle = ancillary_runtime.handle().clone();
 
-    worker_runtime.block_on(main_async(config, args, worker_handle, ancillary_handle))
+    worker_runtime
+        .block_on(main_async(config, args, worker_handle, ancillary_handle))
+        .ok();
+
+    tracing::info!("waiting for worker tasks to finish...");
+    worker_runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    tracing::info!("waiting for ancillary tasks to finish...");
+    ancillary_runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    Ok(())
 }
 
 async fn main_async(
@@ -163,6 +180,7 @@ async fn main_async(
         ancillary_handle.clone(),
     )?;
 
+    let mut ancillary_handles = Vec::new();
     // Spawn adblock background manager task if enabled
     let mut adblock_cancel = CancellationToken::new();
     if config.adblock.enabled {
@@ -170,10 +188,10 @@ async fn main_async(
         let adblock_config = config.adblock.clone();
         let token = adblock_cancel.clone();
         let adblock_manager = pool.adblock_manager.clone();
-        ancillary_handle.spawn(async move {
+        ancillary_handles.push(ancillary_handle.spawn(async move {
             adblock::start_adblock_manager(adblock_manager, adblock_pool, adblock_config, token)
                 .await;
-        });
+        }));
     }
 
     // Spawn health checker and candidate selector background tasks with a shared cancellation token.
@@ -183,33 +201,35 @@ async fn main_async(
         let health_config = config.health_check.clone();
         let token = health_cancel.clone();
         let route_rx_clone = route_rx.clone();
-        ancillary_handle.spawn(async move {
+        ancillary_handles.push(ancillary_handle.spawn(async move {
             health::run_health_checker(health_pool, health_config, token, route_rx_clone).await;
-        });
+        }));
 
         let selector_pool = pool.clone();
         let token = health_cancel.clone();
-        ancillary_handle.spawn(async move {
+        ancillary_handles.push(ancillary_handle.spawn(async move {
             backend::run_candidate_selector(selector_pool, token).await;
-        });
+        }));
     }
 
     // Spawn web dashboard.
     if config.web.enabled {
         let web_pool = pool.clone();
         let web_listen = config.web.listen.clone();
-        ancillary_handle.spawn(async move {
+        ancillary_handles.push(ancillary_handle.spawn(async move {
             if let Err(e) = web::run_web_server(web_listen, web_pool).await {
                 tracing::error!(error = %e, "web server failed");
             }
-        });
+        }));
     }
 
     // Spawn inbound listeners.
+    let inbound_cancel = CancellationToken::new();
     let mut handles = Vec::new();
 
     for inbound_item in config.all_inbounds() {
         let inbound_pool = pool.clone();
+        let cancel = inbound_cancel.clone();
         match inbound_item {
             config::InboundItemConfig::Socks5 {
                 listen,
@@ -233,6 +253,7 @@ async fn main_async(
                         tls_cfg,
                         username,
                         password,
+                        cancel,
                     )
                     .await
                     {
@@ -262,6 +283,7 @@ async fn main_async(
                         stats,
                         filter_enabled,
                         tls_cfg,
+                        cancel,
                     )
                     .await
                     {
@@ -291,6 +313,7 @@ async fn main_async(
                         tls_cfg,
                         username,
                         password,
+                        cancel,
                     )
                     .await
                     {
@@ -332,11 +355,20 @@ async fn main_async(
         }
     }
 
-    // Abort all listener tasks.
+    // Cancel all inbound accept loops and wait for them to exit.
+    inbound_cancel.cancel();
     for handle in handles {
+        let _ = handle.await;
+    }
+
+    adblock_cancel.cancel();
+    health_cancel.cancel();
+
+    for handle in ancillary_handles {
         handle.abort();
     }
 
+    tracing::info!("ProxyLB stopped.");
     Ok(())
 }
 

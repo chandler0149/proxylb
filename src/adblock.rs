@@ -5,14 +5,14 @@
 //! rules (exceptions) override blocklist rules.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -214,7 +214,7 @@ async fn connect_via_backend(
         } else if info.is_shadowsocks() {
             let ss_cfg = info.ss_config.as_ref().unwrap();
             let ss_ctx = info.ss_context.as_ref().unwrap().clone();
-            let pc = pool.get_pooled_connection(index).await;
+            let pc = pool.get_pooled_connection(index);
             match pc {
                 Some(crate::backend::PooledConn {
                     stream: Some(pooled),
@@ -232,7 +232,7 @@ async fn connect_via_backend(
                 }
             }
         } else {
-            let pc = pool.get_pooled_connection(index).await;
+            let pc = pool.get_pooled_connection(index);
             match pc {
                 Some(crate::backend::PooledConn {
                     stream: Some(pooled),

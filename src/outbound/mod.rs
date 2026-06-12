@@ -45,7 +45,7 @@ impl<T: AsyncRead + AsyncWrite + Send> AsyncReadWrite for T {}
 // ─── Transport abstraction ────────────────────────────────────────────────────
 
 /// A connected stream to a SOCKS5 backend, Shadowsocks client, or direct TCP connection.
-pub enum BackendStream {
+pub enum RawBackendStream {
     Tcp(TcpStream),
     Unix(UnixStream),
     /// Type-erased stream; used to hold a shadowsocks/custom client connection.
@@ -54,7 +54,116 @@ pub enum BackendStream {
 
 // SAFETY: TcpStream and UnixStream are Unpin. The Boxed variant is accessed
 // only through `Pin::as_mut()` in poll_* impls; the inner value is never moved.
+impl Unpin for RawBackendStream {}
+
+#[cfg(unix)]
+impl crate::relay::AsRawStreamRef for RawBackendStream {
+    fn as_raw_stream_ref(&self) -> Option<crate::relay::RawStreamRef<'_>> {
+        match self {
+            RawBackendStream::Tcp(s) => Some(crate::relay::RawStreamRef::Tcp(s)),
+            RawBackendStream::Unix(s) => Some(crate::relay::RawStreamRef::Unix(s)),
+            RawBackendStream::Boxed(_) => None,
+        }
+    }
+}
+
+impl AsyncRead for RawBackendStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            RawBackendStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            RawBackendStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            RawBackendStream::Boxed(s) => s.as_mut().poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for RawBackendStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            RawBackendStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            RawBackendStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            RawBackendStream::Boxed(s) => s.as_mut().poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            RawBackendStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            RawBackendStream::Unix(s) => Pin::new(s).poll_flush(cx),
+            RawBackendStream::Boxed(s) => s.as_mut().poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            RawBackendStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            RawBackendStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            RawBackendStream::Boxed(s) => s.as_mut().poll_shutdown(cx),
+        }
+    }
+}
+
+pub struct BackendStream {
+    pub inner: RawBackendStream,
+    #[cfg(target_os = "linux")]
+    pub pipes: Option<crate::relay::PreallocatedPipes>,
+}
+
+impl BackendStream {
+    pub fn new(inner: RawBackendStream) -> Self {
+        Self {
+            inner,
+            #[cfg(target_os = "linux")]
+            pipes: None,
+        }
+    }
+
+    pub fn tcp(s: TcpStream) -> Self {
+        Self::new(RawBackendStream::Tcp(s))
+    }
+
+    pub fn unix(s: UnixStream) -> Self {
+        Self::new(RawBackendStream::Unix(s))
+    }
+
+    pub fn boxed(s: Pin<Box<dyn AsyncReadWrite>>) -> Self {
+        Self::new(RawBackendStream::Boxed(s))
+    }
+}
+
+impl Drop for BackendStream {
+    fn drop(&mut self) {
+        // #[cfg(target_os = "linux")]
+        // {
+        //     if self.pipes.is_some() {
+        //         crate::relay::ACTIVE_PREALLOCATED_PIPES
+        //             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        //     }
+        // }
+    }
+}
+
 impl Unpin for BackendStream {}
+
+#[cfg(unix)]
+impl crate::relay::AsRawStreamRef for BackendStream {
+    fn as_raw_stream_ref(&self) -> Option<crate::relay::RawStreamRef<'_>> {
+        self.inner.as_raw_stream_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn take_preallocated_pipes(&mut self) -> Option<crate::relay::PreallocatedPipes> {
+        self.pipes.take()
+    }
+}
 
 impl AsyncRead for BackendStream {
     fn poll_read(
@@ -62,11 +171,7 @@ impl AsyncRead for BackendStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            BackendStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
-            BackendStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
-            BackendStream::Boxed(s) => s.as_mut().poll_read(cx, buf),
-        }
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
     }
 }
 
@@ -76,27 +181,15 @@ impl AsyncWrite for BackendStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            BackendStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
-            BackendStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
-            BackendStream::Boxed(s) => s.as_mut().poll_write(cx, buf),
-        }
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            BackendStream::Tcp(s) => Pin::new(s).poll_flush(cx),
-            BackendStream::Unix(s) => Pin::new(s).poll_flush(cx),
-            BackendStream::Boxed(s) => s.as_mut().poll_flush(cx),
-        }
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            BackendStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
-            BackendStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
-            BackendStream::Boxed(s) => s.as_mut().poll_shutdown(cx),
-        }
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -240,7 +333,7 @@ pub async fn connect_endpoint(
             let addr = format!("{}:{}", host, port);
             let tcp = tcp_connect_raw(&addr, bind_interface, timeout).await?;
             tcp.set_nodelay(true)?;
-            BackendStream::Tcp(tcp)
+            BackendStream::tcp(tcp)
         }
         crate::backend::BackendEndpoint::Unix { path } => {
             let unix = tokio::time::timeout(timeout, UnixStream::connect(path))
@@ -251,7 +344,7 @@ pub async fn connect_endpoint(
                         format!("UDS connect timeout to {}", path),
                     )
                 })??;
-            BackendStream::Unix(unix)
+            BackendStream::unix(unix)
         }
         crate::backend::BackendEndpoint::Direct => {
             return Err(io::Error::new(
@@ -282,7 +375,7 @@ pub async fn connect_endpoint(
                 .to_owned();
 
         let tls_stream = tls.connect(server_name, stream).await?;
-        Ok(BackendStream::Boxed(Box::pin(tls_stream)))
+        Ok(BackendStream::boxed(Box::pin(tls_stream)))
     } else {
         Ok(stream)
     }

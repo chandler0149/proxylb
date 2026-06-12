@@ -33,7 +33,7 @@ pub async fn ss_connect_fresh(
     let raw = crate::outbound::connect_endpoint(backend, timeout).await?;
     let ss_addr = to_ss_address(target);
     let client_stream = ProxyClientStream::from_stream(ctx, raw, svr_cfg.as_ref(), ss_addr);
-    Ok(BackendStream::Boxed(Box::pin(client_stream)))
+    Ok(BackendStream::boxed(Box::pin(client_stream)))
 }
 
 /// Wrap an **already-established** raw stream (from the connection pool)
@@ -49,5 +49,5 @@ where
 {
     let ss_addr = to_ss_address(target);
     let client_stream = ProxyClientStream::from_stream(ctx, raw, svr_cfg.as_ref(), ss_addr);
-    BackendStream::Boxed(Box::pin(client_stream))
+    BackendStream::boxed(Box::pin(client_stream))
 }

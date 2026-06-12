@@ -6,11 +6,15 @@
 
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
+use super::BoundListener;
 use crate::backend::BackendPool;
 use crate::outbound::TargetAddr;
+use crate::relay::AsRawStreamRef;
+use crate::tls::MaybeTlsStream;
 
+/// Run the HTTP inbound listener (TCP or UDS, selected by address prefix).
 pub async fn run_http_inbound(
     listen_addr: String,
     pool: BackendPool,
@@ -19,140 +23,43 @@ pub async fn run_http_inbound(
     tls_cfg: Option<crate::config::TlsServerConfig>,
     username: Option<String>,
     password: Option<String>,
+    cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    if let Some(path) = listen_addr.strip_prefix("unix://") {
-        run_http_uds_inbound(
-            path.to_string(),
-            pool,
-            stats,
-            filter_enabled,
-            tls_cfg,
-            username,
-            password,
-        )
-        .await
-    } else {
-        run_http_tcp_inbound(
-            listen_addr,
-            pool,
-            stats,
-            filter_enabled,
-            tls_cfg,
-            username,
-            password,
-        )
-        .await
-    }
-}
-
-pub async fn run_http_tcp_inbound(
-    listen_addr: String,
-    pool: BackendPool,
-    stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
-    tls_cfg: Option<crate::config::TlsServerConfig>,
-    username: Option<String>,
-    password: Option<String>,
-) -> anyhow::Result<()> {
-    let tls_cfg = tls_cfg.map(Arc::new);
+    let tls_acceptor = tls_cfg
+        .as_ref()
+        .map(|c| crate::tls::create_tls_acceptor(c))
+        .transpose()?
+        .map(Arc::new);
     let username = username.map(Arc::new);
     let password = password.map(Arc::new);
-    let listener = TcpListener::bind(&listen_addr).await?;
-    tracing::info!(listen = %listen_addr, "HTTP TCP inbound listener started");
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, client_addr)) => {
-                let pool = pool.clone();
-                let stats = Arc::clone(&stats);
-                let tls_cfg = tls_cfg.clone();
-                let username = username.clone();
-                let password = password.clone();
-                tokio::spawn(async move {
-                    let _ = stream.set_nodelay(true);
-                    let client_str = client_addr.to_string();
-                    if let Err(e) = handle_http_connection(
-                        stream,
-                        client_str.clone(),
-                        pool,
-                        stats,
-                        filter_enabled,
-                        tls_cfg,
-                        username,
-                        password,
-                    )
-                    .await
-                    {
-                        tracing::debug!(
-                            client = %client_str,
-                            error = %e,
-                            "HTTP TCP connection failed"
-                        );
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "HTTP TCP accept error");
+    let listener = BoundListener::bind(&listen_addr).await?;
+    tracing::info!(listen = %listen_addr, "HTTP inbound listener started");
+
+    crate::inbound::run_accept_loop(listener, cancel, "HTTP", move |stream, addr| {
+        let pool = pool.clone();
+        let stats = Arc::clone(&stats);
+        let tls_acceptor = tls_acceptor.clone();
+        let username = username.clone();
+        let password = password.clone();
+        async move {
+            if let Err(e) = handle_http_connection(
+                stream,
+                addr.clone(),
+                pool,
+                stats,
+                filter_enabled,
+                tls_acceptor.as_deref().cloned(),
+                username,
+                password,
+            )
+            .await
+            {
+                tracing::debug!(client = %addr, error = %e, "HTTP connection failed");
             }
         }
-    }
-}
-
-pub async fn run_http_uds_inbound(
-    socket_path: String,
-    pool: BackendPool,
-    stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
-    tls_cfg: Option<crate::config::TlsServerConfig>,
-    username: Option<String>,
-    password: Option<String>,
-) -> anyhow::Result<()> {
-    let tls_cfg = tls_cfg.map(Arc::new);
-    let username = username.map(Arc::new);
-    let password = password.map(Arc::new);
-    let path = std::path::Path::new(&socket_path);
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
-
-    let listener = tokio::net::UnixListener::bind(path)?;
-    tracing::info!(socket = %socket_path, "HTTP UDS inbound listener started");
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, client_addr)) => {
-                let pool = pool.clone();
-                let stats = Arc::clone(&stats);
-                let tls_cfg = tls_cfg.clone();
-                let username = username.clone();
-                let password = password.clone();
-                tokio::spawn(async move {
-                    let client_str = format!("unix:{:?}", client_addr);
-                    if let Err(e) = handle_http_connection(
-                        stream,
-                        client_str.clone(),
-                        pool,
-                        stats,
-                        filter_enabled,
-                        tls_cfg,
-                        username,
-                        password,
-                    )
-                    .await
-                    {
-                        tracing::debug!(
-                            client = %client_str,
-                            error = %e,
-                            "HTTP UDS connection failed"
-                        );
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "HTTP UDS accept error");
-            }
-        }
-    }
+    })
+    .await
 }
 
 /// Handle a single HTTP connection.
@@ -162,19 +69,18 @@ async fn handle_http_connection<S>(
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
-    tls_cfg: Option<Arc<crate::config::TlsServerConfig>>,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     username: Option<Arc<String>>,
     password: Option<Arc<String>>,
 ) -> anyhow::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
 {
-    let mut client_stream: crate::outbound::BackendStream = if let Some(ref tls) = tls_cfg {
-        let acceptor = crate::tls::create_tls_acceptor(tls)?;
+    let mut client_stream = if let Some(ref acceptor) = tls_acceptor {
         let tls_stream = acceptor.accept(stream).await?;
-        crate::outbound::BackendStream::Boxed(Box::pin(tls_stream))
+        MaybeTlsStream::Tls(tls_stream)
     } else {
-        crate::outbound::BackendStream::Boxed(Box::pin(stream))
+        MaybeTlsStream::Plain(stream)
     };
 
     // Read HTTP headers up to \r\n\r\n.

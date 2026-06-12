@@ -10,122 +10,15 @@ use fast_socks5::server::{Config, DenyAuthentication, SimpleUserPassword, Socks5
 use fast_socks5::util::target_addr::TargetAddr as FastTargetAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, UnixListener};
+use tokio_util::sync::CancellationToken;
 
+use super::BoundListener;
 use crate::backend::BackendPool;
 use crate::outbound::TargetAddr;
+use crate::relay::AsRawStreamRef;
+use crate::tls::MaybeTlsStream;
 
-/// Run SOCKS5 inbound over a Unix domain socket.
-pub async fn run_socks5_uds_inbound(
-    listen_path: String,
-    pool: BackendPool,
-    stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
-    tls_cfg: Option<crate::config::TlsServerConfig>,
-    username: Option<String>,
-    password: Option<String>,
-) -> anyhow::Result<()> {
-    let tls_cfg = tls_cfg.map(Arc::new);
-    let username = username.map(Arc::new);
-    let password = password.map(Arc::new);
-    if let Some(parent) = std::path::Path::new(&listen_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::metadata(&listen_path).is_ok() {
-        let _ = std::fs::remove_file(&listen_path);
-    }
-
-    let listener = UnixListener::bind(&listen_path)?;
-    tracing::info!(listen = %listen_path, "SOCKS5 UDS inbound listener started");
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, client_addr)) => {
-                let pool = pool.clone();
-                let stats = Arc::clone(&stats);
-                let tls_cfg = tls_cfg.clone();
-                let username = username.clone();
-                let password = password.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_socks5_connection(
-                        stream,
-                        pool,
-                        stats,
-                        filter_enabled,
-                        tls_cfg,
-                        username,
-                        password,
-                    )
-                    .await
-                    {
-                        tracing::debug!(
-                            client = ?client_addr,
-                            error = %e,
-                            "SOCKS5 UDS connection failed"
-                        );
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "SOCKS5 UDS accept error");
-            }
-        }
-    }
-}
-
-/// Run SOCKS5 inbound over TCP.
-pub async fn run_socks5_tcp_inbound(
-    listen_addr: String,
-    pool: BackendPool,
-    stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
-    tls_cfg: Option<crate::config::TlsServerConfig>,
-    username: Option<String>,
-    password: Option<String>,
-) -> anyhow::Result<()> {
-    let tls_cfg = tls_cfg.map(Arc::new);
-    let username = username.map(Arc::new);
-    let password = password.map(Arc::new);
-    let listener = TcpListener::bind(&listen_addr).await?;
-    tracing::info!(listen = %listen_addr, "SOCKS5 TCP inbound listener started");
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, client_addr)) => {
-                let pool = pool.clone();
-                let stats = Arc::clone(&stats);
-                let tls_cfg = tls_cfg.clone();
-                let username = username.clone();
-                let password = password.clone();
-                tokio::spawn(async move {
-                    let _ = stream.set_nodelay(true);
-                    if let Err(e) = handle_socks5_connection(
-                        stream,
-                        pool,
-                        stats,
-                        filter_enabled,
-                        tls_cfg,
-                        username,
-                        password,
-                    )
-                    .await
-                    {
-                        tracing::debug!(
-                            client = %client_addr,
-                            error = %e,
-                            "SOCKS5 TCP connection failed"
-                        );
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "SOCKS5 TCP accept error");
-            }
-        }
-    }
-}
-
-/// Run the SOCKS5 inbound listener.
+/// Run the SOCKS5 inbound listener (TCP or UDS, selected by address prefix).
 pub async fn run_socks5_inbound(
     listen_addr: String,
     pool: BackendPool,
@@ -134,60 +27,64 @@ pub async fn run_socks5_inbound(
     tls_cfg: Option<crate::config::TlsServerConfig>,
     username: Option<String>,
     password: Option<String>,
+    cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    if let Some(path) = listen_addr.strip_prefix("unix://") {
-        run_socks5_uds_inbound(
-            path.to_string(),
-            pool,
-            stats,
-            filter_enabled,
-            tls_cfg,
-            username,
-            password,
-        )
-        .await
-    } else {
-        run_socks5_tcp_inbound(
-            listen_addr,
-            pool,
-            stats,
-            filter_enabled,
-            tls_cfg,
-            username,
-            password,
-        )
-        .await
-    }
+    let tls_acceptor = tls_cfg
+        .as_ref()
+        .map(|c| crate::tls::create_tls_acceptor(c))
+        .transpose()?
+        .map(Arc::new);
+    let username = username.map(Arc::new);
+    let password = password.map(Arc::new);
+
+    let listener = BoundListener::bind(&listen_addr).await?;
+    tracing::info!(listen = %listen_addr, "SOCKS5 inbound listener started");
+
+    crate::inbound::run_accept_loop(listener, cancel, "SOCKS5", move |stream, addr| {
+        let pool = pool.clone();
+        let stats = Arc::clone(&stats);
+        let tls_acceptor = tls_acceptor.clone();
+        let username = username.clone();
+        let password = password.clone();
+        async move {
+            if let Err(e) = handle_socks5_connection(
+                stream,
+                pool,
+                stats,
+                filter_enabled,
+                tls_acceptor.as_deref().cloned(),
+                username,
+                password,
+            )
+            .await
+            {
+                tracing::debug!(client = %addr, error = %e, "SOCKS5 connection failed");
+            }
+        }
+    })
+    .await
 }
 
 /// Handle a single SOCKS5 connection.
-///
-/// We use fast-socks5 with `execute_command = false` and `dns_resolve = false`
-/// so it performs the auth handshake and reads the CONNECT request, but does NOT
-/// connect to the target or do DNS resolution. We then take the target address
-/// and forward through our SOCKS5h backend pool instead of connecting directly.
-///
-
 #[allow(deprecated)]
 async fn handle_socks5_connection<S>(
     stream: S,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
-    tls_cfg: Option<Arc<crate::config::TlsServerConfig>>,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     username: Option<Arc<String>>,
     password: Option<Arc<String>>,
 ) -> anyhow::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
 {
     // Apply TLS if configured.
-    let stream = if let Some(ref tls) = tls_cfg {
-        let acceptor = crate::tls::create_tls_acceptor(tls)?;
+    let stream = if let Some(ref acceptor) = tls_acceptor {
         let tls_stream = acceptor.accept(stream).await?;
-        crate::outbound::BackendStream::Boxed(Box::pin(tls_stream))
+        MaybeTlsStream::Tls(tls_stream)
     } else {
-        crate::outbound::BackendStream::Boxed(Box::pin(stream))
+        MaybeTlsStream::Plain(stream)
     };
 
     if let (Some(u), Some(p)) = (username, password) {
@@ -217,7 +114,7 @@ async fn handle_socks5_handshake<S, A>(
     filter_enabled: bool,
 ) -> anyhow::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
     A: fast_socks5::server::Authentication + Send + Sync + 'static,
 {
     // Perform the SOCKS5 handshake (auth + read command), but don't connect.
@@ -247,7 +144,7 @@ where
     if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
         tracing::warn!(target = %target, "SOCKS5 connection rejected: private target");
         let mut client_stream = socks5_socket.into_inner();
-        let reply = build_socks5_reply(consts::SOCKS5_REPLY_CONNECTION_NOT_ALLOWED); // Connection not allowed by ruleset
+        let reply = build_socks5_reply(consts::SOCKS5_REPLY_CONNECTION_NOT_ALLOWED);
         let _ = client_stream.write_all(&reply).await;
         return Ok(());
     }

@@ -3,10 +3,10 @@
 //! Provides JSON API endpoints for real-time status query and enabling/disabling backends.
 
 use axum::{
+    Router,
     extract::State,
     response::{IntoResponse, Json},
     routing::get,
-    Router,
 };
 use memory_stats::memory_stats;
 use serde::Serialize;

@@ -45,6 +45,8 @@ pub struct Config {
     pub cpu_affinity: Option<CpuAffinityConfig>,
     #[serde(default)]
     pub adblock: AdBlockConfig,
+    #[serde(default)]
+    pub advanced: AdvancedConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -62,6 +64,16 @@ pub struct AdBlockConfig {
 
 fn default_update_interval_hours() -> u64 {
     24
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AdvancedConfig {
+    #[serde(default = "default_zero_copy")]
+    pub zero_copy: bool,
+}
+
+fn default_zero_copy() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -211,7 +223,7 @@ pub struct BackendConfig {
 }
 
 fn default_pool_size() -> usize {
-    10
+    5
 }
 
 /// Health check configuration.
@@ -371,7 +383,10 @@ impl Config {
                         anyhow::bail!("{}: Shadowsocks backend must specify 'address'", label);
                     }
                     if backend.username.is_none() || backend.password.is_none() {
-                        anyhow::bail!("{}: Shadowsocks backend must specify cipher method in 'username' and password in 'password'", label);
+                        anyhow::bail!(
+                            "{}: Shadowsocks backend must specify cipher method in 'username' and password in 'password'",
+                            label
+                        );
                     }
                 }
                 "direct" => {
@@ -379,7 +394,10 @@ impl Config {
                         || backend.username.is_some()
                         || backend.password.is_some()
                     {
-                        anyhow::bail!("{}: direct backend must not specify 'address', 'username', or 'password'", label);
+                        anyhow::bail!(
+                            "{}: direct backend must not specify 'address', 'username', or 'password'",
+                            label
+                        );
                     }
                 }
                 other => {
@@ -510,6 +528,7 @@ mod tests {
             bind_interface: None,
             cpu_affinity: None,
             adblock: AdBlockConfig::default(),
+            advanced: AdvancedConfig::default(),
         };
         assert!(cfg.validate().is_ok());
     }
@@ -548,11 +567,13 @@ mod tests {
             bind_interface: None,
             cpu_affinity: None,
             adblock: AdBlockConfig::default(),
+            advanced: AdvancedConfig::default(),
         };
         let err = cfg.validate().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("cannot be used in multiple groups"));
+        assert!(
+            err.to_string()
+                .contains("cannot be used in multiple groups")
+        );
     }
 
     #[test]
@@ -582,11 +603,13 @@ mod tests {
             bind_interface: None,
             cpu_affinity: None,
             adblock: AdBlockConfig::default(),
+            advanced: AdvancedConfig::default(),
         };
         let err = cfg.validate().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("cannot be used as a standalone target"));
+        assert!(
+            err.to_string()
+                .contains("cannot be used as a standalone target")
+        );
     }
 
     #[test]

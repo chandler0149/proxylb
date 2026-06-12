@@ -29,7 +29,7 @@ pub async fn direct_connect(
             .map_err(|e| io::Error::new(e.kind(), format!("direct connect to {}: {}", addr, e)))?,
     };
     tcp.set_nodelay(true)?;
-    Ok(BackendStream::Tcp(tcp))
+    Ok(BackendStream::tcp(tcp))
 }
 
 #[cfg(test)]

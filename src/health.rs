@@ -9,16 +9,16 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
-use tokio_rustls::rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::backend::{BackendPool, PooledConn};
 use crate::config::HealthCheckConfig;
 use crate::outbound::{
-    direct_connect, socks5h_connect, socks5h_connect_target, ss_connect_fresh, ss_connect_pooled,
-    BackendStream, TargetAddr,
+    BackendStream, TargetAddr, direct_connect, socks5h_connect, socks5h_connect_target,
+    ss_connect_fresh, ss_connect_pooled,
 };
 use std::sync::atomic::Ordering;
 
@@ -122,7 +122,7 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
             let start = Instant::now();
 
             let result = async {
-                let pc = pool.get_pooled_connection(index).await;
+                let pc = pool.get_pooled_connection(index);
 
                 let stream: BackendStream = if info.is_direct() {
                     // ── Direct backend health check ────────────────────────────────

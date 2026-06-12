@@ -1,0 +1,32 @@
+inbound:
+  filter:
+    enabled: false
+inbounds:
+  - type: socks5
+    listen: "127.0.0.1:1080"
+    filter:
+      enabled: false
+
+backends:
+  - type: socks5
+    address: "unix:///tmp/mock_socks5.sock"
+    name: "uds-socks5-backend"
+    pool_size: 5
+
+failover_order:
+  - "uds-socks5-backend"
+
+health_check:
+  interval_secs: 10
+  timeout_secs: 5
+  check_target: "http://www.gstatic.com/generate_204"
+
+adblock:
+  enabled: false
+
+cpu_affinity:
+  worker_cores: [0, 1]
+  ancillary_cores: [2]
+
+advanced:
+  zero_copy: true

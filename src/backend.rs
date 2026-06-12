@@ -5,8 +5,8 @@
 //! counters updated atomically by the relay tasks.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{BackendConfig, GroupConfig, GroupStrategy};
-use crate::outbound::{socks5h_authenticate, BackendStream};
+use crate::outbound::{BackendStream, socks5h_authenticate};
 use tokio_rustls::TlsConnector;
 
 /// Lock-free per-backend traffic counters.
@@ -391,11 +391,18 @@ pub struct CachedCandidates {
     pub unhealthy: Vec<(usize, BackendInfo)>,
 }
 
+#[derive(Clone)]
+pub struct BackendHotPath {
+    pub pool_rx: flume::Receiver<BackendStream>,
+    pub traffic: Arc<TrafficCounters>,
+}
+
 /// Thread-safe backend pool.
 #[derive(Clone)]
 pub struct BackendPool {
     inner: Arc<RwLock<BackendPoolInner>>,
     cached: Arc<ArcSwap<CachedCandidates>>,
+    pub hot_paths: Arc<ArcSwap<Vec<BackendHotPath>>>,
     pub inbound_stats: Arc<std::sync::Mutex<Vec<Arc<InboundStats>>>>,
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
     pub adblock_manager: Arc<crate::adblock::AdBlockManager>,
@@ -652,6 +659,15 @@ impl BackendPool {
             unhealthy: cached_unhealthy.clone(),
         }));
 
+        let hot_paths = entries
+            .iter()
+            .map(|e| BackendHotPath {
+                pool_rx: e.pool_rx.clone(),
+                traffic: Arc::clone(&e.traffic),
+            })
+            .collect::<Vec<_>>();
+        let hot_paths = Arc::new(ArcSwap::from_pointee(hot_paths));
+
         let adblock_manager = Arc::new(crate::adblock::AdBlockManager::new(adblock_config.enabled));
 
         Ok(Self {
@@ -661,6 +677,7 @@ impl BackendPool {
                 failover_order,
             })),
             cached,
+            hot_paths,
             inbound_stats: Arc::new(std::sync::Mutex::new(Vec::new())),
             rt_chg_signal,
             adblock_manager,
@@ -832,6 +849,15 @@ impl BackendPool {
             unhealthy: cached_unhealthy.clone(),
         }));
 
+        let hot_paths_vec = new_entries
+            .iter()
+            .map(|e| BackendHotPath {
+                pool_rx: e.pool_rx.clone(),
+                traffic: Arc::clone(&e.traffic),
+            })
+            .collect::<Vec<_>>();
+        self.hot_paths.store(Arc::new(hot_paths_vec));
+
         guard.entries = new_entries;
         guard.groups = groups;
         guard.failover_order = failover_order;
@@ -847,11 +873,11 @@ impl BackendPool {
     ///
     /// Callers must not call `get_traffic_counters` separately; use the returned `Arc` directly.
     /// Returns `None` only if `index` is out of bounds (never happens in practice).
-    pub async fn get_pooled_connection(&self, index: usize) -> Option<PooledConn> {
-        let guard = self.inner.read().await;
-        guard.entries.get(index).map(|e| PooledConn {
-            stream: e.pool_rx.try_recv().ok(),
-            traffic: Arc::clone(&e.traffic),
+    pub fn get_pooled_connection(&self, index: usize) -> Option<PooledConn> {
+        let hot_paths = self.hot_paths.load();
+        hot_paths.get(index).map(|hp| PooledConn {
+            stream: hp.pool_rx.try_recv().ok(),
+            traffic: Arc::clone(&hp.traffic),
         })
     }
 
@@ -859,9 +885,9 @@ impl BackendPool {
     ///
     /// Callers hold this `Arc` across the relay lifetime and update it directly
     /// without taking the pool lock again.
-    pub async fn get_traffic_counters(&self, index: usize) -> Option<Arc<TrafficCounters>> {
-        let guard = self.inner.read().await;
-        guard.entries.get(index).map(|e| Arc::clone(&e.traffic))
+    pub fn get_traffic_counters(&self, index: usize) -> Option<Arc<TrafficCounters>> {
+        let hot_paths = self.hot_paths.load();
+        hot_paths.get(index).map(|hp| Arc::clone(&hp.traffic))
     }
 
     /// Get the info of all backends with their index, current health, and enabled state.
@@ -886,9 +912,9 @@ impl BackendPool {
         (guard.healthy.clone(), guard.unhealthy.clone())
     }
 
-    /// Get a reference-counted clone of the cached candidates (allocation-free).
-    pub fn get_candidates_ref(&self) -> Arc<CachedCandidates> {
-        self.cached.load_full()
+    /// Get a lock-free guard to the cached candidates (avoiding any Arc clone/refcount overhead).
+    pub fn get_candidates_guard(&self) -> arc_swap::Guard<Arc<CachedCandidates>> {
+        self.cached.load()
     }
 
     /// Mark a backend as healthy with measured latency.
@@ -1197,7 +1223,15 @@ async fn refill_pool_task(
 
         match result {
             // ── Success: try to enqueue, but respect signals ─────────────
-            Ok(stream) => {
+            Ok(mut stream) => {
+                #[cfg(target_os = "linux")]
+                {
+                    if crate::relay::ZERO_COPY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(pipes) = crate::relay::create_preallocated_pipes() {
+                            stream.pipes = Some(pipes);
+                        }
+                    }
+                }
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
