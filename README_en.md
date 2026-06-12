@@ -2,56 +2,93 @@
 
 [English](README_en.md) | [简体中文](README.md)
 
-ProxyLB is an ultra-high-performance, feature-rich proxy load balancer and traffic router written in Rust. It acts as an intermediary gateway supporting SOCKS5, Shadowsocks, and HTTP inbound protocols, routing client traffic through a pool of configurable outbound backends with advanced load balancing strategies, real-time health checks, zero-downtime hot reloading, and built-in domain filtering.
+ProxyLB is an ultra-high-performance proxy load balancer and traffic router written in Rust. It acts as an intermediary gateway supporting SOCKS5, Shadowsocks, and HTTP inbound protocols, routing client traffic through a pool of configurable outbound backends with advanced load balancing, real-time health checks, zero-downtime hot reloading, and built-in domain filtering.
 
 ![web](./web/web.jpg)
 
 ---
 
-## ⚡ Performance Architecture
+## ⚡ Performance
 
-ProxyLB is engineered from the ground up for high throughput, minimal overhead, and predictable low latency:
+```bash
+root@dev:~/code/gfw/proxylb# uname -a
+Linux dev 6.12.85+deb13-arm64 #1 SMP Debian 6.12.85-1 (2026-04-30) aarch64 GNU/Linux
+```
 
-*   **Lockless Hot-Path Forwarding**: Data relaying between clients and backends operates entirely lock-free. Once a route is established, data packets bypass all control-plane locks (such as RwLocks or Mutexes), utilizing high-speed tokio-assisted asynchronous pipelines.
-*   **Dedicated CPU Affinity Pinning**: 
-    *   **Worker Cores**: Heavy-lifting I/O relay tasks are pinned to dedicated CPU cores (`worker_cores`). Thread names are prefixed with `proxylb-worker` to guarantee strict isolation.
-    *   **Ancillary Cores**: Background management tasks (health checking, connection pool refilling, AdBlock updates, REST API server, and netlink watchers) are isolated to separate CPU cores (`ancillary_cores`) via a dedicated tokio runtime. This ensures that control plane overhead never interrupts or adds latency to the hot forwarding path.
-*   **Pre-Authenticated Connection Pooling**: To eliminate SOCKS5/Shadowsocks handshake latency, ProxyLB maintains a background connection pool for each backend. When a client connects, a pre-handshaked connection is popped from the pool instantly, converting outbound connection latency to near-zero.
-*   **High-Speed AdBlock Trie Matcher**: Utilizes a highly optimized domain suffix-matching Trie to evaluate blocker rules and exceptions (whitelist overrides). The engine is benchmarked to handle millions of queries per second with sub-nanosecond lookups.
+> **Measured on a single machine — 2 worker cores (pinned), pool_size = 5, 300 concurrent clients, 10 s window:**
+>
+> | Metric | Result |
+> |---|---|
+> | Connections per second (CPS) | **14,669** |
+> | Failed connections | **0** |
+> | Benchmark tool | Rust `benchmark_cps` (bundled) |
+
+ProxyLB is engineered from the ground up for high throughput, minimal overhead, and predictable low latency. Every design decision in the data path is motivated by eliminating unnecessary work:
+
+### Zero-Copy `splice(2)` relay (Linux)
+
+On Linux, the hot relay path uses `splice(2)` to move data between the client socket and the backend socket **without ever copying bytes into user space**. The kernel transfers data directly between file descriptors through an intermediate pipe, saving two memory copies per direction and removing the associated CPU and cache pressure entirely.
+
+Pipe file descriptors are **pre-allocated at connection-pool fill time** and attached to pooled backend streams so there is zero syscall overhead on the critical path when a client hits a pool hit.
+
+The fallback for non-Linux targets or non-TCP streams is `tokio::io::copy_bidirectional`, which is itself highly efficient.
+
+### Lock-free hot path
+
+Once a route is established, the entire relay loop is lock-free. No `Mutex` or `RwLock` is held during data transfer. The connection pool lookup is a single atomic read from a pre-built snapshot that is swapped out only when health state changes — entirely off the hot path.
+
+### Pre-authenticated connection pooling
+
+Every SOCKS5 / Shadowsocks backend maintains a background connection pool. Workers continuously fill the pool with **pre-handshaked, ready-to-use connections**. When a client connects, a pooled connection is popped atomically — the outbound connection latency is effectively zero. Pool misses (cold connections) still work but fall back to a fresh dial.
+
+### Dedicated CPU affinity pinning
+
+Two separate tokio runtimes keep the control plane and data plane from interfering:
+
+| Runtime thread | Pinned to | What runs there |
+|---|---|---|
+| `proxylb-worker` | `worker_cores` | inbound accept, relay, all I/O |
+| `proxylb-ancillary` | `ancillary_cores` | health checks, pool refill, adblock, web API, netlink |
+
+This prevents health-check or stats collection jitter from ever adding latency to the forwarding path.
+
+### jemalloc allocator
+
+ProxyLB uses **jemalloc** (`tikv-jemallocator`) as the global allocator. Compared to glibc `malloc`, jemalloc reduces memory fragmentation and lock contention under the high-allocation, high-concurrency workload of a proxy server.
+
+### High-speed adblock trie
+
+The domain filter uses a **compressed suffix-matching trie** evaluated at sub-nanosecond latency. At 300 CPS sustained, the trie adds immeasurable overhead even with millions of rules loaded.
 
 ---
 
-## 🛠️ Core Functionality
+## 🛠️ Core Features
 
-### Inbound Protocols
-*   **SOCKS5 Inbound**: Supports standard SOCKS5 authentication and TCP forwarding. Can listen on TCP ports or Unix Domain Sockets (e.g. `unix:///tmp/socks.sock`).
-*   **Shadowsocks Inbound**: Standard Shadowsocks server supporting multiple modern encryption ciphers (e.g., `aes-256-gcm`, `chacha20-ietf-poly1305`).
-*   **HTTP Inbound**: Fully featured HTTP/1.1 proxy supporting both relative and absolute GET requests as well as CONNECT tunneling.
+### Inbound protocols
+- **SOCKS5** — TCP or Unix domain socket (`unix:///tmp/socks.sock`), optional username/password auth, optional TLS
+- **Shadowsocks** — AEAD ciphers (`aes-256-gcm`, `chacha20-ietf-poly1305`, …), TCP or UDS
+- **HTTP** — HTTP/1.1 proxy: `CONNECT` tunnel + absolute/relative `GET`, optional Basic Auth, optional TLS
 
-### Outbound Backends & Grouping
-*   **Supported Outbound Protocols**: Direct connection, SOCKS5h over TCP, SOCKS5h over Unix Domain Sockets, and Shadowsocks.
-*   **Hierarchical Grouping**: Group backends and apply customized routing policies. Groups can be referenced directly in the global failover sequence.
-*   **Advanced Load Balancing Strategies**:
-    *   `failover`: Routes to the first healthy backend in the list.
-    *   `urltest`: Dynamically monitors latency and routes traffic to the backend with the lowest response time.
-    *   `loadbalance`: Distributes connections based on least historical and active connections.
+### Outbound backends & grouping
+- **Protocols**: Direct, SOCKS5h over TCP, SOCKS5h over UDS, Shadowsocks
+- **Hierarchical groups** with per-group strategies:
+  - `failover` — first healthy backend wins
+  - `urltest` — lowest-latency backend wins (measured continuously)
+  - `loadbalance` — fewest active connections wins
 
-### Resilience & Control
-*   **Zero-Downtime Hot Reload**: Triggered via `SIGHUP`. Reloads the configuration, constructs new connection pools, and updates route tables gracefully without dropping active client connections.
-*   **Dynamic Network Watcher**: Monitors routing socket events (Netlink on Linux, Route Sockets on macOS). Instantly triggers a health check probe upon physical link or default gateway changes to route around failed connections immediately.
-*   **Web Dashboard & REST API**: Real-time traffic metrics, active connection counts, memory stats, and per-backend latency logs. The API can listen on a TCP port or a Unix Domain Socket (e.g., `unix:///tmp/api.sock`).
-*   **Security & Protection**:
-    *   **Private Address Filter**: Blocks forwarding to private/internal IPs (RFC 1918) through proxy backends to protect local networks.
-    *   **AdBlock Engine**: AdGuard / Hosts style lists parsed and updated periodically in the background.
+### Resilience & control
+- **Zero-downtime hot reload** via `SIGHUP` — rewires backends without dropping active sessions
+- **Dynamic network watcher** — Netlink (Linux) / Route Sockets (macOS) trigger immediate re-probe on link or gateway changes
+- **Web dashboard + REST API** — real-time traffic metrics, per-backend latency, active connections; listens on TCP or UDS
+- **Private address filter** — blocks RFC 1918 targets to protect local networks
+- **AdBlock engine** — AdGuard/Hosts-format lists fetched and refreshed in background
 
 ---
 
 ## ⚙️ Configuration Example
 
-Below is a robust example of `config.yaml` showing inbound listeners, backends, grouping strategies, CPU pinning, and AdBlock configurations:
-
 ```yaml
-# Inbound listeners configuration
+# Inbound listeners
 inbounds:
   - type: socks5
     listen: "127.0.0.1:1080"
@@ -71,18 +108,18 @@ backends:
     address: "12.34.56.78:1080"
     username: "user"
     password: "pass"
-    pool_size: 10
+    pool_size: 10          # pre-authenticated connections kept ready
   - name: "ss-hk-1"
     type: "shadowsocks"
     address: "88.99.11.22:8388"
-    username: "chacha20-ietf-poly1305"
     password: "backendpassword"
+    method: "chacha20-ietf-poly1305"
     pool_size: 15
 
 # Hierarchical groups and strategies
 groups:
   - name: "asia-group"
-    strategy: "urltest" # Dynamically route to lowest latency
+    strategy: "urltest"    # route to lowest-latency backend dynamically
     backends:
       - "ss-hk-1"
   - name: "failover-pool"
@@ -96,31 +133,35 @@ failover_order:
   - "asia-group"
   - "failover-pool"
 
-# Health check intervals
+# Health check
 health_check:
   interval_secs: 10
   timeout_secs: 5
   check_target: "http://www.gstatic.com/generate_204"
 
-# Web Status Dashboard API
+# Web dashboard / REST API
 web:
   enabled: true
-  listen: "unix:///tmp/api.sock" # Or TCP address, e.g. "127.0.0.1:9090"
+  listen: "unix:///tmp/api.sock"   # or e.g. "127.0.0.1:9090"
 
-# CPU Affinity & Thread Isolation Settings
+# CPU affinity — keep data plane and control plane on separate cores
 cpu_affinity:
-  worker_cores: [0, 1]      # Pinned core IDs for proxy forwarding (hot path)
-  ancillary_cores: [2]      # Pinned core IDs for background/health tasks
+  worker_cores: [0, 1]      # relay & accept threads
+  ancillary_cores: [2]      # health check, pool refill, adblock, API
 
 # Domain filtering (AdBlock)
 adblock:
   enabled: true
-  backend: "direct-out"     # Backend used to download lists
+  backend: "direct-out"
   update_interval_hours: 24
   urls:
     - "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
   files:
     - "/etc/proxylb/custom_rules.txt"
+
+# Performance tuning
+advanced:
+  zero_copy: true           # enable splice(2) on Linux (default: true)
 ```
 
 ---
@@ -128,19 +169,38 @@ adblock:
 ## 🚀 Getting Started
 
 ### Prerequisites
-*   Rust toolchain (Stable 1.75+)
+- Rust toolchain (stable 1.75+)
 
-### Compilation & Execution
+### Build & run
 ```bash
-# Build release version
+# Build optimised release binary
 cargo build --release
 
-# Run ProxyLB with a configuration file
+# Run with your config
 ./target/release/proxylb -c config.yaml
-```
 
-### Hot Reload
-To apply configuration changes on the fly without restarting the service or interrupting active connections:
-```bash
+# Apply config changes without restarting
 kill -SIGHUP $(pgrep proxylb)
 ```
+
+### Run the benchmark
+```bash
+make bench
+```
+
+The bundled benchmark (`benchmark_cps`) spawns a Rust SOCKS5 mock backend on a dedicated core and a multi-threaded client firing 300 concurrent connections for 10 seconds, reporting total CPS and failure rate.
+
+---
+
+## 🐳 Docker
+
+```bash
+docker build -t proxylb .
+docker run -v $(pwd)/config.yaml:/config.yaml proxylb
+```
+
+---
+
+## 📄 License
+
+[GPL-3.0](LICENSE)

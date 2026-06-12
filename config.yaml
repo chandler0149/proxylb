@@ -182,3 +182,7 @@ adblock:
     - "/etc/proxylb/custom-blocklist.txt"
   # Periodic update check interval for remote URLs (in hours).
   update_interval_hours: 24
+
+
+advanced:
+  zero_copy: true
