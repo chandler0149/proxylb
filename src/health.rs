@@ -9,14 +9,17 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::backend::{BackendPool, PooledConn};
 use crate::config::HealthCheckConfig;
-use crate::outbound::{socks5h_connect, socks5h_connect_target, ss_connect_fresh, ss_connect_pooled, direct_connect, BackendStream, TargetAddr};
+use crate::outbound::{
+    BackendStream, TargetAddr, direct_connect, socks5h_connect, socks5h_connect_target,
+    ss_connect_fresh, ss_connect_pooled,
+};
 use std::sync::atomic::Ordering;
 
 /// Target for the health check probe.
@@ -45,7 +48,7 @@ pub async fn run_health_checker(
         Ok(t) => t,
         Err(e) => {
             tracing::error!(target = %config.check_target, error = %e, "failed to parse health check target; using default");
-            parse_check_target("http://www.google.com:80/").unwrap()
+            parse_check_target("http://www.gstatic.com/generate_204").unwrap()
         }
     };
 
@@ -119,7 +122,7 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
             let start = Instant::now();
 
             let result = async {
-                let pc = pool.get_pooled_connection(index).await;
+                let pc = pool.get_pooled_connection(index);
 
                 let stream: BackendStream = if info.is_direct() {
                     // ── Direct backend health check ────────────────────────────────
@@ -130,23 +133,32 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                     let ss_ctx = info.ss_context.as_ref().unwrap().clone();
 
                     match pc {
-                        Some(PooledConn { stream: Some(pooled), ref traffic }) => {
+                        Some(PooledConn {
+                            stream: Some(pooled),
+                            ref traffic,
+                        }) => {
                             traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
                             ss_connect_pooled(pooled, ss_cfg, ss_ctx, &target.addr)
                         }
-                        Some(PooledConn { stream: None, ref traffic }) => {
+                        Some(PooledConn {
+                            stream: None,
+                            ref traffic,
+                        }) => {
                             traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
-                            ss_connect_fresh(&info.endpoint, ss_cfg, ss_ctx, &target.addr, timeout, info.bind_interface.as_deref()).await?
+                            ss_connect_fresh(&info, ss_cfg, ss_ctx, &target.addr, timeout).await?
                         }
                         None => {
-                            ss_connect_fresh(&info.endpoint, ss_cfg, ss_ctx, &target.addr, timeout, info.bind_interface.as_deref()).await?
+                            ss_connect_fresh(&info, ss_cfg, ss_ctx, &target.addr, timeout).await?
                         }
                     }
                 } else {
                     // ── SOCKS5 backend health check ─────────────────────────────
                     // Try the pool first: validates pooled connections are still alive.
                     match pc {
-                        Some(PooledConn { stream: Some(pooled), ref traffic }) => {
+                        Some(PooledConn {
+                            stream: Some(pooled),
+                            ref traffic,
+                        }) => {
                             match socks5h_connect_target(pooled, &target.addr).await {
                                 Ok(s) => {
                                     traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
@@ -159,7 +171,10 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                                 }
                             }
                         }
-                        Some(PooledConn { stream: None, ref traffic }) => {
+                        Some(PooledConn {
+                            stream: None,
+                            ref traffic,
+                        }) => {
                             traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
                             socks5h_connect(&info, &target.addr, timeout).await?
                         }
@@ -169,8 +184,9 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
 
                 if let Some(config) = tls_config {
                     let connector = TlsConnector::from(config);
-                    let domain = ServerName::try_from(target.host.clone())
-                        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid DNS name"))?;
+                    let domain = ServerName::try_from(target.host.clone()).map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid DNS name")
+                    })?;
                     let mut tls_stream = connector.connect(domain, stream).await?;
                     perform_http_get(&mut tls_stream, &target).await
                 } else {
@@ -290,4 +306,3 @@ fn parse_check_target(target_str: &str) -> anyhow::Result<ProbeTarget> {
         is_https,
     })
 }
-

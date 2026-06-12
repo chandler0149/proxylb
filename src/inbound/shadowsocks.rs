@@ -12,13 +12,15 @@ use shadowsocks::context::{Context, SharedContext};
 use shadowsocks::crypto::CipherKind;
 use shadowsocks::relay::socks5::Address;
 use shadowsocks::relay::tcprelay::proxy_stream::server::ProxyServerStream;
-use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
+use super::BoundListener;
 use crate::backend::BackendPool;
 use crate::outbound::TargetAddr;
+use crate::relay::AsRawStreamRef;
+use crate::tls::MaybeTlsStream;
 
-
-/// Run the Shadowsocks inbound listener.
+/// Run the Shadowsocks inbound listener (TCP or UDS, selected by address prefix).
 pub async fn run_shadowsocks_inbound(
     listen_addr: String,
     password: String,
@@ -26,21 +28,8 @@ pub async fn run_shadowsocks_inbound(
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
-) -> anyhow::Result<()> {
-    if let Some(path) = listen_addr.strip_prefix("unix://") {
-        run_shadowsocks_uds_inbound(path.to_string(), password, method_str, pool, stats, filter_enabled).await
-    } else {
-        run_shadowsocks_tcp_inbound(listen_addr, password, method_str, pool, stats, filter_enabled).await
-    }
-}
-
-pub async fn run_shadowsocks_tcp_inbound(
-    listen_addr: String,
-    password: String,
-    method_str: String,
-    pool: BackendPool,
-    stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    tls_cfg: Option<crate::config::TlsServerConfig>,
+    cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let method: CipherKind = method_str
         .parse()
@@ -49,105 +38,48 @@ pub async fn run_shadowsocks_tcp_inbound(
     let dummy_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let ss_config = SsServerConfig::new(dummy_addr, &password, method)
         .map_err(|e| anyhow::anyhow!("shadowsocks config error: {}", e))?;
-    let key = ss_config.key().to_vec();
+    let key: Arc<[u8]> = ss_config.key().into();
 
     let context: SharedContext = Context::new_shared(shadowsocks::config::ServerType::Server);
 
-    let listener = TcpListener::bind(&listen_addr).await?;
-    tracing::info!(
-        listen = %listen_addr,
-        method = %method_str,
-        "Shadowsocks TCP inbound listener started"
-    );
+    let tls_acceptor = tls_cfg
+        .as_ref()
+        .map(|c| crate::tls::create_tls_acceptor(c))
+        .transpose()?
+        .map(Arc::new);
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, client_addr)) => {
-                let pool = pool.clone();
-                let context = context.clone();
-                let key = key.clone();
-                let stats = Arc::clone(&stats);
+    let listener = BoundListener::bind(&listen_addr).await?;
+    tracing::info!(listen = %listen_addr, method = %method_str, "Shadowsocks inbound listener started");
 
-                tokio::spawn(async move {
-                    let _ = stream.set_nodelay(true);
-                    let client_str = client_addr.to_string();
-                    if let Err(e) =
-                        handle_ss_connection(stream, client_str.clone(), context, method, &key, pool, stats, filter_enabled).await
-                    {
-                        tracing::debug!(
-                            client = %client_str,
-                            error = %e,
-                            "Shadowsocks TCP connection failed"
-                        );
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Shadowsocks TCP accept error");
-            }
-        }
-    }
-}
-
-pub async fn run_shadowsocks_uds_inbound(
-    socket_path: String,
-    password: String,
-    method_str: String,
-    pool: BackendPool,
-    stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
-) -> anyhow::Result<()> {
-    let method: CipherKind = method_str
-        .parse()
-        .map_err(|_| anyhow::anyhow!("unsupported cipher: {}", method_str))?;
-
-    let dummy_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let ss_config = SsServerConfig::new(dummy_addr, &password, method)
-        .map_err(|e| anyhow::anyhow!("shadowsocks config error: {}", e))?;
-    let key = ss_config.key().to_vec();
-
-    let context: SharedContext = Context::new_shared(shadowsocks::config::ServerType::Server);
-
-    // Remove existing file if present.
-    let path = std::path::Path::new(&socket_path);
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
-
-    let listener = tokio::net::UnixListener::bind(path)?;
-    tracing::info!(
-        socket = %socket_path,
-        method = %method_str,
-        "Shadowsocks UDS inbound listener started"
-    );
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, client_addr)) => {
-                let pool = pool.clone();
-                let context = context.clone();
-                let key = key.clone();
-                let stats = Arc::clone(&stats);
-
-                tokio::spawn(async move {
-                    let client_str = format!("unix:{:?}", client_addr);
-                    if let Err(e) =
-                        handle_ss_connection(stream, client_str.clone(), context, method, &key, pool, stats, filter_enabled).await
-                    {
-                        tracing::debug!(
-                            client = %client_str,
-                            error = %e,
-                            "Shadowsocks UDS connection failed"
-                        );
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Shadowsocks UDS accept error");
+    crate::inbound::run_accept_loop(listener, cancel, "Shadowsocks", move |stream, addr| {
+        let pool = pool.clone();
+        let context = context.clone();
+        let key = Arc::clone(&key);
+        let stats = Arc::clone(&stats);
+        let tls_acceptor = tls_acceptor.clone();
+        async move {
+            if let Err(e) = handle_ss_connection(
+                stream,
+                addr.clone(),
+                context,
+                method,
+                &key,
+                pool,
+                stats,
+                filter_enabled,
+                tls_acceptor.as_deref().cloned(),
+            )
+            .await
+            {
+                tracing::debug!(client = %addr, error = %e, "Shadowsocks connection failed");
             }
         }
-    }
+    })
+    .await
 }
+
+
+
 
 /// Handle a single Shadowsocks connection.
 async fn handle_ss_connection<S>(
@@ -159,10 +91,18 @@ async fn handle_ss_connection<S>(
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> anyhow::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
 {
+    let stream = if let Some(ref acceptor) = tls_acceptor {
+        let tls_stream = acceptor.accept(stream).await?;
+        MaybeTlsStream::Tls(tls_stream)
+    } else {
+        MaybeTlsStream::Plain(stream)
+    };
+
     // Wrap the raw stream in the Shadowsocks decryption layer.
     let mut ss_stream = ProxyServerStream::from_stream(context, stream, method, key);
 
@@ -183,7 +123,9 @@ where
     let is_private = crate::inbound::is_private_target(&target).await;
     if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
         tracing::warn!(target = %target, "Shadowsocks connection rejected: private target");
-        return Err(anyhow::anyhow!("private address target is rejected by filter"));
+        return Err(anyhow::anyhow!(
+            "private address target is rejected by filter"
+        ));
     }
 
     if pool.adblock_manager.is_blocked(&target) {
@@ -192,20 +134,29 @@ where
     }
 
     // Try backends in order with fallback.
-    let (backend_stream, chosen_traffic) = match crate::inbound::route_and_connect(&pool, &target).await {
-        Ok((s, t)) => (s, t),
-        Err(e) => {
-            tracing::warn!(
-                client = %client_addr,
-                target = %target,
-                error = %e,
-                "all backends failed"
-            );
-            return Err(anyhow::anyhow!("all backends unavailable"));
-        }
-    };
+    let (backend_stream, chosen_traffic) =
+        match crate::inbound::route_and_connect(&pool, &target).await {
+            Ok((s, t)) => (s, t),
+            Err(e) => {
+                tracing::warn!(
+                    client = %client_addr,
+                    target = %target,
+                    error = %e,
+                    "all backends failed"
+                );
+                return Err(anyhow::anyhow!("all backends unavailable"));
+            }
+        };
 
-    crate::inbound::relay_and_track(ss_stream, backend_stream, chosen_traffic, Some(stats), &target, "Shadowsocks").await
+    crate::inbound::relay_and_track(
+        ss_stream,
+        backend_stream,
+        chosen_traffic,
+        Some(stats),
+        &target,
+        "Shadowsocks",
+    )
+    .await
 }
 
 /// Convert a shadowsocks `Address` to our `TargetAddr`.
@@ -213,5 +164,14 @@ fn convert_ss_address(addr: &Address) -> TargetAddr {
     match addr {
         Address::SocketAddress(socket_addr) => TargetAddr::Ip(*socket_addr),
         Address::DomainNameAddress(host, port) => TargetAddr::Domain(host.clone(), *port),
+    }
+}
+
+#[cfg(unix)]
+impl<S> crate::relay::AsRawStreamRef
+    for shadowsocks::relay::tcprelay::proxy_stream::server::ProxyServerStream<S>
+{
+    fn as_raw_stream_ref(&self) -> Option<crate::relay::RawStreamRef<'_>> {
+        None
     }
 }

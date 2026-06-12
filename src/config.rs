@@ -9,6 +9,20 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TlsServerConfig {
+    Auto(String),
+    Manual { cert: String, key: String },
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct TlsClientConfig {
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub insecure: bool,
+}
+
 /// Root configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
@@ -31,6 +45,8 @@ pub struct Config {
     pub cpu_affinity: Option<CpuAffinityConfig>,
     #[serde(default)]
     pub adblock: AdBlockConfig,
+    #[serde(default)]
+    pub advanced: AdvancedConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -48,6 +64,16 @@ pub struct AdBlockConfig {
 
 fn default_update_interval_hours() -> u64 {
     24
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AdvancedConfig {
+    #[serde(default = "default_zero_copy")]
+    pub zero_copy: bool,
+}
+
+fn default_zero_copy() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
@@ -95,6 +121,12 @@ pub enum InboundItemConfig {
     Socks5 {
         listen: String,
         #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        #[serde(default)]
         filter: Option<FilterConfig>,
     },
     Shadowsocks {
@@ -102,10 +134,18 @@ pub enum InboundItemConfig {
         password: String,
         method: String,
         #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        #[serde(default)]
         filter: Option<FilterConfig>,
     },
     Http {
         listen: String,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
         #[serde(default)]
         filter: Option<FilterConfig>,
     },
@@ -115,6 +155,8 @@ pub enum InboundItemConfig {
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct Socks5InboundConfig {
     pub listen: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 /// Shadowsocks inbound listener.
@@ -130,6 +172,8 @@ pub struct ShadowsocksInboundConfig {
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct HttpInboundConfig {
     pub listen: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
 }
 
 fn default_filter_enabled() -> bool {
@@ -148,9 +192,6 @@ impl Default for FilterConfig {
         Self { enabled: true }
     }
 }
-
-
-
 
 /// A backend entry.
 ///
@@ -174,12 +215,15 @@ pub struct BackendConfig {
     pub pool_size: usize,
     /// Optional network interface to bind when connecting outbound.
     pub bind_interface: Option<String>,
+    /// TLS configuration for the backend.
+    #[serde(default)]
+    pub tls: Option<TlsClientConfig>,
     /// Whether the backend is enabled initially (default: true).
     pub enabled: Option<bool>,
 }
 
 fn default_pool_size() -> usize {
-    10
+    5
 }
 
 /// Health check configuration.
@@ -246,8 +290,8 @@ fn default_web_enabled() -> bool {
 impl Config {
     /// Load config from a YAML file.
     pub fn load(path: &Path) -> Result<Self> {
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading config: {}", path.display()))?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config: {}", path.display()))?;
         let config: Config =
             serde_yaml::from_str(&content).with_context(|| "parsing YAML config")?;
         config.validate()?;
@@ -260,6 +304,9 @@ impl Config {
         if let Some(ref s5) = self.inbound.socks5 {
             res.push(InboundItemConfig::Socks5 {
                 listen: s5.listen.clone(),
+                username: s5.username.clone(),
+                password: s5.password.clone(),
+                tls: None,
                 filter: Some(self.inbound.filter.clone()),
             });
         }
@@ -268,12 +315,16 @@ impl Config {
                 listen: ss.listen.clone(),
                 password: ss.password.clone(),
                 method: ss.method.clone(),
+                tls: None,
                 filter: Some(self.inbound.filter.clone()),
             });
         }
         if let Some(ref http) = self.inbound.http {
             res.push(InboundItemConfig::Http {
                 listen: http.listen.clone(),
+                username: http.username.clone(),
+                password: http.password.clone(),
+                tls: None,
                 filter: Some(self.inbound.filter.clone()),
             });
         }
@@ -332,12 +383,21 @@ impl Config {
                         anyhow::bail!("{}: Shadowsocks backend must specify 'address'", label);
                     }
                     if backend.username.is_none() || backend.password.is_none() {
-                        anyhow::bail!("{}: Shadowsocks backend must specify cipher method in 'username' and password in 'password'", label);
+                        anyhow::bail!(
+                            "{}: Shadowsocks backend must specify cipher method in 'username' and password in 'password'",
+                            label
+                        );
                     }
                 }
                 "direct" => {
-                    if backend.address.is_some() || backend.username.is_some() || backend.password.is_some() {
-                        anyhow::bail!("{}: direct backend must not specify 'address', 'username', or 'password'", label);
+                    if backend.address.is_some()
+                        || backend.username.is_some()
+                        || backend.password.is_some()
+                    {
+                        anyhow::bail!(
+                            "{}: direct backend must not specify 'address', 'username', or 'password'",
+                            label
+                        );
                     }
                 }
                 other => {
@@ -372,10 +432,7 @@ impl Config {
                 }
                 // Enforce: the same backend cannot be used in multiple groups
                 if !grouped_backends.insert(member.clone()) {
-                    anyhow::bail!(
-                        "backend '{}' cannot be used in multiple groups",
-                        member
-                    );
+                    anyhow::bail!("backend '{}' cannot be used in multiple groups", member);
                 }
             }
         }
@@ -437,18 +494,41 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![
-                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None, enabled: None },
-                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8082".to_string()), name: Some("b2".to_string()), username: None, password: None, pool_size: 1, bind_interface: None, enabled: None },
+                BackendConfig {
+                    backend_type: "socks5".to_string(),
+                    address: Some("127.0.0.1:8081".to_string()),
+                    name: Some("b1".to_string()),
+                    username: None,
+                    password: None,
+                    pool_size: 1,
+                    bind_interface: None,
+                    tls: None,
+                    enabled: None,
+                },
+                BackendConfig {
+                    backend_type: "socks5".to_string(),
+                    address: Some("127.0.0.1:8082".to_string()),
+                    name: Some("b2".to_string()),
+                    username: None,
+                    password: None,
+                    pool_size: 1,
+                    bind_interface: None,
+                    tls: None,
+                    enabled: None,
+                },
             ],
-            groups: vec![
-                GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
-            ],
+            groups: vec![GroupConfig {
+                name: "g1".to_string(),
+                strategy: GroupStrategy::UrlTest,
+                backends: vec!["b1".to_string()],
+            }],
             failover_order: Some(vec!["g1".to_string(), "b2".to_string()]),
             health_check: HealthCheckConfig::default(),
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
             adblock: AdBlockConfig::default(),
+            advanced: AdvancedConfig::default(),
         };
         assert!(cfg.validate().is_ok());
     }
@@ -458,12 +538,28 @@ mod tests {
         let cfg = Config {
             inbound: InboundConfig::default(),
             inbounds: vec![],
-            backends: vec![
-                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None, enabled: None },
-            ],
+            backends: vec![BackendConfig {
+                backend_type: "socks5".to_string(),
+                address: Some("127.0.0.1:8081".to_string()),
+                name: Some("b1".to_string()),
+                username: None,
+                password: None,
+                pool_size: 1,
+                bind_interface: None,
+                tls: None,
+                enabled: None,
+            }],
             groups: vec![
-                GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
-                GroupConfig { name: "g2".to_string(), strategy: GroupStrategy::Failover, backends: vec!["b1".to_string()] },
+                GroupConfig {
+                    name: "g1".to_string(),
+                    strategy: GroupStrategy::UrlTest,
+                    backends: vec!["b1".to_string()],
+                },
+                GroupConfig {
+                    name: "g2".to_string(),
+                    strategy: GroupStrategy::Failover,
+                    backends: vec!["b1".to_string()],
+                },
             ],
             failover_order: None,
             health_check: HealthCheckConfig::default(),
@@ -471,9 +567,13 @@ mod tests {
             bind_interface: None,
             cpu_affinity: None,
             adblock: AdBlockConfig::default(),
+            advanced: AdvancedConfig::default(),
         };
         let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("cannot be used in multiple groups"));
+        assert!(
+            err.to_string()
+                .contains("cannot be used in multiple groups")
+        );
     }
 
     #[test]
@@ -481,21 +581,35 @@ mod tests {
         let cfg = Config {
             inbound: InboundConfig::default(),
             inbounds: vec![],
-            backends: vec![
-                BackendConfig { backend_type: "socks5".to_string(), address: Some("127.0.0.1:8081".to_string()), name: Some("b1".to_string()), username: None, password: None, pool_size: 1, bind_interface: None, enabled: None },
-            ],
-            groups: vec![
-                GroupConfig { name: "g1".to_string(), strategy: GroupStrategy::UrlTest, backends: vec!["b1".to_string()] },
-            ],
+            backends: vec![BackendConfig {
+                backend_type: "socks5".to_string(),
+                address: Some("127.0.0.1:8081".to_string()),
+                name: Some("b1".to_string()),
+                username: None,
+                password: None,
+                pool_size: 1,
+                bind_interface: None,
+                tls: None,
+                enabled: None,
+            }],
+            groups: vec![GroupConfig {
+                name: "g1".to_string(),
+                strategy: GroupStrategy::UrlTest,
+                backends: vec!["b1".to_string()],
+            }],
             failover_order: Some(vec!["g1".to_string(), "b1".to_string()]),
             health_check: HealthCheckConfig::default(),
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
             adblock: AdBlockConfig::default(),
+            advanced: AdvancedConfig::default(),
         };
         let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("cannot be used as a standalone target"));
+        assert!(
+            err.to_string()
+                .contains("cannot be used as a standalone target")
+        );
     }
 
     #[test]
@@ -523,7 +637,7 @@ backends:
         assert_eq!(resolved.len(), 3);
 
         match &resolved[0] {
-            InboundItemConfig::Socks5 { listen, filter } => {
+            InboundItemConfig::Socks5 { listen, filter, .. } => {
                 assert_eq!(listen, "127.0.0.1:1080");
                 assert_eq!(filter.as_ref().unwrap().enabled, false);
             }
@@ -531,7 +645,13 @@ backends:
         }
 
         match &resolved[1] {
-            InboundItemConfig::Shadowsocks { listen, password, method, filter } => {
+            InboundItemConfig::Shadowsocks {
+                listen,
+                password,
+                method,
+                filter,
+                ..
+            } => {
                 assert_eq!(listen, "127.0.0.1:8388");
                 assert_eq!(password, "password123");
                 assert_eq!(method, "aes-256-gcm");
@@ -541,7 +661,7 @@ backends:
         }
 
         match &resolved[2] {
-            InboundItemConfig::Http { listen, filter } => {
+            InboundItemConfig::Http { listen, filter, .. } => {
                 assert_eq!(listen, "127.0.0.1:8080");
                 assert_eq!(filter.as_ref().unwrap().enabled, false);
             }
@@ -625,7 +745,12 @@ backends:
         let inbounds = cfg.all_inbounds();
         assert_eq!(inbounds.len(), 1);
         match &inbounds[0] {
-            InboundItemConfig::Shadowsocks { listen, password, method, .. } => {
+            InboundItemConfig::Shadowsocks {
+                listen,
+                password,
+                method,
+                ..
+            } => {
                 assert_eq!(listen, "unix:///tmp/proxylb-ss.sock");
                 assert_eq!(password, "pass");
                 assert_eq!(method, "chacha20-ietf-poly1305");
@@ -673,9 +798,15 @@ backends:
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.backends.len(), 2);
         assert_eq!(cfg.backends[0].backend_type, "ss");
-        assert_eq!(cfg.backends[0].address.as_deref().unwrap(), "unix:///tmp/ss.sock");
+        assert_eq!(
+            cfg.backends[0].address.as_deref().unwrap(),
+            "unix:///tmp/ss.sock"
+        );
         assert_eq!(cfg.backends[1].backend_type, "socks5");
-        assert_eq!(cfg.backends[1].address.as_deref().unwrap(), "unix:///tmp/socks5.sock");
+        assert_eq!(
+            cfg.backends[1].address.as_deref().unwrap(),
+            "unix:///tmp/socks5.sock"
+        );
     }
 
     #[test]

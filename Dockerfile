@@ -1,4 +1,11 @@
-# Stage 1: Build the React frontend
+# Stage 1: Build the Rust backend
+FROM rust:trixie AS backend-builder
+WORKDIR /usr/src/app
+COPY . .
+RUN make box
+
+
+# Stage 2: Build the React frontend
 FROM node:24-slim AS frontend-builder
 WORKDIR /usr/src/app/web
 COPY web/package*.json ./
@@ -6,13 +13,6 @@ RUN npm install
 COPY web/ ./
 RUN npm run build
 
-# Stage 2: Build the Rust backend
-FROM rust:trixie AS backend-builder
-WORKDIR /usr/src/app
-COPY Cargo.toml Cargo.lock* ./
-COPY src src
-COPY Makefile ./
-RUN make box
 
 # Stage 3: Runtime image
 FROM debian:trixie-slim

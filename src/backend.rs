@@ -5,20 +5,21 @@
 //! counters updated atomically by the relay tasks.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use shadowsocks::config::ServerConfig as SsServerConfig;
 use shadowsocks::context::{Context as SsContext, SharedContext};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use arc_swap::ArcSwap;
 
 use crate::config::{BackendConfig, GroupConfig, GroupStrategy};
-use crate::outbound::{socks5h_authenticate, BackendStream};
+use crate::outbound::{BackendStream, socks5h_authenticate};
+use tokio_rustls::TlsConnector;
 
 /// Lock-free per-backend traffic counters.
 ///
@@ -69,7 +70,7 @@ impl BackendEndpoint {
 }
 
 /// Parsed backend information.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BackendInfo {
     pub name: String,
     pub endpoint: BackendEndpoint,
@@ -82,7 +83,18 @@ pub struct BackendInfo {
     /// Shared Shadowsocks context — one per backend, reused across pool connections.
     pub ss_context: Option<SharedContext>,
     pub bind_interface: Option<String>,
+    pub tls_connector: Option<TlsConnector>,
+    pub server_name: Option<String>,
     pub enabled: Option<bool>,
+}
+
+impl std::fmt::Debug for BackendInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendInfo")
+            .field("name", &self.name)
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BackendInfo {
@@ -96,13 +108,18 @@ impl BackendInfo {
         let endpoint = match cfg.backend_type.as_str() {
             "direct" => BackendEndpoint::Direct,
             "socks5" | "ss" | "shadowsocks" | "uds" => {
-                let addr = cfg.address.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("backend must specify address")
-                })?;
+                let addr = cfg
+                    .address
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("backend must specify address"))?;
                 if addr.starts_with("unix://") {
                     let path = addr.strip_prefix("unix://").unwrap().to_string();
                     BackendEndpoint::Unix { path }
-                } else if addr.starts_with('/') || addr.starts_with("./") || addr.starts_with("../") || cfg.backend_type == "uds" {
+                } else if addr.starts_with('/')
+                    || addr.starts_with("./")
+                    || addr.starts_with("../")
+                    || cfg.backend_type == "uds"
+                {
                     let path = if let Some(stripped) = addr.strip_prefix("unix://") {
                         stripped.to_string()
                     } else {
@@ -118,68 +135,87 @@ impl BackendInfo {
                         })?;
                         BackendEndpoint::Tcp { host, port }
                     } else {
-                        anyhow::bail!("backend address must be in host:port or unix://path format: {}", addr);
+                        anyhow::bail!(
+                            "backend address must be in host:port or unix://path format: {}",
+                            addr
+                        );
                     }
                 }
             }
             other => anyhow::bail!("unknown backend type: {}", other),
         };
 
-        let name = cfg
-            .name
-            .clone()
-            .unwrap_or_else(|| {
-                if is_direct {
-                    format!("direct-{}", index)
-                } else {
-                    format!("backend-{}", index)
-                }
-            });
+        let name = cfg.name.clone().unwrap_or_else(|| {
+            if is_direct {
+                format!("direct-{}", index)
+            } else {
+                format!("backend-{}", index)
+            }
+        });
 
         // Build Shadowsocks config if this is an SS backend.
-        let (ss_config, ss_context) = if cfg.backend_type == "ss" || cfg.backend_type == "shadowsocks" {
-            let method_str = cfg.username.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("ss backend must specify method in username field")
-            })?;
-            let pass = cfg.password.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("ss backend must specify password in password field")
-            })?;
-            let addr = cfg.address.as_deref().expect("ss backend must have address");
-            let dummy_sock: std::net::SocketAddr = if addr.starts_with("unix://") || addr.starts_with('/') || addr.starts_with("./") || addr.starts_with("../") {
-                "0.0.0.0:0".parse().unwrap()
+        let (ss_config, ss_context) =
+            if cfg.backend_type == "ss" || cfg.backend_type == "shadowsocks" {
+                let method_str = cfg.username.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("ss backend must specify method in username field")
+                })?;
+                let pass = cfg.password.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("ss backend must specify password in password field")
+                })?;
+                let addr = cfg
+                    .address
+                    .as_deref()
+                    .expect("ss backend must have address");
+                let dummy_sock: std::net::SocketAddr = if addr.starts_with("unix://")
+                    || addr.starts_with('/')
+                    || addr.starts_with("./")
+                    || addr.starts_with("../")
+                {
+                    "0.0.0.0:0".parse().unwrap()
+                } else {
+                    addr.parse()
+                        .or_else(|_| {
+                            if let Some(pos) = addr.rfind(':') {
+                                let port: u16 = addr[pos + 1..].parse()?;
+                                let host_str = &addr[..pos];
+                                let ip: std::net::IpAddr = host_str.parse().unwrap_or(
+                                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                                );
+                                Ok(std::net::SocketAddr::new(ip, port))
+                            } else {
+                                Err(anyhow::anyhow!("invalid address"))
+                            }
+                        })
+                        .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+                };
+
+                let method: shadowsocks::crypto::CipherKind = method_str
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("unsupported ss_method: {}", method_str))?;
+
+                let ss_cfg = SsServerConfig::new(dummy_sock, pass, method).map_err(|e| {
+                    anyhow::anyhow!("shadowsocks config error for backend '{}': {}", name, e)
+                })?;
+
+                let ctx = SsContext::new_shared(shadowsocks::config::ServerType::Local);
+                (Some(Arc::new(ss_cfg)), Some(ctx))
             } else {
-                addr.parse()
-                    .or_else(|_| {
-                        if let Some(pos) = addr.rfind(':') {
-                            let port: u16 = addr[pos + 1..].parse()?;
-                            let host_str = &addr[..pos];
-                            let ip: std::net::IpAddr = host_str.parse().unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                            Ok(std::net::SocketAddr::new(ip, port))
-                        } else {
-                            Err(anyhow::anyhow!("invalid address"))
-                        }
-                    })
-                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+                (None, None)
             };
-
-            let method: shadowsocks::crypto::CipherKind = method_str
-                .parse()
-                .map_err(|_| anyhow::anyhow!("unsupported ss_method: {}", method_str))?;
-
-            let ss_cfg = SsServerConfig::new(dummy_sock, pass, method)
-                .map_err(|e| anyhow::anyhow!("shadowsocks config error for backend '{}': {}", name, e))?;
-
-            let ctx = SsContext::new_shared(shadowsocks::config::ServerType::Local);
-            (Some(Arc::new(ss_cfg)), Some(ctx))
-        } else {
-            (None, None)
-        };
 
         let pool_size = if is_direct { 0 } else { cfg.pool_size };
         let bind_interface = cfg
             .bind_interface
             .clone()
             .or_else(|| global_bind_interface.map(String::from));
+
+        let tls_connector = if let Some(tls) = &cfg.tls {
+            Some(crate::tls::create_tls_connector(tls.insecure)?)
+        } else {
+            None
+        };
+
+        let server_name = cfg.tls.as_ref().and_then(|tls| tls.server_name.clone());
 
         Ok(Self {
             name,
@@ -190,6 +226,8 @@ impl BackendInfo {
             ss_config,
             ss_context,
             bind_interface,
+            tls_connector,
+            server_name,
             enabled: cfg.enabled,
         })
     }
@@ -287,9 +325,7 @@ pub struct BackendStatusView {
 #[serde(tag = "type")]
 pub enum TreeItem {
     #[serde(rename = "backend")]
-    Backend {
-        status: BackendStatusView,
-    },
+    Backend { status: BackendStatusView },
     #[serde(rename = "group")]
     Group {
         name: String,
@@ -355,11 +391,18 @@ pub struct CachedCandidates {
     pub unhealthy: Vec<(usize, BackendInfo)>,
 }
 
+#[derive(Clone)]
+pub struct BackendHotPath {
+    pub pool_rx: flume::Receiver<BackendStream>,
+    pub traffic: Arc<TrafficCounters>,
+}
+
 /// Thread-safe backend pool.
 #[derive(Clone)]
 pub struct BackendPool {
     inner: Arc<RwLock<BackendPoolInner>>,
     cached: Arc<ArcSwap<CachedCandidates>>,
+    pub hot_paths: Arc<ArcSwap<Vec<BackendHotPath>>>,
     pub inbound_stats: Arc<std::sync::Mutex<Vec<Arc<InboundStats>>>>,
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
     pub adblock_manager: Arc<crate::adblock::AdBlockManager>,
@@ -502,7 +545,11 @@ fn calculate_candidates(
             Target::Backend(idx) => {
                 if let Some(entry) = entries.get(*idx) {
                     let status = entry.status.lock().unwrap();
-                    if status.enabled && !status.healthy && !added_healthy.contains(idx) && !added_unhealthy.contains(idx) {
+                    if status.enabled
+                        && !status.healthy
+                        && !added_healthy.contains(idx)
+                        && !added_unhealthy.contains(idx)
+                    {
                         unhealthy_candidates.push((*idx, entry.info.clone()));
                         added_unhealthy.insert(*idx);
                     }
@@ -515,8 +562,16 @@ fn calculate_candidates(
                     for &idx in &group.backend_indices {
                         if let Some(entry) = entries.get(idx) {
                             let status = entry.status.lock().unwrap();
-                            if status.enabled && !status.healthy && !added_healthy.contains(&idx) && !added_unhealthy.contains(&idx) {
-                                group_unhealthy.push((idx, entry.info.clone(), status.last_latency));
+                            if status.enabled
+                                && !status.healthy
+                                && !added_healthy.contains(&idx)
+                                && !added_unhealthy.contains(&idx)
+                            {
+                                group_unhealthy.push((
+                                    idx,
+                                    entry.info.clone(),
+                                    status.last_latency,
+                                ));
                             }
                         }
                     }
@@ -584,16 +639,34 @@ impl BackendPool {
             entries.push(entry);
 
             // Spawn refill task for this backend.
-            ancillary_handle.spawn(refill_pool_task(info, enabled_signal, tx, rx, cancel, rt_chg_signal.clone()));
+            ancillary_handle.spawn(refill_pool_task(
+                info,
+                enabled_signal,
+                tx,
+                rx,
+                cancel,
+                rt_chg_signal.clone(),
+            ));
         }
 
-        let (groups, failover_order) = build_groups_and_failover_order(&entries, group_configs, failover_order_cfg);
-        let (cached_healthy, cached_unhealthy) = calculate_candidates(&entries, &groups, &failover_order);
+        let (groups, failover_order) =
+            build_groups_and_failover_order(&entries, group_configs, failover_order_cfg);
+        let (cached_healthy, cached_unhealthy) =
+            calculate_candidates(&entries, &groups, &failover_order);
 
         let cached = Arc::new(ArcSwap::from_pointee(CachedCandidates {
             healthy: cached_healthy.clone(),
             unhealthy: cached_unhealthy.clone(),
         }));
+
+        let hot_paths = entries
+            .iter()
+            .map(|e| BackendHotPath {
+                pool_rx: e.pool_rx.clone(),
+                traffic: Arc::clone(&e.traffic),
+            })
+            .collect::<Vec<_>>();
+        let hot_paths = Arc::new(ArcSwap::from_pointee(hot_paths));
 
         let adblock_manager = Arc::new(crate::adblock::AdBlockManager::new(adblock_config.enabled));
 
@@ -604,6 +677,7 @@ impl BackendPool {
                 failover_order,
             })),
             cached,
+            hot_paths,
             inbound_stats: Arc::new(std::sync::Mutex::new(Vec::new())),
             rt_chg_signal,
             adblock_manager,
@@ -687,7 +761,7 @@ impl BackendPool {
                 // Reuse the existing entry — just update pool_size on the info.
                 // We swap it out of the vec to move it into new_entries.
                 let mut entry = guard.entries.swap_remove(pos);
-                
+
                 let creds_or_pool_changed = entry.info.username != new_info.username
                     || entry.info.password != new_info.password
                     || entry.info.pool_size != new_info.pool_size;
@@ -715,7 +789,14 @@ impl BackendPool {
 
                     let enabled_signal = entry.enabled_tx.subscribe();
                     // Spawn the new refill task with new configuration and channel
-                    self.ancillary_handle.spawn(refill_pool_task(new_info, enabled_signal, tx, rx, new_cancel, entry.rt_chg_signal.clone()));
+                    self.ancillary_handle.spawn(refill_pool_task(
+                        new_info,
+                        enabled_signal,
+                        tx,
+                        rx,
+                        new_cancel,
+                        entry.rt_chg_signal.clone(),
+                    ));
                 }
 
                 new_entries.push(entry);
@@ -740,7 +821,14 @@ impl BackendPool {
                     rt_chg_signal: self.rt_chg_signal.clone(),
                 };
                 new_entries.push(entry);
-                self.ancillary_handle.spawn(refill_pool_task(new_info, enabled_signal, tx, rx, cancel, self.rt_chg_signal.clone()));
+                self.ancillary_handle.spawn(refill_pool_task(
+                    new_info,
+                    enabled_signal,
+                    tx,
+                    rx,
+                    cancel,
+                    self.rt_chg_signal.clone(),
+                ));
                 added += 1;
             }
         }
@@ -751,13 +839,24 @@ impl BackendPool {
             old_entry.cancel.cancel();
         }
 
-        let (groups, failover_order) = build_groups_and_failover_order(&new_entries, group_configs, failover_order_cfg);
-        let (cached_healthy, cached_unhealthy) = calculate_candidates(&new_entries, &groups, &failover_order);
+        let (groups, failover_order) =
+            build_groups_and_failover_order(&new_entries, group_configs, failover_order_cfg);
+        let (cached_healthy, cached_unhealthy) =
+            calculate_candidates(&new_entries, &groups, &failover_order);
 
         self.cached.store(Arc::new(CachedCandidates {
             healthy: cached_healthy.clone(),
             unhealthy: cached_unhealthy.clone(),
         }));
+
+        let hot_paths_vec = new_entries
+            .iter()
+            .map(|e| BackendHotPath {
+                pool_rx: e.pool_rx.clone(),
+                traffic: Arc::clone(&e.traffic),
+            })
+            .collect::<Vec<_>>();
+        self.hot_paths.store(Arc::new(hot_paths_vec));
 
         guard.entries = new_entries;
         guard.groups = groups;
@@ -774,11 +873,11 @@ impl BackendPool {
     ///
     /// Callers must not call `get_traffic_counters` separately; use the returned `Arc` directly.
     /// Returns `None` only if `index` is out of bounds (never happens in practice).
-    pub async fn get_pooled_connection(&self, index: usize) -> Option<PooledConn> {
-        let guard = self.inner.read().await;
-        guard.entries.get(index).map(|e| PooledConn {
-            stream: e.pool_rx.try_recv().ok(),
-            traffic: Arc::clone(&e.traffic),
+    pub fn get_pooled_connection(&self, index: usize) -> Option<PooledConn> {
+        let hot_paths = self.hot_paths.load();
+        hot_paths.get(index).map(|hp| PooledConn {
+            stream: hp.pool_rx.try_recv().ok(),
+            traffic: Arc::clone(&hp.traffic),
         })
     }
 
@@ -786,16 +885,17 @@ impl BackendPool {
     ///
     /// Callers hold this `Arc` across the relay lifetime and update it directly
     /// without taking the pool lock again.
-    pub async fn get_traffic_counters(&self, index: usize) -> Option<Arc<TrafficCounters>> {
-        let guard = self.inner.read().await;
-        guard.entries.get(index).map(|e| Arc::clone(&e.traffic))
+    pub fn get_traffic_counters(&self, index: usize) -> Option<Arc<TrafficCounters>> {
+        let hot_paths = self.hot_paths.load();
+        hot_paths.get(index).map(|hp| Arc::clone(&hp.traffic))
     }
 
     /// Get the info of all backends with their index, current health, and enabled state.
     /// Returns (index, BackendInfo, is_healthy, is_enabled) for each backend in priority order.
     pub async fn get_backends_in_order(&self) -> Vec<(usize, BackendInfo, bool, bool)> {
         let guard = self.inner.read().await;
-        guard.entries
+        guard
+            .entries
             .iter()
             .enumerate()
             .map(|(i, e)| {
@@ -806,9 +906,15 @@ impl BackendPool {
     }
 
     /// Get the order of backends to try, separated into healthy and unhealthy lists.
+    #[allow(dead_code)]
     pub async fn get_candidates(&self) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
         let guard = self.cached.load();
         (guard.healthy.clone(), guard.unhealthy.clone())
+    }
+
+    /// Get a lock-free guard to the cached candidates (avoiding any Arc clone/refcount overhead).
+    pub fn get_candidates_guard(&self) -> arc_swap::Guard<Arc<CachedCandidates>> {
+        self.cached.load()
     }
 
     /// Mark a backend as healthy with measured latency.
@@ -884,19 +990,19 @@ impl BackendPool {
                     break;
                 }
 
-                 // Set the flag via the watch channel
-                 let _ = entry.enabled_tx.send(enabled);
-                 
-                 // Update the status for the health/candidate selection
-                 let mut status = entry.status.lock().unwrap();
-                 status.enabled = enabled;
+                // Set the flag via the watch channel
+                let _ = entry.enabled_tx.send(enabled);
 
-                 if !enabled {
-                     // Drain the connection pool immediately from the control thread.
-                     // This instantly unblocks any blocking `tx.send_async` in the refill task.
-                     while entry.pool_rx.try_recv().is_ok() {}
-                 }
-                
+                // Update the status for the health/candidate selection
+                let mut status = entry.status.lock().unwrap();
+                status.enabled = enabled;
+
+                if !enabled {
+                    // Drain the connection pool immediately from the control thread.
+                    // This instantly unblocks any blocking `tx.send_async` in the refill task.
+                    while entry.pool_rx.try_recv().is_ok() {}
+                }
+
                 changed = true;
                 break;
             }
@@ -925,7 +1031,9 @@ impl BackendPool {
         let guard = self.inner.read().await;
         let mut views = Vec::with_capacity(guard.entries.len());
         for (i, e) in guard.entries.iter().enumerate() {
-            let group_name = guard.groups.iter()
+            let group_name = guard
+                .groups
+                .iter()
                 .find(|g| g.backend_indices.contains(&i))
                 .map(|g| g.name.clone());
 
@@ -955,10 +1063,12 @@ impl BackendPool {
     pub async fn status_tree(&self) -> Vec<TreeItem> {
         let guard = self.inner.read().await;
         let mut tree = Vec::with_capacity(guard.failover_order.len());
-        
+
         let mut views = Vec::with_capacity(guard.entries.len());
         for (i, e) in guard.entries.iter().enumerate() {
-            let group_name = guard.groups.iter()
+            let group_name = guard
+                .groups
+                .iter()
                 .find(|g| g.backend_indices.contains(&i))
                 .map(|g| g.name.clone());
 
@@ -1003,8 +1113,9 @@ impl BackendPool {
                             crate::config::GroupStrategy::Failover => "failover",
                             crate::config::GroupStrategy::UrlTest => "urltest",
                             crate::config::GroupStrategy::LoadBalance => "loadbalance",
-                        }.to_string();
-                        
+                        }
+                        .to_string();
+
                         tree.push(TreeItem::Group {
                             name: group.name.clone(),
                             strategy: strategy_str,
@@ -1014,7 +1125,7 @@ impl BackendPool {
                 }
             }
         }
-        
+
         tree
     }
 }
@@ -1031,7 +1142,10 @@ fn push_history(history: &mut VecDeque<HealthCheckResult>, result: HealthCheckRe
 /// Recalculates and updates the cached candidate list periodically (every 3 seconds)
 /// so that dynamic load balancing states are kept up-to-date with minimal latency
 /// and completely lock-free for the connection handling worker threads.
-pub async fn run_candidate_selector(pool: BackendPool, cancel: tokio_util::sync::CancellationToken) {
+pub async fn run_candidate_selector(
+    pool: BackendPool,
+    cancel: tokio_util::sync::CancellationToken,
+) {
     let interval = std::time::Duration::from_secs(1);
     let mut ticker = tokio::time::interval(interval);
 
@@ -1100,9 +1214,7 @@ async fn refill_pool_task(
         }
 
         // ── Connect (+ optional SOCKS5 auth) ────────────────────────────────
-        let connect = crate::outbound::connect_endpoint(
-            &info.endpoint, info.bind_interface.as_deref(), Duration::from_secs(10),
-        ).await;
+        let connect = crate::outbound::connect_endpoint(&info, Duration::from_secs(10)).await;
         let result = match connect {
             Err(e) => Err(e),
             Ok(stream) if info.is_shadowsocks() => Ok(stream),
@@ -1111,7 +1223,15 @@ async fn refill_pool_task(
 
         match result {
             // ── Success: try to enqueue, but respect signals ─────────────
-            Ok(stream) => {
+            Ok(mut stream) => {
+                #[cfg(target_os = "linux")]
+                {
+                    if crate::relay::ZERO_COPY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(pipes) = crate::relay::create_preallocated_pipes() {
+                            stream.pipes = Some(pipes);
+                        }
+                    }
+                }
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
@@ -1166,6 +1286,7 @@ mod tests {
             name: Some(name.to_string()),
             pool_size: 1,
             bind_interface: None,
+            tls: None,
             enabled: None,
         }
     }
@@ -1177,7 +1298,15 @@ mod tests {
         global_bind_interface: Option<&str>,
     ) -> anyhow::Result<BackendPool> {
         let (_tx, rx) = tokio::sync::watch::channel(0u64);
-        BackendPool::new(configs, group_configs, failover_order_cfg, global_bind_interface, rx, &crate::config::AdBlockConfig::default(), tokio::runtime::Handle::current())
+        BackendPool::new(
+            configs,
+            group_configs,
+            failover_order_cfg,
+            global_bind_interface,
+            rx,
+            &crate::config::AdBlockConfig::default(),
+            tokio::runtime::Handle::current(),
+        )
     }
 
     #[tokio::test]
@@ -1203,9 +1332,13 @@ mod tests {
         let pool = new_test_pool(
             &[b1, b2, b3],
             &[g1, g2],
-            Some(&vec!["group-urltest".to_string(), "group-failover".to_string()]),
+            Some(&vec![
+                "group-urltest".to_string(),
+                "group-failover".to_string(),
+            ]),
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // 1. Initially all backends are healthy by default on startup.
         let (healthy, unhealthy) = pool.get_candidates().await;
@@ -1247,16 +1380,15 @@ mod tests {
                 make_cfg("127.0.0.1:8081", "b1"),
                 make_cfg("127.0.0.1:8082", "b2"),
             ],
-            &[
-                GroupConfig {
-                    name: "group-fo".to_string(),
-                    strategy: GroupStrategy::Failover,
-                    backends: vec!["b2".to_string(), "b1".to_string()],
-                }
-            ],
+            &[GroupConfig {
+                name: "group-fo".to_string(),
+                strategy: GroupStrategy::Failover,
+                backends: vec!["b2".to_string(), "b1".to_string()],
+            }],
             Some(&vec!["group-fo".to_string()]),
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         pool_fo.mark_healthy(0, Duration::from_millis(10)).await; // b1: 10ms
         pool_fo.mark_healthy(1, Duration::from_millis(100)).await; // b2: 100ms
@@ -1280,18 +1412,20 @@ mod tests {
             backends: vec!["b1".to_string(), "b2".to_string()],
         };
 
-        let pool = new_test_pool(
-            &[b1, b2],
-            &[g],
-            Some(&vec!["group-lb".to_string()]),
-            None,
-        ).unwrap();
+        let pool =
+            new_test_pool(&[b1, b2], &[g], Some(&vec!["group-lb".to_string()]), None).unwrap();
 
         // Simulate b1 has more historical connections (total_connections = 10) than b2 (total_connections = 5)
         {
             let guard = pool.inner.read().await;
-            guard.entries[0].traffic.total_connections.store(10, Ordering::Relaxed);
-            guard.entries[1].traffic.total_connections.store(5, Ordering::Relaxed);
+            guard.entries[0]
+                .traffic
+                .total_connections
+                .store(10, Ordering::Relaxed);
+            guard.entries[1]
+                .traffic
+                .total_connections
+                .store(5, Ordering::Relaxed);
         }
 
         // Recalculate candidates (which runs `calculate_candidates` and caches results)
@@ -1306,10 +1440,19 @@ mod tests {
         // Now simulate b2 also getting up to 10 connections, but b1 having fewer active connections
         {
             let guard = pool.inner.read().await;
-            guard.entries[1].traffic.total_connections.store(10, Ordering::Relaxed);
+            guard.entries[1]
+                .traffic
+                .total_connections
+                .store(10, Ordering::Relaxed);
             // b1 active connections = 1, b2 active connections = 2
-            guard.entries[0].traffic.active_connections.store(1, Ordering::Relaxed);
-            guard.entries[1].traffic.active_connections.store(2, Ordering::Relaxed);
+            guard.entries[0]
+                .traffic
+                .active_connections
+                .store(1, Ordering::Relaxed);
+            guard.entries[1]
+                .traffic
+                .active_connections
+                .store(2, Ordering::Relaxed);
         }
 
         pool.recalculate_candidates().await;
@@ -1349,7 +1492,8 @@ mod tests {
             &[g1, g2],
             None, // No explicit failover order
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 3);
@@ -1375,7 +1519,8 @@ mod tests {
             &[g1.clone()],
             Some(&vec!["group-1".to_string()]),
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 1);
@@ -1388,12 +1533,15 @@ mod tests {
             backends: vec!["b1".to_string(), "b2".to_string()],
         };
 
-        let (added, removed, kept) = pool.reload(
-            &[b1, b2],
-            &[g1_new],
-            Some(&vec!["group-1".to_string()]),
-            None,
-        ).await.unwrap();
+        let (added, removed, kept) = pool
+            .reload(
+                &[b1, b2],
+                &[g1_new],
+                Some(&vec!["group-1".to_string()]),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(added, 1);
         assert_eq!(removed, 0);
@@ -1409,12 +1557,7 @@ mod tests {
     async fn test_reload_restarts_refill_task_on_config_change() {
         let b1 = make_cfg("127.0.0.1:8081", "b1");
 
-        let pool = new_test_pool(
-            &[b1.clone()],
-            &[],
-            None,
-            None,
-        ).unwrap();
+        let pool = new_test_pool(&[b1.clone()], &[], None, None).unwrap();
 
         let original_cancel = {
             let guard = pool.inner.read().await;
@@ -1432,15 +1575,11 @@ mod tests {
             name: Some("b1".to_string()),
             pool_size: 3,
             bind_interface: None,
+            tls: None,
             enabled: None,
         };
 
-        let (added, removed, kept) = pool.reload(
-            &[b1_updated],
-            &[],
-            None,
-            None,
-        ).await.unwrap();
+        let (added, removed, kept) = pool.reload(&[b1_updated], &[], None, None).await.unwrap();
 
         assert_eq!(added, 0);
         assert_eq!(removed, 0);
@@ -1452,7 +1591,7 @@ mod tests {
         assert_eq!(guard.entries[0].info.password.as_deref(), Some("new-pass"));
 
         let new_cancel = guard.entries[0].cancel.clone();
-        
+
         // Assert the old refill task cancellation token is cancelled
         assert!(original_cancel.is_cancelled());
         // Assert the new refill task cancellation token is NOT cancelled
@@ -1468,18 +1607,19 @@ mod tests {
         b2.bind_interface = Some("eno1".to_string());
 
         // Pool constructed with a global bind interface "eno0"
-        let pool = new_test_pool(
-            &[b1, b2],
-            &[],
-            None,
-            Some("eno0"),
-        ).unwrap();
+        let pool = new_test_pool(&[b1, b2], &[], None, Some("eno0")).unwrap();
 
         let guard = pool.inner.read().await;
         // b1 should resolve to the global bind interface "eno0"
-        assert_eq!(guard.entries[0].info.bind_interface.as_deref(), Some("eno0"));
+        assert_eq!(
+            guard.entries[0].info.bind_interface.as_deref(),
+            Some("eno0")
+        );
         // b2 should resolve to the backend-specific bind interface "eno1" (override)
-        assert_eq!(guard.entries[1].info.bind_interface.as_deref(), Some("eno1"));
+        assert_eq!(
+            guard.entries[1].info.bind_interface.as_deref(),
+            Some("eno1")
+        );
     }
 
     #[tokio::test]
@@ -1487,12 +1627,7 @@ mod tests {
         let b1 = make_cfg("127.0.0.1:8081", "b1");
         let b2 = make_cfg("127.0.0.1:8082", "b2");
 
-        let pool = new_test_pool(
-            &[b1, b2],
-            &[],
-            None,
-            None,
-        ).unwrap();
+        let pool = new_test_pool(&[b1, b2], &[], None, None).unwrap();
 
         // 1. Initially, both should be enabled and in candidates list.
         let (healthy, _) = pool.get_candidates().await;
@@ -1520,7 +1655,10 @@ mod tests {
         assert_eq!(healthy[1].1.name, "b2");
 
         // 4. Try enabling/disabling a non-existent backend
-        let found = pool.set_backend_enabled("nonexistent", false).await.unwrap();
+        let found = pool
+            .set_backend_enabled("nonexistent", false)
+            .await
+            .unwrap();
         assert!(!found);
     }
 
@@ -1535,6 +1673,7 @@ mod tests {
             name: None,
             pool_size: 1,
             bind_interface: None,
+            tls: None,
             enabled: None,
         };
         let info = BackendInfo::from_config(&cfg_s5, 0, None).unwrap();
@@ -1552,6 +1691,7 @@ mod tests {
             name: None,
             pool_size: 1,
             bind_interface: None,
+            tls: None,
             enabled: None,
         };
         let info = BackendInfo::from_config(&cfg_ss, 0, None).unwrap();
@@ -1569,6 +1709,7 @@ mod tests {
             name: None,
             pool_size: 1,
             bind_interface: None,
+            tls: None,
             enabled: None,
         };
         let info = BackendInfo::from_config(&cfg_legacy, 0, None).unwrap();
@@ -1586,6 +1727,7 @@ mod tests {
             name: None,
             pool_size: 1,
             bind_interface: None,
+            tls: None,
             enabled: None,
         };
         let info = BackendInfo::from_config(&cfg_tcp, 0, None).unwrap();

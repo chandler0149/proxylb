@@ -1,0 +1,6 @@
+# Exclude the local Rust build directory
+target/
+
+# Exclude local environment files or IDE settings
+.env
+.vscode/

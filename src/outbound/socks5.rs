@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::backend::BackendInfo;
 use super::{BackendStream, TargetAddr};
+use crate::backend::BackendInfo;
 
 /// SOCKS5 protocol constants.
 const SOCKS5_VERSION: u8 = 0x05;
@@ -27,11 +27,10 @@ pub async fn socks5h_connect(
     target: &TargetAddr,
     timeout: Duration,
 ) -> io::Result<BackendStream> {
-    let stream = crate::outbound::connect_endpoint(&backend.endpoint, backend.bind_interface.as_deref(), timeout).await?;
+    let stream = crate::outbound::connect_endpoint(backend, timeout).await?;
     let stream = socks5h_authenticate(stream, backend).await?;
     socks5h_connect_target(stream, target).await
 }
-
 
 /// Phase 1: SOCKS5 auth negotiation on an already-connected stream.
 pub async fn socks5h_authenticate<S>(mut stream: S, backend: &BackendInfo) -> io::Result<S>
@@ -113,8 +112,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // === Step 2: CONNECT request ===
-    let connect_req = build_connect_request(target);
-    stream.write_all(&connect_req).await?;
+    let mut req = [0u8; 262];
+    let req_len = build_connect_request_buf(target, &mut req)?;
+    stream.write_all(&req[..req_len]).await?;
     stream.flush().await?;
 
     // === Step 3: Read CONNECT response ===
@@ -130,7 +130,10 @@ where
     if resp_header[1] != 0x00 {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
-            format!("SOCKS5 CONNECT failed with reply code: {:#x}", resp_header[1]),
+            format!(
+                "SOCKS5 CONNECT failed with reply code: {:#x}",
+                resp_header[1]
+            ),
         ));
     }
 
@@ -147,8 +150,9 @@ where
         ATYP_DOMAIN => {
             let mut len_buf = [0u8; 1];
             stream.read_exact(&mut len_buf).await?;
-            let mut skip = vec![0u8; len_buf[0] as usize + 2]; // domain + port
-            stream.read_exact(&mut skip).await?;
+            let skip_len = len_buf[0] as usize + 2;
+            let mut skip = [0u8; 257]; // Max domain length is 255 + 2 bytes for port
+            stream.read_exact(&mut skip[..skip_len]).await?;
         }
         _ => {
             return Err(io::Error::new(
@@ -161,42 +165,48 @@ where
     Ok(stream)
 }
 
-/// Build a SOCKS5 CONNECT request packet.
-fn build_connect_request(target: &TargetAddr) -> Vec<u8> {
+/// Build a SOCKS5 CONNECT request packet into a pre-allocated stack buffer.
+fn build_connect_request_buf(target: &TargetAddr, buf: &mut [u8]) -> io::Result<usize> {
     match target {
         TargetAddr::Domain(host, port) => {
             let host_bytes = host.as_bytes();
-            let mut req = Vec::with_capacity(7 + host_bytes.len());
-            req.push(SOCKS5_VERSION);
-            req.push(CMD_CONNECT);
-            req.push(0x00); // RSV
-            req.push(ATYP_DOMAIN);
-            req.push(host_bytes.len() as u8);
-            req.extend_from_slice(host_bytes);
-            req.push((port >> 8) as u8);
-            req.push(*port as u8);
-            req
+            if host_bytes.len() > 255 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "domain name too long for SOCKS5",
+                ));
+            }
+            buf[0] = SOCKS5_VERSION;
+            buf[1] = CMD_CONNECT;
+            buf[2] = 0x00; // RSV
+            buf[3] = ATYP_DOMAIN;
+            buf[4] = host_bytes.len() as u8;
+            buf[5..5 + host_bytes.len()].copy_from_slice(host_bytes);
+            let port_idx = 5 + host_bytes.len();
+            buf[port_idx] = (port >> 8) as u8;
+            buf[port_idx + 1] = *port as u8;
+            Ok(port_idx + 2)
         }
         TargetAddr::Ip(addr) => {
-            let mut req = Vec::with_capacity(10);
-            req.push(SOCKS5_VERSION);
-            req.push(CMD_CONNECT);
-            req.push(0x00); // RSV
+            buf[0] = SOCKS5_VERSION;
+            buf[1] = CMD_CONNECT;
+            buf[2] = 0x00; // RSV
             match addr {
                 SocketAddr::V4(v4) => {
-                    req.push(ATYP_IPV4);
-                    req.extend_from_slice(&v4.ip().octets());
-                    req.push((v4.port() >> 8) as u8);
-                    req.push(v4.port() as u8);
+                    buf[3] = ATYP_IPV4;
+                    buf[4..8].copy_from_slice(&v4.ip().octets());
+                    buf[8] = (v4.port() >> 8) as u8;
+                    buf[9] = v4.port() as u8;
+                    Ok(10)
                 }
                 SocketAddr::V6(v6) => {
-                    req.push(ATYP_IPV6);
-                    req.extend_from_slice(&v6.ip().octets());
-                    req.push((v6.port() >> 8) as u8);
-                    req.push(v6.port() as u8);
+                    buf[3] = ATYP_IPV6;
+                    buf[4..20].copy_from_slice(&v6.ip().octets());
+                    buf[20] = (v6.port() >> 8) as u8;
+                    buf[21] = v6.port() as u8;
+                    Ok(22)
                 }
             }
-            req
         }
     }
 }

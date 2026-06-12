@@ -11,13 +11,13 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::backend::BackendPool;
-use crate::outbound::{TargetAddr, BackendStream};
+use crate::outbound::{BackendStream, TargetAddr};
 
 /// A node in the domain suffix Trie.
 #[derive(Default)]
@@ -199,34 +199,50 @@ async fn connect_via_backend(
     };
 
     let backends = pool.get_backends_in_order().await;
-    let found = backends.into_iter().find(|(_, info, _, _)| info.name == name);
+    let found = backends
+        .into_iter()
+        .find(|(_, info, _, _)| info.name == name);
 
     if let Some((index, info, _healthy, _enabled)) = found {
         if info.is_direct() {
-            return Ok(crate::outbound::direct_connect(target, timeout, info.bind_interface.as_deref()).await?);
+            return Ok(crate::outbound::direct_connect(
+                target,
+                timeout,
+                info.bind_interface.as_deref(),
+            )
+            .await?);
         } else if info.is_shadowsocks() {
             let ss_cfg = info.ss_config.as_ref().unwrap();
             let ss_ctx = info.ss_context.as_ref().unwrap().clone();
-            let pc = pool.get_pooled_connection(index).await;
+            let pc = pool.get_pooled_connection(index);
             match pc {
-                Some(crate::backend::PooledConn { stream: Some(pooled), .. }) => {
-                    return Ok(crate::outbound::ss_connect_pooled(pooled, ss_cfg, ss_ctx, target));
+                Some(crate::backend::PooledConn {
+                    stream: Some(pooled),
+                    ..
+                }) => {
+                    return Ok(crate::outbound::ss_connect_pooled(
+                        pooled, ss_cfg, ss_ctx, target,
+                    ));
                 }
                 _ => {
-                    return Ok(crate::outbound::ss_connect_fresh(&info.endpoint, ss_cfg, ss_ctx, target, timeout, info.bind_interface.as_deref()).await?);
+                    return Ok(crate::outbound::ss_connect_fresh(
+                        &info, ss_cfg, ss_ctx, target, timeout,
+                    )
+                    .await?);
                 }
             }
         } else {
-            let pc = pool.get_pooled_connection(index).await;
+            let pc = pool.get_pooled_connection(index);
             match pc {
-                Some(crate::backend::PooledConn { stream: Some(pooled), .. }) => {
-                    match crate::outbound::socks5h_connect_target(pooled, target).await {
-                        Ok(s) => return Ok(s),
-                        Err(_) => {
-                            return Ok(crate::outbound::socks5h_connect(&info, target, timeout).await?);
-                        }
+                Some(crate::backend::PooledConn {
+                    stream: Some(pooled),
+                    ..
+                }) => match crate::outbound::socks5h_connect_target(pooled, target).await {
+                    Ok(s) => return Ok(s),
+                    Err(_) => {
+                        return Ok(crate::outbound::socks5h_connect(&info, target, timeout).await?);
                     }
-                }
+                },
                 _ => {
                     return Ok(crate::outbound::socks5h_connect(&info, target, timeout).await?);
                 }
@@ -249,14 +265,23 @@ async fn download_url(
     const MAX_REDIRECTS: usize = 5;
 
     loop {
-        let host = url.host_str().ok_or_else(|| anyhow::anyhow!("missing host in URL"))?.to_string();
-        let port = url.port_or_known_default().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("missing host in URL"))?
+            .to_string();
+        let port = url
+            .port_or_known_default()
+            .unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
         let target = TargetAddr::Domain(host.clone(), port);
         let timeout = Duration::from_secs(15);
 
         let stream = connect_via_backend(pool, backend_name, &target, timeout).await?;
 
-        let path = if url.path().is_empty() { "/" } else { url.path() };
+        let path = if url.path().is_empty() {
+            "/"
+        } else {
+            url.path()
+        };
         let path_with_query = if let Some(query) = url.query() {
             format!("{}?{}", path, query)
         } else {
@@ -279,8 +304,9 @@ async fn download_url(
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
             let connector = TlsConnector::from(Arc::new(config));
-            let domain = ServerName::try_from(host)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid DNS name"))?;
+            let domain = ServerName::try_from(host).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid DNS name")
+            })?;
             let mut tls_stream = connector.connect(domain, stream).await?;
 
             tls_stream.write_all(request.as_bytes()).await?;
@@ -307,7 +333,10 @@ async fn download_url(
     }
 }
 
-fn parse_http_redirect(response_buf: &[u8], current_url: &Url) -> Result<Option<Url>, anyhow::Error> {
+fn parse_http_redirect(
+    response_buf: &[u8],
+    current_url: &Url,
+) -> Result<Option<Url>, anyhow::Error> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut resp = httparse::Response::new(&mut headers);
     let status = resp.parse(response_buf)?;
@@ -455,12 +484,30 @@ mod tests {
     fn test_rule_parser() {
         assert_eq!(parse_rule_line("! comment"), None);
         assert_eq!(parse_rule_line("# comment"), None);
-        assert_eq!(parse_rule_line("||example.org^"), Some(("example.org".to_string(), false)));
-        assert_eq!(parse_rule_line("@@||example.org^"), Some(("example.org".to_string(), true)));
-        assert_eq!(parse_rule_line("127.0.0.1 badsite.com"), Some(("badsite.com".to_string(), false)));
-        assert_eq!(parse_rule_line("0.0.0.0   badsite.com"), Some(("badsite.com".to_string(), false)));
-        assert_eq!(parse_rule_line("badsite.com"), Some(("badsite.com".to_string(), false)));
-        assert_eq!(parse_rule_line("||example.org^$third-party"), Some(("example.org".to_string(), false)));
+        assert_eq!(
+            parse_rule_line("||example.org^"),
+            Some(("example.org".to_string(), false))
+        );
+        assert_eq!(
+            parse_rule_line("@@||example.org^"),
+            Some(("example.org".to_string(), true))
+        );
+        assert_eq!(
+            parse_rule_line("127.0.0.1 badsite.com"),
+            Some(("badsite.com".to_string(), false))
+        );
+        assert_eq!(
+            parse_rule_line("0.0.0.0   badsite.com"),
+            Some(("badsite.com".to_string(), false))
+        );
+        assert_eq!(
+            parse_rule_line("badsite.com"),
+            Some(("badsite.com".to_string(), false))
+        );
+        assert_eq!(
+            parse_rule_line("||example.org^$third-party"),
+            Some(("example.org".to_string(), false))
+        );
     }
 
     #[test]
@@ -480,7 +527,7 @@ mod tests {
     #[test]
     fn test_adblock_performance_benchmark() {
         let mut engine = AdBlockEngine::new();
-        
+
         // Add 10,000 dummy rules
         for i in 0..10000 {
             engine.insert(&format!("bad-domain-{}.com", i), false);

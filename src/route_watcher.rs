@@ -48,27 +48,25 @@ pub fn start_route_watcher(
     ancillary_handle: &tokio::runtime::Handle,
     tx: tokio::sync::watch::Sender<u64>,
 ) {
-    ancillary_handle.spawn_blocking(move || {
-        unsafe {
-            let fd = libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC);
-            if fd < 0 {
-                tracing::warn!("Failed to create routing socket for route monitoring");
-                return;
-            }
+    ancillary_handle.spawn_blocking(move || unsafe {
+        let fd = libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_UNSPEC);
+        if fd < 0 {
+            tracing::warn!("Failed to create routing socket for route monitoring");
+            return;
+        }
 
-            let mut epoch = 0u64;
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
-                if n <= 0 {
-                    libc::close(fd);
-                    break;
-                }
-                epoch += 1;
-                if tx.send(epoch).is_err() {
-                    libc::close(fd);
-                    break;
-                }
+        let mut epoch = 0u64;
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
+            if n <= 0 {
+                libc::close(fd);
+                break;
+            }
+            epoch += 1;
+            if tx.send(epoch).is_err() {
+                libc::close(fd);
+                break;
             }
         }
     });
@@ -78,4 +76,5 @@ pub fn start_route_watcher(
 pub fn start_route_watcher(
     _ancillary_handle: &tokio::runtime::Handle,
     _tx: tokio::sync::watch::Sender<u64>,
-) {}
+) {
+}

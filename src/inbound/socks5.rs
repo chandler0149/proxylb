@@ -4,130 +4,119 @@
 //! command execution disabled — we intercept the target address and
 //! forward through our SOCKS5h backend pool instead of connecting directly.
 
-#[allow(deprecated)]
-use fast_socks5::server::{Config, DenyAuthentication, Socks5Socket};
-use fast_socks5::util::target_addr::TargetAddr as FastTargetAddr;
 use fast_socks5::consts;
+#[allow(deprecated)]
+use fast_socks5::server::{Config, DenyAuthentication, SimpleUserPassword, Socks5Socket};
+use fast_socks5::util::target_addr::TargetAddr as FastTargetAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, UnixListener};
+use tokio_util::sync::CancellationToken;
 
+use super::BoundListener;
 use crate::backend::BackendPool;
 use crate::outbound::TargetAddr;
+use crate::relay::AsRawStreamRef;
+use crate::tls::MaybeTlsStream;
 
-
-/// Run SOCKS5 inbound over a Unix domain socket.
-pub async fn run_socks5_uds_inbound(
-    listen_path: String,
-    pool: BackendPool,
-    stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
-) -> anyhow::Result<()> {
-    if let Some(parent) = std::path::Path::new(&listen_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if std::fs::metadata(&listen_path).is_ok() {
-        let _ = std::fs::remove_file(&listen_path);
-    }
-
-    let listener = UnixListener::bind(&listen_path)?;
-    tracing::info!(listen = %listen_path, "SOCKS5 UDS inbound listener started");
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, client_addr)) => {
-                let pool = pool.clone();
-                let stats = Arc::clone(&stats);
-                tokio::spawn(async move {
-                    if let Err(e) = handle_socks5_connection(stream, pool, stats, filter_enabled).await {
-                        tracing::debug!(
-                            client = ?client_addr,
-                            error = %e,
-                            "SOCKS5 UDS connection failed"
-                        );
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "SOCKS5 UDS accept error");
-            }
-        }
-    }
-}
-
-/// Run SOCKS5 inbound over TCP.
-pub async fn run_socks5_tcp_inbound(
-    listen_addr: String,
-    pool: BackendPool,
-    stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
-) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(&listen_addr).await?;
-    tracing::info!(listen = %listen_addr, "SOCKS5 TCP inbound listener started");
-
-    loop {
-        match listener.accept().await {
-            Ok((stream, client_addr)) => {
-                let pool = pool.clone();
-                let stats = Arc::clone(&stats);
-                tokio::spawn(async move {
-                    let _ = stream.set_nodelay(true);
-                    if let Err(e) = handle_socks5_connection(stream, pool, stats, filter_enabled).await {
-                        tracing::debug!(
-                            client = %client_addr,
-                            error = %e,
-                            "SOCKS5 TCP connection failed"
-                        );
-                    }
-                });
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "SOCKS5 TCP accept error");
-            }
-        }
-    }
-}
-
-/// Run the SOCKS5 inbound listener.
+/// Run the SOCKS5 inbound listener (TCP or UDS, selected by address prefix).
 pub async fn run_socks5_inbound(
     listen_addr: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
+    tls_cfg: Option<crate::config::TlsServerConfig>,
+    username: Option<String>,
+    password: Option<String>,
+    cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    if let Some(path) = listen_addr.strip_prefix("unix://") {
-        run_socks5_uds_inbound(path.to_string(), pool, stats, filter_enabled).await
-    } else {
-        run_socks5_tcp_inbound(listen_addr, pool, stats, filter_enabled).await
-    }
+    let tls_acceptor = tls_cfg
+        .as_ref()
+        .map(|c| crate::tls::create_tls_acceptor(c))
+        .transpose()?
+        .map(Arc::new);
+    let username = username.map(Arc::new);
+    let password = password.map(Arc::new);
+
+    let listener = BoundListener::bind(&listen_addr).await?;
+    tracing::info!(listen = %listen_addr, "SOCKS5 inbound listener started");
+
+    crate::inbound::run_accept_loop(listener, cancel, "SOCKS5", move |stream, addr| {
+        let pool = pool.clone();
+        let stats = Arc::clone(&stats);
+        let tls_acceptor = tls_acceptor.clone();
+        let username = username.clone();
+        let password = password.clone();
+        async move {
+            if let Err(e) = handle_socks5_connection(
+                stream,
+                pool,
+                stats,
+                filter_enabled,
+                tls_acceptor.as_deref().cloned(),
+                username,
+                password,
+            )
+            .await
+            {
+                tracing::debug!(client = %addr, error = %e, "SOCKS5 connection failed");
+            }
+        }
+    })
+    .await
 }
 
 /// Handle a single SOCKS5 connection.
-///
-/// We use fast-socks5 with `execute_command = false` and `dns_resolve = false`
-/// so it performs the auth handshake and reads the CONNECT request, but does NOT
-/// connect to the target or do DNS resolution. We then take the target address
-/// and forward through our SOCKS5h backend pool instead of connecting directly.
-/// 
-
 #[allow(deprecated)]
 async fn handle_socks5_connection<S>(
     stream: S,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    username: Option<Arc<String>>,
+    password: Option<Arc<String>>,
 ) -> anyhow::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
 {
-    // Configure fast-socks5 to NOT execute the command or resolve DNS.
+    // Apply TLS if configured.
+    let stream = if let Some(ref acceptor) = tls_acceptor {
+        let tls_stream = acceptor.accept(stream).await?;
+        MaybeTlsStream::Tls(tls_stream)
+    } else {
+        MaybeTlsStream::Plain(stream)
+    };
 
-    let mut config = Config::<DenyAuthentication>::default();
-    config.set_execute_command(false);
-    config.set_dns_resolve(false);
+    if let (Some(u), Some(p)) = (username, password) {
+        let mut config = Config::<DenyAuthentication>::default();
+        config.set_execute_command(false);
+        config.set_dns_resolve(false);
+        let config = config.with_authentication(SimpleUserPassword {
+            username: u.as_ref().clone(),
+            password: p.as_ref().clone(),
+        });
+        let socks5_socket = Socks5Socket::new(stream, std::sync::Arc::new(config));
+        handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled).await
+    } else {
+        let mut config = Config::<DenyAuthentication>::default();
+        config.set_execute_command(false);
+        config.set_dns_resolve(false);
+        let socks5_socket = Socks5Socket::new(stream, std::sync::Arc::new(config));
+        handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled).await
+    }
+}
 
-    let socks5_socket = Socks5Socket::new(stream, std::sync::Arc::new(config));
-
+#[allow(deprecated)]
+async fn handle_socks5_handshake<S, A>(
+    socks5_socket: Socks5Socket<S, A>,
+    pool: BackendPool,
+    stats: Arc<crate::backend::InboundStats>,
+    filter_enabled: bool,
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
+    A: fast_socks5::server::Authentication + Send + Sync + 'static,
+{
     // Perform the SOCKS5 handshake (auth + read command), but don't connect.
     let socks5_socket = socks5_socket
         .upgrade_to_socks5()
@@ -155,7 +144,7 @@ where
     if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
         tracing::warn!(target = %target, "SOCKS5 connection rejected: private target");
         let mut client_stream = socks5_socket.into_inner();
-        let reply = build_socks5_reply(consts::SOCKS5_REPLY_CONNECTION_NOT_ALLOWED); // Connection not allowed by ruleset
+        let reply = build_socks5_reply(consts::SOCKS5_REPLY_CONNECTION_NOT_ALLOWED);
         let _ = client_stream.write_all(&reply).await;
         return Ok(());
     }
@@ -168,30 +157,35 @@ where
         return Ok(());
     }
 
-
     // Get the raw stream back from the socks5 socket.
     let mut client_stream = socks5_socket.into_inner();
 
-
     // Try backends in order with fallback.
-    let (backend_stream, chosen_traffic) = match crate::inbound::route_and_connect(&pool, &target).await {
-        Ok((s, t)) => (s, t),
-        Err(e) => {
-            tracing::warn!(target = %target, error = %e, "all backends failed");
-            let reply = build_socks5_reply(consts::SOCKS5_REPLY_HOST_UNREACHABLE);
-            let _ = client_stream.write_all(&reply).await;
-            return Ok(());
-        }
-    };
-
+    let (backend_stream, chosen_traffic) =
+        match crate::inbound::route_and_connect(&pool, &target).await {
+            Ok((s, t)) => (s, t),
+            Err(e) => {
+                tracing::warn!(target = %target, error = %e, "all backends failed");
+                let reply = build_socks5_reply(consts::SOCKS5_REPLY_HOST_UNREACHABLE);
+                let _ = client_stream.write_all(&reply).await;
+                return Ok(());
+            }
+        };
 
     // Send SOCKS5 success reply to the client.
     let reply = build_socks5_reply(consts::SOCKS5_REPLY_SUCCEEDED);
     client_stream.write_all(&reply).await?;
     client_stream.flush().await?;
 
-    crate::inbound::relay_and_track(client_stream, backend_stream, chosen_traffic, Some(stats), &target, "SOCKS5").await
-
+    crate::inbound::relay_and_track(
+        client_stream,
+        backend_stream,
+        chosen_traffic,
+        Some(stats),
+        &target,
+        "SOCKS5",
+    )
+    .await
 }
 
 /// Build a minimal SOCKS5 reply: VER=5, REP, RSV=0, ATYP=IPv4, BND.ADDR=0.0.0.0, BND.PORT=0
@@ -202,7 +196,7 @@ fn build_socks5_reply(reply_code: u8) -> [u8; 10] {
         0x00,       // RSV
         0x01,       // ATYP = IPv4
         0, 0, 0, 0, // BND.ADDR = 0.0.0.0
-        0, 0,       // BND.PORT = 0
+        0, 0, // BND.PORT = 0
     ]
 }
 
