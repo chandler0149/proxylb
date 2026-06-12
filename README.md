@@ -1,5 +1,7 @@
 # ProxyLB
 
+[English](README.md) | [简体中文](README_zh.md)
+
 ProxyLB is an ultra-high-performance, feature-rich proxy load balancer and traffic router written in Rust. It acts as an intermediary gateway supporting SOCKS5, Shadowsocks, and HTTP inbound protocols, routing client traffic through a pool of configurable outbound backends with advanced load balancing strategies, real-time health checks, zero-downtime hot reloading, and built-in domain filtering.
 
 ![web](./web/web.jpg)
