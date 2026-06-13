@@ -52,6 +52,62 @@ What makes it fast:
 
 ---
 
+## 🛠️ Usage Scenarios
+
+### Scenario 1: Highly Reliable Proxy Gateway
+
+The most common use case is utilizing tools like sing-box, Hysteria, or Mihomo as backends connected to different VPSs, while ProxyLB provides a unified SOCKS5/Shadowsocks gateway for highly reliable network services.
+
+ProxyLB and the backends can be deployed on different machines or on the same machine depending on the situation:
+
+- **ProxyLB and sing-box deployed on different machines, communicating over the network:**
+  * Since ProxyLB supports connection pooling, it effectively reduces the handshake latency between ProxyLB and the backends.
+  * My friend's deployment method: Deploy ProxyLB on a public cloud to provide a stable entry point, then connect via WireGuard to the home machine running sing-box/Hysteria/Mihomo.
+
+- **ProxyLB and sing-box deployed on the same machine, communicating via Unix Domain Sockets (UDS):**
+  * Using domain sockets bypasses the network protocol stack, yielding better performance.
+  * My friend's deployment method:
+    - Deploy ProxyLB on a software router.
+    - Use frp to expose ProxyLB's UDS inbound to the public network, allowing mobile devices to connect via the frp server when away from home.
+    - When at home, connect phones and computers directly to ProxyLB's SOCKS5 inbound.
+
+Since sing-box and Hysteria do not natively support domain sockets, you will need to use my modified versions. For details, refer to:
+
+- sing-box: https://github.com/chandler0149/sing-box 
+- Hysteria: https://github.com/chandler0149/hysteria
+
+
+### Scenario 2: SOCKS5 Load Balancer
+
+```
+                                                 +-------+                  
+                                                 |       |                  
+                                  +-------------->singbox+----------------> 
+                                  |              |       |                  
+                |                 |              +-------+                  
+                |                 |                                         
+                | shadowsocks     |                                         
+      UDS/TCP   |                 |                                         
+                |                 |                                         
+                |             +---+-----+        +-------+                  
+  socks5        +------------>|         |        |       |                  
+----------------------------->| proxylb +-------->singbox+----------------> 
+                +------------>|         |        |       |                  
+                |             +---+-----+        +-------+                  
+                |                 |                                         
+                |                 |                                         
+                |                 |                                         
+                |  http           |                                         
+                |                 |              +-------+                  
+                |                 |              |       |                  
+                |                 +-------------->hysteri+----------------->
+                                                 |       |                  
+                                                 +-------+                  
+
+```
+
+---
+
 ## ⚙️ Configuration
 
 ```yaml

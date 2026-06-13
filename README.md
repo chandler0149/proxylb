@@ -54,6 +54,60 @@ Linux dev 6.12.85+deb13-arm64 aarch64 GNU/Linux
 
 ---
 
+## 🛠️ 使用场景
+
+### 场景1: 提供高可靠的代理入口
+
+最常见的使用场景是，将singbox/hysteria/mihomo等工具作为后端，这些后端可以接入不同的VPS，然后proxylb对外提供一个统一的socks5/shadowsocks入口，提供搞可靠的网络服务。
+
+proxylb跟后端可以根据情况部署在不同机器或同一台机器上
+
+- proxylb和singbox部署在不同机器上，两者然后通过网络连接。
+  * 由于proxylb支持连接池，可以有效的减少proxylb跟后端之间的握手延迟。
+  * 我朋友的部署方式： 将proxylb部署到公有云上，提供稳定的入口，然后通过wireguard连接到家里装有singbox/hysteria/mihomo的机器。
+
+- proxylb和singbox部署到同一台机器上，然后通过domain socket连接。
+  * domain socket避免了经过网络协议栈，性能更好。
+  * 我朋友的部署方式：
+    - proxylb部署到一台软路由上
+    - 使用frp将proxylb的domain socket入站暴露到公网，出门在外手机连接到frp服务器。
+    - 在家手机电脑直接连接到proxylb的socks5入站即可。
+
+singbox和hysteria原生不支持domain socket，需要使用我修改过的版本，具体可以参考:
+
+- singbox: https://github.com/chandler0149/sing-box 
+- hysteria: https://github.com/chandler0149/hysteria
+
+
+### 场景2: socks5负载均衡器
+
+```
+                                                 +-------+                  
+                                                 |       |                  
+                                  +-------------->singbox+----------------> 
+                                  |              |       |                  
+                |                 |              +-------+                  
+                |                 |                                         
+                | shadowsocks     |                                         
+      UDS/TCP   |                 |                                         
+                |                 |                                         
+                |             +---+-----+        +-------+                  
+  socks5        +------------>|         |        |       |                  
+----------------------------->| proxylb +-------->singbox+----------------> 
+                +------------>|         |        |       |                  
+                |             +---+-----+        +-------+                  
+                |                 |                                         
+                |                 |                                         
+                |                 |                                         
+                |  http           |                                         
+                |                 |              +-------+                  
+                |                 |              |       |                  
+                |                 +-------------->hysteri+----------------->
+                                                 |       |                  
+                                                 +-------+                  
+
+```
+
 ## ⚙️ 配置示例
 
 ```yaml
