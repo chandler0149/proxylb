@@ -53,7 +53,7 @@ bench: release
 	@./target/release/proxylb -c ./bench/bench_config.yaml --log-level info > bench.log 2>&1 &
 	@sleep 1
 	@echo "Running Rust SOCKS5 CPS benchmark..."
-	@taskset -c 4,5,6 ./target/release/benchmark_cps --proxy-host 127.0.0.1 --proxy-port 1080 --target-host 127.0.0.1 --target-port 10800 --concurrency 300 --duration 10
+	@taskset -c 5 ./target/release/benchmark_cps --proxy-host 127.0.0.1 --proxy-port 1080 --target-host 127.0.0.1 --target-port 10800 --concurrency 300 --duration 10
 	@echo "Cleaning up processes..."
 	@killall -9 proxylb || true
 	@killall -9 dummy_uds_backend || true

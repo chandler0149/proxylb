@@ -144,8 +144,6 @@ where
     Ok(())
 }
 
-
-
 /// Branch prediction hint: indicates that `b` is highly likely to be true.
 #[inline(always)]
 pub fn likely(b: bool) -> bool {
@@ -308,18 +306,26 @@ pub async fn route_and_connect(
     }
 }
 
-/// Generic, high-performance bidirectional relay with unified traffic counter tracking and clean stream shutdown.
-pub async fn relay_and_track<I, B>(
+/// High-performance bidirectional relay with unified traffic counter tracking and clean stream shutdown.
+///
+/// After the relay completes, both streams are handed off to the fd-closer thread
+/// (via [`crate::relay::defer_drop`]) so that `close(2)` / TCP teardown for both
+/// the inbound client socket and the backend socket never runs on a tokio worker thread.
+pub async fn relay_and_track<I>(
     mut inbound_stream: I,
-    mut backend_stream: B,
+    mut backend_stream: crate::outbound::BackendStream,
     traffic: Arc<crate::backend::TrafficCounters>,
     inbound_stats: Option<Arc<crate::backend::InboundStats>>,
     target: &TargetAddr,
     protocol_name: &str,
 ) -> Result<(), anyhow::Error>
 where
-    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + crate::relay::AsRawStreamRef,
-    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + crate::relay::AsRawStreamRef,
+    I: tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + Unpin
+        + crate::relay::AsRawStreamRef
+        + Send
+        + 'static,
 {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncWriteExt;
@@ -362,8 +368,13 @@ where
         stats.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
+    // Flush the write-halves so peers see a clean EOF before we release the FDs.
     let _ = inbound_stream.shutdown().await;
     let _ = backend_stream.shutdown().await;
+
+    // Defer both close(2) calls to the fd-closer thread — off the worker runtime.
+    crate::relay::defer_drop(inbound_stream);
+    crate::relay::defer_drop(backend_stream);
 
     Ok(())
 }

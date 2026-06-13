@@ -1227,8 +1227,11 @@ async fn refill_pool_task(
                 #[cfg(target_os = "linux")]
                 {
                     if crate::relay::ZERO_COPY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-                        if let Some(pipes) = crate::relay::create_preallocated_pipes() {
-                            stream.pipes = Some(pipes);
+                        use crate::relay::AsRawStreamRef;
+                        if let Some(_) = stream.as_raw_stream_ref() {
+                            if let Some(pipes) = crate::relay::create_preallocated_pipes() {
+                                stream.pipes = Some(pipes);
+                            }
                         }
                     }
                 }

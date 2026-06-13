@@ -70,6 +70,12 @@ fn main() -> anyhow::Result<()> {
     tracing::info!("ProxyLB starting...");
     tracing::info!(backends = config.backends.len(), "configuration loaded");
 
+    // Launch the fd-closer thread before the worker runtime so it is ready
+    // as soon as the first connection closes.  Pin it to the first ancillary
+    // core when one is configured so it stays off the forwarding cores.
+    let closer_core = ancillary_cores.as_ref().and_then(|v| v.first().copied());
+    crate::relay::init_deferred_dropper(closer_core);
+
     // Builder for worker runtime.
     let mut worker_builder = tokio::runtime::Builder::new_multi_thread();
     worker_builder.enable_all();
