@@ -178,10 +178,12 @@ pub struct PreallocatedPipes {
 #[cfg(target_os = "linux")]
 pub fn create_preallocated_pipes() -> Option<PreallocatedPipes> {
     let (p1_rd, p1_wr) = create_pipe().ok()?;
+    // Wrap immediately so the FDs are closed if the second pipe() call fails.
+    let (pipe1_rd, pipe1_wr) = (OwnedFd(p1_rd), OwnedFd(p1_wr));
     let (p2_rd, p2_wr) = create_pipe().ok()?;
     Some(PreallocatedPipes {
-        pipe1_rd: OwnedFd(p1_rd),
-        pipe1_wr: OwnedFd(p1_wr),
+        pipe1_rd,
+        pipe1_wr,
         pipe2_rd: OwnedFd(p2_rd),
         pipe2_wr: OwnedFd(p2_wr),
     })
