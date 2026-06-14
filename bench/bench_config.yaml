@@ -6,6 +6,10 @@ inbounds:
     listen: "127.0.0.1:1080"
     filter:
       enabled: false
+  - type: socks5
+    listen: "unix:///tmp/proxylb_bench.sock"
+    filter:
+      enabled: false
 
 backends:
   - type: socks5

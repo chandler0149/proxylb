@@ -39,35 +39,47 @@ clean:
 	$(CARGO) clean
 
 ## Run SOCKS5 CPS Benchmark
+# Usage:
+#   make bench                   — TCP mode  (may hit port limits on macOS)
+#   make bench BENCH_UDS=1       — UDS mode  (no port exhaustion, macOS-friendly)
 bench: release
-	ulimit -n 1024000
 	@echo "Starting SOCKS5 CPS benchmark..."
-	@killall -9 proxylb || true
-	@killall -9 dummy_uds_backend || true
-	@killall -9 benchmark_cps || true
-	@rm -f /tmp/mock_socks5.sock
-	@echo "Starting Rust SOCKS5 mock backend on CPU core 3..."
-	@taskset -c 3 ./target/release/dummy_uds_backend /tmp/mock_socks5.sock > /dev/null 2>&1 &
+	@killall -9 proxylb 2>/dev/null || true
+	@killall -9 dummy_uds_backend 2>/dev/null || true
+	@killall -9 benchmark_cps 2>/dev/null || true
+	@rm -f /tmp/mock_socks5.sock /tmp/proxylb_bench.sock
+	@echo "Starting Rust SOCKS5 mock backend..."
+	@./target/release/dummy_uds_backend /tmp/mock_socks5.sock > /dev/null 2>&1 &
 	@sleep 1
 	@echo "Starting ProxyLB in release mode..."
-	@./target/release/proxylb -c ./bench/bench_config.yaml --log-level info > bench.log 2>&1 &
+	@./target/release/proxylb -c ./bench/bench_config.yaml --log-level off > bench.log 2>&1 &
 	@sleep 1
 	@echo "Running Rust SOCKS5 CPS benchmark..."
-	@taskset -c 5 ./target/release/benchmark_cps --proxy-host 127.0.0.1 --proxy-port 1080 --target-host 127.0.0.1 --target-port 10800 --concurrency 300 --duration 10
+	@if [ "$(BENCH_UDS)" = "1" ]; then \
+		./target/release/benchmark_cps \
+			--proxy-uds /tmp/proxylb_bench.sock \
+			--target-host 127.0.0.1 --target-port 10800 \
+			--concurrency 300 --duration 10; \
+	else \
+		./target/release/benchmark_cps \
+			--proxy-host 127.0.0.1 --proxy-port 1080 \
+			--target-host 127.0.0.1 --target-port 10800 \
+			--concurrency 300 --duration 10; \
+	fi
 	@echo "Cleaning up processes..."
-	@killall -9 proxylb || true
-	@killall -9 dummy_uds_backend || true
-	@killall -9 benchmark_cps || true
-	@rm -f /tmp/mock_socks5.sock
+	@killall -9 proxylb 2>/dev/null || true
+	@killall -9 dummy_uds_backend 2>/dev/null || true
+	@killall -9 benchmark_cps 2>/dev/null || true
+	@rm -f /tmp/mock_socks5.sock /tmp/proxylb_bench.sock
 	@echo "Benchmark complete."
 
 ## Clean SOCKS5 CPS Benchmark processes and sockets
 bench_clean:
 	@echo "Cleaning up SOCKS5 benchmark processes and sockets..."
-	@killall -9 proxylb || true
-	@killall -9 dummy_uds_backend || true
-	@killall -9 benchmark_cps || true
-	@rm -f /tmp/mock_socks5.sock
+	@killall -9 proxylb 2>/dev/null || true
+	@killall -9 dummy_uds_backend 2>/dev/null || true
+	@killall -9 benchmark_cps 2>/dev/null || true
+	@rm -f /tmp/mock_socks5.sock /tmp/proxylb_bench.sock
 
 ## Show help
 help:
