@@ -6,6 +6,10 @@ inbounds:
     listen: "127.0.0.1:1080"
     filter:
       enabled: false
+  - type: socks5
+    listen: "unix:///tmp/proxylb_bench.sock"
+    filter:
+      enabled: false
 
 backends:
   - type: socks5
@@ -25,7 +29,7 @@ adblock:
   enabled: false
 
 cpu_affinity:
-  worker_cores: [0, 1]
+  worker_cores: [1]
   ancillary_cores: [2]
 
 advanced:

@@ -3,6 +3,7 @@
 //! Wraps `tokio::io::copy_bidirectional` with byte-count tracking and logging.
 //! If both streams are raw files/sockets on Linux, it utilizes zero-copy `splice`.
 
+use std::sync::OnceLock;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(unix)]
@@ -73,6 +74,51 @@ impl AsRawStreamRef for tokio::net::UnixStream {
 pub static ZERO_COPY_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// Global sender used to defer stream drops off the tokio worker threads.
+/// The item type is type-erased so any stream (`BackendStream`, inbound `TcpStream`, etc.)
+/// can be sent to the same closer thread.
+/// Populated by [`init_deferred_dropper`] before the worker runtime starts.
+static STREAM_DROP_TX: OnceLock<flume::Sender<Box<dyn Send + 'static>>> = OnceLock::new();
+
+/// Spawn a dedicated std thread that receives and drops stream values,
+/// keeping `close(2)` / TCP teardown completely off the worker runtime.
+///
+/// `closer_core` — if `Some`, the thread is pinned to that logical CPU core.
+pub fn init_deferred_dropper(closer_core: Option<usize>) {
+    let (tx, rx) = flume::unbounded::<Box<dyn Send + 'static>>();
+    // Ignore the error if already initialised (idempotent on hot-reload).
+    let _ = STREAM_DROP_TX.set(tx);
+
+    std::thread::Builder::new()
+        .name("proxylb-fd-closer".into())
+        .spawn(move || {
+            if let Some(core_num) = closer_core {
+                if let Some(core_ids) = core_affinity::get_core_ids() {
+                    if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
+                        if core_affinity::set_for_current(core_id) {
+                            tracing::info!("proxylb-fd-closer pinned to CPU core {}", core_num);
+                        }
+                    }
+                }
+            }
+            // Drain until all senders are gone (process exit or channel drop).
+            while rx.recv().is_ok() { /* actual close(2) happens here */ }
+        })
+        .expect("failed to spawn fd-closer thread");
+}
+
+/// Send `stream` to the fd-closer thread so that `close(2)` / TCP teardown
+/// happens off the tokio worker runtime. Falls back to an immediate drop if
+/// the closer has not been initialised or the send fails.
+#[inline]
+pub fn defer_drop(stream: impl Send + 'static) {
+    if let Some(tx) = STREAM_DROP_TX.get() {
+        let _ = tx.try_send(Box::new(stream));
+        // On failure the Box is dropped here — correct, just not deferred.
+    }
+    // If not initialised: drop immediately (correct, just not deferred).
+}
+
 /// Relay data bidirectionally between two streams until one side closes.
 ///
 /// Returns (bytes_client_to_backend, bytes_backend_to_client).
@@ -132,10 +178,12 @@ pub struct PreallocatedPipes {
 #[cfg(target_os = "linux")]
 pub fn create_preallocated_pipes() -> Option<PreallocatedPipes> {
     let (p1_rd, p1_wr) = create_pipe().ok()?;
+    // Wrap immediately so the FDs are closed if the second pipe() call fails.
+    let (pipe1_rd, pipe1_wr) = (OwnedFd(p1_rd), OwnedFd(p1_wr));
     let (p2_rd, p2_wr) = create_pipe().ok()?;
     Some(PreallocatedPipes {
-        pipe1_rd: OwnedFd(p1_rd),
-        pipe1_wr: OwnedFd(p1_wr),
+        pipe1_rd,
+        pipe1_wr,
         pipe2_rd: OwnedFd(p2_rd),
         pipe2_wr: OwnedFd(p2_wr),
     })
@@ -164,6 +212,27 @@ fn create_pipe() -> std::io::Result<(RawFd, RawFd)> {
 }
 
 #[cfg(target_os = "linux")]
+struct DeferredFd(Option<OwnedFd>);
+
+#[cfg(target_os = "linux")]
+impl Drop for DeferredFd {
+    fn drop(&mut self) {
+        if let Some(fd) = self.0.take() {
+            defer_drop(fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for DeferredFd {
+    type Target = OwnedFd;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+
+#[cfg(target_os = "linux")]
 async fn splice_one_way(
     r_stream: RawStreamRef<'_>,
     w_stream: RawStreamRef<'_>,
@@ -171,6 +240,10 @@ async fn splice_one_way(
     pipe_wr: OwnedFd,
 ) -> std::io::Result<u64> {
     use std::os::unix::io::AsRawFd;
+
+    // Wrap the FDs so they are sent to the fd-closer thread when dropped.
+    let pipe_rd = DeferredFd(Some(pipe_rd));
+    let pipe_wr = DeferredFd(Some(pipe_wr));
 
     let mut total_bytes = 0;
     let r_fd = r_stream.as_raw_fd();

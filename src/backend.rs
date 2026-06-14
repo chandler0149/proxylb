@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{BackendConfig, GroupConfig, GroupStrategy};
-use crate::outbound::{BackendStream, socks5h_authenticate};
+use crate::outbound::BackendStream;
 use tokio_rustls::TlsConnector;
 
 /// Lock-free per-backend traffic counters.
@@ -286,7 +286,7 @@ impl Default for BackendStatus {
 #[derive(Debug)]
 pub struct BackendEntry {
     pub info: BackendInfo,
-    pub status: std::sync::Mutex<BackendStatus>,
+    pub status: parking_lot::Mutex<BackendStatus>,
     pub traffic: Arc<TrafficCounters>,
     /// Pre-authenticated connection pool.
     /// `flume::Receiver` is Clone + Send + Sync, so no Mutex is needed.
@@ -403,7 +403,7 @@ pub struct BackendPool {
     inner: Arc<RwLock<BackendPoolInner>>,
     cached: Arc<ArcSwap<CachedCandidates>>,
     pub hot_paths: Arc<ArcSwap<Vec<BackendHotPath>>>,
-    pub inbound_stats: Arc<std::sync::Mutex<Vec<Arc<InboundStats>>>>,
+    pub inbound_stats: Arc<parking_lot::Mutex<Vec<Arc<InboundStats>>>>,
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
     pub adblock_manager: Arc<crate::adblock::AdBlockManager>,
     pub ancillary_handle: tokio::runtime::Handle,
@@ -488,7 +488,7 @@ fn calculate_candidates(
         match target {
             Target::Backend(idx) => {
                 if let Some(entry) = entries.get(*idx) {
-                    let status = entry.status.lock().unwrap();
+                    let status = entry.status.lock();
                     if status.enabled && status.healthy && !added_healthy.contains(idx) {
                         healthy_candidates.push((*idx, entry.info.clone()));
                         added_healthy.insert(*idx);
@@ -501,7 +501,7 @@ fn calculate_candidates(
                     let mut group_healthy = Vec::new();
                     for &idx in &group.backend_indices {
                         if let Some(entry) = entries.get(idx) {
-                            let status = entry.status.lock().unwrap();
+                            let status = entry.status.lock();
                             if status.enabled && status.healthy && !added_healthy.contains(&idx) {
                                 group_healthy.push((idx, entry.info.clone(), status.last_latency));
                             }
@@ -544,7 +544,7 @@ fn calculate_candidates(
         match target {
             Target::Backend(idx) => {
                 if let Some(entry) = entries.get(*idx) {
-                    let status = entry.status.lock().unwrap();
+                    let status = entry.status.lock();
                     if status.enabled
                         && !status.healthy
                         && !added_healthy.contains(idx)
@@ -561,7 +561,7 @@ fn calculate_candidates(
                     let mut group_unhealthy = Vec::new();
                     for &idx in &group.backend_indices {
                         if let Some(entry) = entries.get(idx) {
-                            let status = entry.status.lock().unwrap();
+                            let status = entry.status.lock();
                             if status.enabled
                                 && !status.healthy
                                 && !added_healthy.contains(&idx)
@@ -629,7 +629,7 @@ impl BackendPool {
 
             let entry = BackendEntry {
                 info: info.clone(),
-                status: std::sync::Mutex::new(status),
+                status: parking_lot::Mutex::new(status),
                 traffic: Arc::new(TrafficCounters::default()),
                 pool_rx: rx.clone(),
                 cancel: cancel.clone(),
@@ -678,7 +678,7 @@ impl BackendPool {
             })),
             cached,
             hot_paths,
-            inbound_stats: Arc::new(std::sync::Mutex::new(Vec::new())),
+            inbound_stats: Arc::new(parking_lot::Mutex::new(Vec::new())),
             rt_chg_signal,
             adblock_manager,
             ancillary_handle,
@@ -692,7 +692,7 @@ impl BackendPool {
         listen: String,
         inbound_type: String,
     ) -> Arc<InboundStats> {
-        let mut stats_list = self.inbound_stats.lock().unwrap();
+        let mut stats_list = self.inbound_stats.lock();
         if let Some(existing) = stats_list.iter().find(|s| s.listen == listen) {
             return Arc::clone(existing);
         }
@@ -711,7 +711,7 @@ impl BackendPool {
 
     /// Retrieve a snapshot of the stats for all registered inbounds.
     pub fn get_inbound_stats(&self) -> Vec<InboundStatsView> {
-        let stats_list = self.inbound_stats.lock().unwrap();
+        let stats_list = self.inbound_stats.lock();
         stats_list
             .iter()
             .map(|s| InboundStatsView {
@@ -768,7 +768,7 @@ impl BackendPool {
 
                 if let Some(new_enabled) = new_info.enabled {
                     let _ = entry.enabled_tx.send(new_enabled);
-                    entry.status.lock().unwrap().enabled = new_enabled;
+                    entry.status.lock().enabled = new_enabled;
                     if !new_enabled {
                         while entry.pool_rx.try_recv().is_ok() {}
                     }
@@ -813,7 +813,7 @@ impl BackendPool {
 
                 let entry = BackendEntry {
                     info: new_info.clone(),
-                    status: std::sync::Mutex::new(status),
+                    status: parking_lot::Mutex::new(status),
                     traffic: Arc::new(TrafficCounters::default()),
                     pool_rx: rx.clone(),
                     cancel: cancel.clone(),
@@ -899,7 +899,7 @@ impl BackendPool {
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let status = e.status.lock().unwrap();
+                let status = e.status.lock();
                 (i, e.info.clone(), status.healthy, status.enabled)
             })
             .collect()
@@ -921,7 +921,7 @@ impl BackendPool {
     pub async fn mark_healthy(&self, index: usize, latency: Duration) {
         let guard = self.inner.read().await;
         if let Some(entry) = guard.entries.get(index) {
-            let mut status = entry.status.lock().unwrap();
+            let mut status = entry.status.lock();
             let was_unhealthy = !status.healthy;
             status.healthy = true;
             status.last_check = Some(Instant::now());
@@ -950,7 +950,7 @@ impl BackendPool {
     pub async fn mark_unhealthy(&self, index: usize, error: &str) {
         let guard = self.inner.read().await;
         if let Some(entry) = guard.entries.get(index) {
-            let mut status = entry.status.lock().unwrap();
+            let mut status = entry.status.lock();
             let was_healthy = status.healthy;
             status.healthy = false;
             status.last_check = Some(Instant::now());
@@ -985,7 +985,7 @@ impl BackendPool {
                 found = true;
 
                 // Idempotent: skip if already in the desired state.
-                let current = entry.status.lock().unwrap().enabled;
+                let current = entry.status.lock().enabled;
                 if current == enabled {
                     break;
                 }
@@ -994,7 +994,7 @@ impl BackendPool {
                 let _ = entry.enabled_tx.send(enabled);
 
                 // Update the status for the health/candidate selection
-                let mut status = entry.status.lock().unwrap();
+                let mut status = entry.status.lock();
                 status.enabled = enabled;
 
                 if !enabled {
@@ -1037,7 +1037,7 @@ impl BackendPool {
                 .find(|g| g.backend_indices.contains(&i))
                 .map(|g| g.name.clone());
 
-            let status = e.status.lock().unwrap();
+            let status = e.status.lock();
             views.push(BackendStatusView {
                 name: e.info.name.clone(),
                 address: e.info.endpoint.display(),
@@ -1072,7 +1072,7 @@ impl BackendPool {
                 .find(|g| g.backend_indices.contains(&i))
                 .map(|g| g.name.clone());
 
-            let status = e.status.lock().unwrap();
+            let status = e.status.lock();
             views.push(BackendStatusView {
                 name: e.info.name.clone(),
                 address: e.info.endpoint.display(),
@@ -1186,6 +1186,30 @@ fn drain_pool(rx: &flume::Receiver<BackendStream>) {
 /// setup.
 ///
 /// Exits cleanly when `cancel` is cancelled (backend removed during hot reload).
+#[inline]
+async fn allocate_backend_resource(info: &BackendInfo) -> std::io::Result<BackendStream> {
+    let connect = crate::outbound::connect_endpoint(info, Duration::from_secs(10)).await;
+    let mut stream = match connect {
+        Err(e) => return Err(e),
+        Ok(stream) if info.is_shadowsocks() => stream,
+        Ok(stream) => crate::outbound::socks5h_authenticate(stream, info).await?,
+    };
+
+    #[cfg(target_os = "linux")]
+    {
+        if crate::relay::ZERO_COPY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            use crate::relay::AsRawStreamRef;
+            if let Some(_) = stream.as_raw_stream_ref() {
+                if let Some(pipes) = crate::relay::create_preallocated_pipes() {
+                    stream.pipes = Some(pipes);
+                }
+            }
+        }
+    }
+
+    Ok(stream)
+}
+
 async fn refill_pool_task(
     info: BackendInfo,
     mut enabled_signal: tokio::sync::watch::Receiver<bool>,
@@ -1198,12 +1222,27 @@ async fn refill_pool_task(
         return;
     }
 
-    let retry_interval = Duration::from_secs(5);
+    let mut join_set = tokio::task::JoinSet::new();
+    let target = info.pool_size.max(1);
+    let mut pending_stream: Option<BackendStream> = None;
 
     loop {
-        // ── Disabled: drain and wait for re-enable ───────────────────────────
+        // Maintain concurrent connection attempts
+        while join_set.len() < target && pending_stream.is_none() && *enabled_signal.borrow() {
+            let info = info.clone();
+            join_set.spawn(async move {
+                let res = allocate_backend_resource(&info).await;
+                if res.is_err() {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                res
+            });
+        }
+
         if !*enabled_signal.borrow() {
             drain_pool(&rx);
+            join_set.abort_all();
+            pending_stream = None;
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return,
@@ -1213,59 +1252,41 @@ async fn refill_pool_task(
             continue;
         }
 
-        // ── Connect (+ optional SOCKS5 auth) ────────────────────────────────
-        let connect = crate::outbound::connect_endpoint(&info, Duration::from_secs(10)).await;
-        let result = match connect {
-            Err(e) => Err(e),
-            Ok(stream) if info.is_shadowsocks() => Ok(stream),
-            Ok(stream) => socks5h_authenticate(stream, &info).await,
-        };
-
-        match result {
-            // ── Success: try to enqueue, but respect signals ─────────────
-            Ok(mut stream) => {
-                #[cfg(target_os = "linux")]
-                {
-                    if crate::relay::ZERO_COPY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-                        if let Some(pipes) = crate::relay::create_preallocated_pipes() {
-                            stream.pipes = Some(pipes);
-                        }
-                    }
-                }
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return,
-                    res = enabled_signal.changed() => {
-                        if res.is_err() { return; }
-                        if !*enabled_signal.borrow() { drain_pool(&rx); }
-                    }
-                    res = rt_chg_signal.changed() => {
-                        if res.is_err() { return; }
-                        drain_pool(&rx);
-                        tracing::info!(backend = %info.name, "connection pool drained due to route change");
-                    }
-                    res = tx.send_async(stream) => {
-                        if res.is_err() { return; }
-                        tracing::trace!(backend = %info.name, "pool refilled");
-                    }
-                }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            res = enabled_signal.changed() => {
+                if res.is_err() { return; }
             }
-            // ── Failure: log and backoff, but respect signals ────────────
-            Err(e) => {
-                tracing::debug!(
-                    backend = %info.name, error = %e,
-                    "connect failed; retrying in {}s", retry_interval.as_secs()
-                );
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return,
-                    res = enabled_signal.changed() => if res.is_err() { return; },
-                    res = rt_chg_signal.changed() => {
-                        if res.is_err() { return; }
-                        drain_pool(&rx);
-                        tracing::info!(backend = %info.name, "connection pool drained due to route change");
+            res = rt_chg_signal.changed() => {
+                if res.is_err() { return; }
+                drain_pool(&rx);
+                join_set.abort_all();
+                pending_stream = None;
+                tracing::info!(backend = %info.name, "connection pool drained due to route change");
+            }
+            res = async {
+                if let Some(stream) = pending_stream.take() {
+                    tx.send_async(stream).await.map_err(|e| e.into_inner())
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if res.is_err() { return; } // channel closed
+                tracing::trace!(backend = %info.name, "pool refilled");
+            }
+            Some(res) = join_set.join_next(), if pending_stream.is_none() => {
+                match res {
+                    Ok(Ok(stream)) => {
+                        pending_stream = Some(stream);
                     }
-                    _ = tokio::time::sleep(retry_interval) => {}
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            backend = %info.name, error = %e,
+                            "connect failed; retrying in 5s"
+                        );
+                    }
+                    Err(_) => {}
                 }
             }
         }
