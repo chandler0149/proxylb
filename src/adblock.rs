@@ -74,7 +74,13 @@ impl AdBlockEngine {
             return false;
         }
 
-        let domain_lower = domain_trimmed.to_lowercase();
+        let is_lower = domain_trimmed.bytes().all(|b| !b.is_ascii_uppercase());
+        let domain_lower = if is_lower {
+            std::borrow::Cow::Borrowed(domain_trimmed)
+        } else {
+            std::borrow::Cow::Owned(domain_trimmed.to_ascii_lowercase())
+        };
+
         let mut current = &self.root;
         let mut blocked = false;
         let mut allowed = false;

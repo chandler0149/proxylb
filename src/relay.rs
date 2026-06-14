@@ -212,6 +212,27 @@ fn create_pipe() -> std::io::Result<(RawFd, RawFd)> {
 }
 
 #[cfg(target_os = "linux")]
+struct DeferredFd(Option<OwnedFd>);
+
+#[cfg(target_os = "linux")]
+impl Drop for DeferredFd {
+    fn drop(&mut self) {
+        if let Some(fd) = self.0.take() {
+            defer_drop(fd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for DeferredFd {
+    type Target = OwnedFd;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+
+#[cfg(target_os = "linux")]
 async fn splice_one_way(
     r_stream: RawStreamRef<'_>,
     w_stream: RawStreamRef<'_>,
@@ -219,6 +240,10 @@ async fn splice_one_way(
     pipe_wr: OwnedFd,
 ) -> std::io::Result<u64> {
     use std::os::unix::io::AsRawFd;
+
+    // Wrap the FDs so they are sent to the fd-closer thread when dropped.
+    let pipe_rd = DeferredFd(Some(pipe_rd));
+    let pipe_wr = DeferredFd(Some(pipe_wr));
 
     let mut total_bytes = 0;
     let r_fd = r_stream.as_raw_fd();

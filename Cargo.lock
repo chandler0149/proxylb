@@ -1748,6 +1748,7 @@ dependencies = [
  "httparse",
  "libc",
  "memory-stats",
+ "parking_lot",
  "rcgen",
  "rustls-pemfile",
  "serde",

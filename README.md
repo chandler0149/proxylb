@@ -8,28 +8,6 @@
 
 ---
 
-## ⚡ 性能
-
-测试环境：
-
-```
-Linux dev 6.12.85+deb13-arm64 aarch64 GNU/Linux
-2 个工作核心（CPU 绑定）· pool_size=5 · 300 并发客户端 · 10 秒
-```
-
-| 每秒连接数（CPS） | 失败数 |
-|---|---|
-| **14,669** | **0** |
-
-性能亮点：
-
-- **零拷贝中继** — `splice(2)` 实现内核级数据传输，完全绕过用户空间
-- **预热连接池** — 后台提前完成握手，使出站握手延迟趋近于零
-- **独立 CPU 运行时** — 转发线程与后台任务隔离在专用的 CPU 核心上，防止控制平面的抖动影响数据路径
-- **jemalloc** — 为高并发负载优化的内存分配器
-
----
-
 ## 🛠️ 功能特性
 
 传输层与协议层分离，出站和入站均支持tcp或UDS传输层，入站支持socks5、http、shadowsocks协议，出站支持直连、socks5、shadowsocks协议。还支持TLS安全层，详见配置文件
@@ -53,6 +31,70 @@ Linux dev 6.12.85+deb13-arm64 aarch64 GNU/Linux
 - AdBlock — 后台自动获取和刷新 AdGuard/Hosts 格式的过滤规则
 
 ---
+
+
+## ⚡ 性能
+
+性能亮点：
+
+- **零拷贝中继** — `splice(2)` 实现内核级数据传输，完全绕过用户空间
+- **预热连接池** — 后台提前完成握手，使出站握手延迟趋近于零
+- **独立 CPU 运行时** — 转发线程与后台任务隔离在专用的 CPU 核心上，防止控制平面的抖动影响数据路径
+- **jemalloc** — 为高并发负载优化的内存分配器
+---
+
+测试环境：
+
+macOS 14 Parallels Desktop 虚拟机运行 Debian 13: M3 Macbook Air
+
+```
+Linux dev 6.12.85+deb13-arm64 aarch64 GNU/Linux
+1 个工作核心（CPU 绑定）· pool_size=5 · 300 并发客户端 · 10 秒
+```
+
+比较粗糙的cps测试，UDS入站CPS达到37485，TCP入站CPS达到15346。
+
+```bash
+root@dev:~/code/gfw/proxylb# make bench BENCH_UDS=1
+cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.08s
+Starting SOCKS5 CPS benchmark...
+Starting Rust SOCKS5 mock backend...
+Starting ProxyLB in release mode...
+Running Rust SOCKS5 CPS benchmark...
+Proxy:  unix:///tmp/proxylb_bench.sock
+Target: 127.0.0.1:10800
+Concurrency: 300, Duration: 10s
+Starting SOCKS5 CPS benchmark...
+
+=== Consolidated Results ===
+Total Successful Connections: 375073
+Total Failed Connections:     0
+Max Elapsed Time:             10.01s
+Combined Connections Per Second (CPS): 37485.10
+Cleaning up processes...
+Benchmark complete.
+root@dev:~/code/gfw/proxylb# make bench
+cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.09s
+Starting SOCKS5 CPS benchmark...
+Starting Rust SOCKS5 mock backend...
+Starting ProxyLB in release mode...
+Running Rust SOCKS5 CPS benchmark...
+Proxy:  127.0.0.1:1080
+Target: 127.0.0.1:10800
+Concurrency: 300, Duration: 10s
+Starting SOCKS5 CPS benchmark...
+
+=== Consolidated Results ===
+Total Successful Connections: 169099
+Total Failed Connections:     0
+Max Elapsed Time:             11.02s
+Combined Connections Per Second (CPS): 15346.97
+Cleaning up processes...
+Benchmark complete.
+```
+
 
 ## 🛠️ 使用场景
 

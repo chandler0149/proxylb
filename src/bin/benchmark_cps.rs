@@ -143,8 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy_addr: SocketAddr =
-        format!("{}:{}", args.proxy_host, args.proxy_port).parse()?;
+    let proxy_addr: SocketAddr = format!("{}:{}", args.proxy_host, args.proxy_port).parse()?;
     let target_ip = Ipv4Addr::from_str(&args.target_host)?;
     let target_ip_bytes = target_ip.octets();
     let target_port_bytes = args.target_port.to_be_bytes();
@@ -160,7 +159,10 @@ async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         println!("Proxy:  {}", proxy_addr);
     }
     println!("Target: {}:{}", args.target_host, args.target_port);
-    println!("Concurrency: {}, Duration: {}s", args.concurrency, args.duration);
+    println!(
+        "Concurrency: {}, Duration: {}s",
+        args.concurrency, args.duration
+    );
     println!("Starting SOCKS5 CPS benchmark...");
 
     let start_time = Instant::now();

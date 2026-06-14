@@ -8,27 +8,6 @@ A high-performance proxy load balancer written in Rust. Supports SOCKS5, Shadows
 
 ---
 
-## ⚡ Performance
-
-Test environment:
-
-```
-Linux dev 6.12.85+deb13-arm64 aarch64 GNU/Linux
-2 worker cores (CPU-pinned) · pool_size=5 · 300 concurrent clients · 10 s
-```
-
-| Connections / second | Failed |
-|---|---|
-| **14,669** | **0** |
-
-What makes it fast:
-
-- **Zero-copy relay** — `splice(2)` enables kernel-level data transfer, bypassing userspace entirely
-- **Pre-warmed connection pools** — outbound handshakes happen in the background, making connection latency near-zero
-- **Dedicated CPU runtimes** — forwarding threads and background tasks are isolated on pinned CPU cores, preventing control-plane jitter from affecting the data path
-- **jemalloc** — optimized memory allocation for high-concurrency workloads
-
----
 
 ## 🛠️ Features
 
@@ -49,6 +28,78 @@ What makes it fast:
 - Network change detection — auto-reprobes on link or gateway changes
 - Web dashboard & REST API — live traffic stats, per-backend latency, active connections
 - AdBlock — AdGuard/Hosts-format lists fetched and refreshed in the background
+
+## ⚡ Performance
+
+
+What makes it fast:
+
+- **Zero-copy relay** — `splice(2)` enables kernel-level data transfer, bypassing userspace entirely
+- **Pre-warmed connection pools** — outbound handshakes happen in the background, making connection latency near-zero
+- **Dedicated CPU runtimes** — forwarding threads and background tasks are isolated on pinned CPU cores, preventing control-plane jitter from affecting the data path
+- **jemalloc** — optimized memory allocation for high-concurrency workloads
+
+---
+
+Test environment:
+
+Parallels Desktop on macOS 14 running linux guest: M3 Macbook Air
+
+```
+Linux dev 6.12.85+deb13-arm64 aarch64 GNU/Linux
+1 worker cores (CPU-pinned) · pool_size=5 · 300 concurrent clients · 10 s
+```
+
+A rough CPS benchmark, UDS inbound CPS reaches 37485, TCP inbound CPS reaches 15346.
+
+```bash
+root@dev:~/code/gfw/proxylb# make bench BENCH_UDS=1
+cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.08s
+Starting SOCKS5 CPS benchmark...
+Starting Rust SOCKS5 mock backend...
+Starting ProxyLB in release mode...
+Running Rust SOCKS5 CPS benchmark...
+Proxy:  unix:///tmp/proxylb_bench.sock
+Target: 127.0.0.1:10800
+Concurrency: 300, Duration: 10s
+Starting SOCKS5 CPS benchmark...
+
+=== Consolidated Results ===
+Total Successful Connections: 375073
+Total Failed Connections:     0
+Max Elapsed Time:             10.01s
+Combined Connections Per Second (CPS): 37485.10
+Cleaning up processes...
+Benchmark complete.
+root@dev:~/code/gfw/proxylb# make bench
+cargo build --release
+    Finished `release` profile [optimized] target(s) in 0.09s
+Starting SOCKS5 CPS benchmark...
+Starting Rust SOCKS5 mock backend...
+Starting ProxyLB in release mode...
+Running Rust SOCKS5 CPS benchmark...
+Proxy:  127.0.0.1:1080
+Target: 127.0.0.1:10800
+Concurrency: 300, Duration: 10s
+Starting SOCKS5 CPS benchmark...
+
+=== Consolidated Results ===
+Total Successful Connections: 169099
+Total Failed Connections:     0
+Max Elapsed Time:             11.02s
+Combined Connections Per Second (CPS): 15346.97
+Cleaning up processes...
+Benchmark complete.
+```
+
+
+
+
+
+
+
+
 
 ---
 
