@@ -56,7 +56,7 @@ pub enum RawBackendStream {
 // only through `Pin::as_mut()` in poll_* impls; the inner value is never moved.
 impl Unpin for RawBackendStream {}
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl crate::relay::AsRawStreamRef for RawBackendStream {
     fn as_raw_stream_ref(&self) -> Option<crate::relay::RawStreamRef<'_>> {
         match self {
@@ -153,7 +153,7 @@ impl Drop for BackendStream {
 
 impl Unpin for BackendStream {}
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl crate::relay::AsRawStreamRef for BackendStream {
     fn as_raw_stream_ref(&self) -> Option<crate::relay::RawStreamRef<'_>> {
         self.inner.as_raw_stream_ref()

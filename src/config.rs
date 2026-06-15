@@ -46,6 +46,7 @@ pub struct Config {
     #[serde(default)]
     pub adblock: AdBlockConfig,
     #[serde(default)]
+    #[allow(dead_code)]
     pub advanced: AdvancedConfig,
 }
 
@@ -69,11 +70,12 @@ fn default_update_interval_hours() -> u64 {
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct AdvancedConfig {
     #[serde(default = "default_zero_copy")]
+    #[allow(dead_code)]
     pub zero_copy: bool,
 }
 
 fn default_zero_copy() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]

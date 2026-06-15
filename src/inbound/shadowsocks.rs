@@ -164,7 +164,7 @@ fn convert_ss_address(addr: &Address) -> TargetAddr {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl<S> crate::relay::AsRawStreamRef
     for shadowsocks::relay::tcprelay::proxy_stream::server::ProxyServerStream<S>
 {

@@ -47,6 +47,7 @@ fn main() -> anyhow::Result<()> {
     let config = config::Config::load(&args.config)?;
 
     // Store zero-copy flag.
+    #[cfg(target_os = "linux")]
     crate::relay::ZERO_COPY_ENABLED.store(
         config.advanced.zero_copy,
         std::sync::atomic::Ordering::Relaxed,

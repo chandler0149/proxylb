@@ -6,17 +6,17 @@
 use std::sync::OnceLock;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 pub enum RawStreamRef<'a> {
     Tcp(&'a tokio::net::TcpStream),
     Unix(&'a tokio::net::UnixStream),
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl<'a> RawStreamRef<'a> {
     pub fn as_raw_fd(&self) -> RawFd {
         use std::os::unix::io::AsRawFd;
@@ -38,7 +38,7 @@ impl<'a> RawStreamRef<'a> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub trait AsRawStreamRef {
     fn as_raw_stream_ref(&self) -> Option<RawStreamRef<'_>>;
 
@@ -48,15 +48,19 @@ pub trait AsRawStreamRef {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub trait AsRawStreamRef {
+    #[allow(dead_code)]
     fn as_raw_stream_ref(&self) -> Option<()> {
         None
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+impl<T> AsRawStreamRef for T {}
+
 // Implement AsRawStreamRef for TcpStream
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl AsRawStreamRef for tokio::net::TcpStream {
     fn as_raw_stream_ref(&self) -> Option<RawStreamRef<'_>> {
         Some(RawStreamRef::Tcp(self))
@@ -64,13 +68,14 @@ impl AsRawStreamRef for tokio::net::TcpStream {
 }
 
 // Implement AsRawStreamRef for UnixStream
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl AsRawStreamRef for tokio::net::UnixStream {
     fn as_raw_stream_ref(&self) -> Option<RawStreamRef<'_>> {
         Some(RawStreamRef::Unix(self))
     }
 }
 
+#[cfg(target_os = "linux")]
 pub static ZERO_COPY_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -127,18 +132,16 @@ where
     A: AsyncRead + AsyncWrite + Unpin + AsRawStreamRef,
     B: AsyncRead + AsyncWrite + Unpin + AsRawStreamRef,
 {
+    #[cfg(target_os = "linux")]
     if ZERO_COPY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        #[cfg(target_os = "linux")]
+        let pipes = client
+            .take_preallocated_pipes()
+            .or_else(|| backend.take_preallocated_pipes());
+        if let (Some(stream_a), Some(stream_b)) =
+            (client.as_raw_stream_ref(), backend.as_raw_stream_ref())
         {
-            let pipes = client
-                .take_preallocated_pipes()
-                .or_else(|| backend.take_preallocated_pipes());
-            if let (Some(stream_a), Some(stream_b)) =
-                (client.as_raw_stream_ref(), backend.as_raw_stream_ref())
-            {
-                if let Ok(res) = splice_bidirectional_with_pipes(stream_a, stream_b, pipes).await {
-                    return Ok(res);
-                }
+            if let Ok(res) = splice_bidirectional_with_pipes(stream_a, stream_b, pipes).await {
+                return Ok(res);
             }
         }
     }

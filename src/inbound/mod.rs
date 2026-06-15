@@ -106,7 +106,7 @@ impl tokio::io::AsyncWrite for InboundStream {
 
 impl Unpin for InboundStream {}
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl crate::relay::AsRawStreamRef for InboundStream {
     fn as_raw_stream_ref(&self) -> Option<crate::relay::RawStreamRef<'_>> {
         match self {

@@ -247,7 +247,7 @@ where
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl<S> crate::relay::AsRawStreamRef for MaybeTlsStream<S>
 where
     S: crate::relay::AsRawStreamRef,
