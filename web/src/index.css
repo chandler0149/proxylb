@@ -1,0 +1,5 @@
+/* Cleaned template defaults to allow App.css full styling control */
+body {
+  margin: 0;
+  padding: 0;
+}
