@@ -59,6 +59,11 @@ inbounds:
   - type: http
     listen: "unix:///tmp/proxylb-http.sock" # HTTP inbound running over Unix Domain Socket
 
+  - type: mtproto
+    listen: "0.0.0.0:8443"
+    password: "00000000000000000000000000000000" # 32-character (16-byte) hex secret for Telegram clients
+
+
 # Global outbound interface to bind to (selection logic: backend specific -> global -> default)
 # bind_interface: "eno" # Linux interface (or "en0" on macOS)
 
