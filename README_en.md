@@ -15,13 +15,18 @@ A high-performance proxy load balancer written in Rust. Supports SOCKS5, Shadows
 - SOCKS5 — TCP or Unix socket, optional auth, optional TLS
 - Shadowsocks — AEAD ciphers (`aes-256-gcm`, `chacha20-ietf-poly1305`, …)
 - HTTP — `CONNECT` tunnel and plain `GET` proxy, optional Basic Auth, optional TLS
+- MTProto — FakeTLS support, can be used as a direct proxy for Telegram
 
 **Outbound**
 - Direct, SOCKS5h (TCP or Unix socket), Shadowsocks
-- Hierarchical backend groups with per-group strategy:
+- Hierarchical nested backend groups with flexible inbound route binding:
   - `failover` — first healthy backend
   - `urltest` — lowest measured latency
   - `loadbalance` — fewest active connections
+
+**Routing**
+- Inbound Route Binding — Each inbound listener can optionally bind to a specific backend or nested group via the `route` configuration.
+- Global Fallback — Inbounds without an explicit route will automatically fall back to the global `failover_order`.
 
 **Operations**
 - Hot reload via `SIGHUP` — rewires backends without dropping active sessions
@@ -130,31 +135,28 @@ Since sing-box and Hysteria do not natively support domain sockets, you will nee
 
 ### Scenario 2: SOCKS5 Load Balancer
 
-```
-                                                 +-------+                  
-                                                 |       |                  
-                                  +-------------->singbox+----------------> 
-                                  |              |       |                  
-                |                 |              +-------+                  
-                |                 |                                         
-                | shadowsocks     |                                         
-      UDS/TCP   |                 |                                         
-                |                 |                                         
-                |             +---+-----+        +-------+                  
-  socks5        +------------>|         |        |       |                  
------------------------------>| proxylb +-------->singbox+----------------> 
-                +------------>|         |        |       |                  
-                |             +---+-----+        +-------+                  
-                |                 |                                         
-                |                 |                                         
-                |                 |                                         
-                |  http           |                                         
-                |                 |              +-------+                  
-                |                 |              |       |                  
-                |                 +-------------->hysteri+----------------->
-                                                 |       |                  
-                                                 +-------+                  
+```text
+    [ Inbounds ]                                   [ ProxyLB Routing ]                          [ Backends ]
 
+                  |                                                                             +----------+
+    Shadowsocks   |                                   +------------------+                      |          |
+    (route: asia) +-------------+               +---->| Group: Asia      |--------------------->| sing-box |-->
+                  |             |               |     | (urltest)        |                      |          |
+                  |             |               |     +------------------+                      +----------+
+                  |             |               |
+                  |         +---+-----+         |                                               +----------+
+    SOCKS5        |         |         |         |     +------------------+                      |          |
+    (no route)    +-------->|         |---------+---->| Global Fallback  |--------------------->| hysteria |-->
+--------------------------->| ProxyLB |         |     | (failover)       |                      |          |
+                  +-------->|         |---------+     +------------------+                      +----------+
+                  |         |         |         |              ^
+    HTTP          |         +---+-----+         |              |
+    (no route)    |             |               |              | (nested fallback)
+                  |             |               |     +--------+---------+                      +----------+
+                  |             |               |     | Group: Telegram  |                      |          |
+    MTProto       |             +---------------+---->| (failover)       |--------------------->| sing-box |-->
+    (route: tg)   |                                   +------------------+                      |          |
+                  |                                                                             +----------+
 ```
 
 ---
@@ -167,10 +169,15 @@ inbounds:
     listen: "127.0.0.1:1080"
   - type: http
     listen: "127.0.0.1:8080"
+  - type: mtproto
+    listen: "0.0.0.0:8443"
+    password: "00000000000000000000000000000000"
+    route: "telegram-group"  # Bind this inbound to a specific nested group
   - type: shadowsocks
     listen: "127.0.0.1:8388"
     password: "securepassword"
     method: "chacha20-ietf-poly1305"
+    route: "telegram-group"
 
 backends:
   - name: "direct-out"
@@ -189,14 +196,20 @@ backends:
     pool_size: 15
 
 groups:
-  - name: "asia"
+  # Sub-groups
+  - name: "asia-group"
     strategy: "urltest"
     backends: ["ss-hk-1"]
   - name: "us-fallback"
     strategy: "failover"
     backends: ["socks-us-1", "direct-out"]
+  
+  # Nested group (incorporating other groups as backends)
+  - name: "telegram-group"
+    strategy: "failover"
+    backends: ["asia-group", "us-fallback"]
 
-failover_order: ["asia", "us-fallback"]
+failover_order: ["asia-group", "us-fallback"]
 
 health_check:
   interval_secs: 10
