@@ -330,7 +330,7 @@ async fn main_async(
             }
             config::InboundItemConfig::Mtproto {
                 listen,
-                secret,
+                password: secret,
                 tls: tls_cfg,
                 filter,
             } => {

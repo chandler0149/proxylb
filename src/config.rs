@@ -154,7 +154,7 @@ pub enum InboundItemConfig {
     },
     Mtproto {
         listen: String,
-        secret: String,
+        password: String,
         #[serde(default)]
         tls: Option<TlsServerConfig>,
         #[serde(default)]
@@ -349,7 +349,7 @@ impl Config {
         if let Some(ref mtproto) = self.inbound.mtproto {
             res.push(InboundItemConfig::Mtproto {
                 listen: mtproto.listen.clone(),
-                secret: mtproto.secret.clone(),
+                password: mtproto.secret.clone(),
                 tls: None,
                 filter: Some(self.inbound.filter.clone()),
             });
