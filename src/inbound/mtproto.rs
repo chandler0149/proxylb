@@ -118,6 +118,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PeekStream<S> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl<S: crate::relay::AsRawStreamRef> crate::relay::AsRawStreamRef for PeekStream<S> {
     #[cfg(target_os = "linux")]
     fn as_raw_stream_ref(&self) -> Option<crate::relay::RawStreamRef<'_>> {
@@ -444,6 +445,7 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for CombinedStream<R, W> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl<R, W> crate::relay::AsRawStreamRef for CombinedStream<R, W> {
     #[cfg(target_os = "linux")]
     fn as_raw_stream_ref(&self) -> Option<crate::relay::RawStreamRef<'_>> {

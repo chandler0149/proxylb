@@ -992,18 +992,6 @@ impl BackendPool {
             .collect()
     }
 
-    /// Get the order of backends to try, separated into healthy and unhealthy lists.
-    // #[allow(dead_code)]
-    // pub async fn get_candidates(&self) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
-    //     let guard = self.cached.load();
-    //     (guard.healthy.clone(), guard.unhealthy.clone())
-    // }
-
-    /// Get a lock-free guard to the cached candidates (avoiding any Arc clone/refcount overhead).
-    // pub fn get_candidates_guard(&self) -> arc_swap::Guard<Arc<CachedCandidates>> {
-    //     self.cached.load()
-    // }
-
     /// Get the array index for a given route name to use in O(1) lookups.
     pub fn get_route_index(&self, route: &str) -> Option<usize> {
         self.route_map.get(route).copied()
