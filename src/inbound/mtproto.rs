@@ -160,9 +160,11 @@ where
     let is_tls = tls::is_tls_handshake(&peek_buf);
     let mut matched_tls_validation = None;
 
+    let mut total_hello_len = 0;
+
     if is_tls {
         let tls_len = ((peek_buf[3] as usize) << 8) | (peek_buf[4] as usize);
-        let total_hello_len = 5 + tls_len;
+        total_hello_len = 5 + tls_len;
         
         if total_hello_len > peek_buf.len() {
             anyhow::bail!("TLS ClientHello too large: {}", total_hello_len);
@@ -201,7 +203,8 @@ where
         );
         stream.write_all(&server_hello).await?;
 
-        let (read_half, write_half) = tokio::io::split(stream);
+        let peek_stream = PeekStream::new(stream, peek_buf[total_hello_len..peek_len].to_vec());
+        let (read_half, write_half) = tokio::io::split(peek_stream);
         let mut fake_tls_reader = FakeTlsReader::new(read_half);
         let fake_tls_writer = FakeTlsWriter::new(write_half);
         

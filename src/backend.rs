@@ -992,6 +992,12 @@ impl BackendPool {
             .collect()
     }
 
+    #[allow(dead_code)]
+    pub async fn get_candidates(&self) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
+        let guard = self.cached.load();
+        (guard.healthy.clone(), guard.unhealthy.clone())
+    }
+
     /// Get the array index for a given route name to use in O(1) lookups.
     pub fn get_route_index(&self, route: &str) -> Option<usize> {
         self.route_map.get(route).copied()
