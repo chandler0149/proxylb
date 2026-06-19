@@ -1,6 +1,6 @@
 # ProxyLB Configuration
 # ---------------------
-# A high-performance SOCKS5 proxy load balancer with Shadowsocks inbound support.
+# A high-performance proxy load balancer with multi-protocol inbound support.
 
 inbound:
   # Private address target filter (reject private/loopback targets if enabled)
@@ -10,107 +10,104 @@ inbound:
 
 # Multiple Inbound Listeners Reference
 # ------------------------------------
-# You can define multiple concurrent inbound listeners using the `inbounds` key.
-# Legacy single `inbound` configuration keys defined above will merge with this list.
+# Each inbound can optionally specify a `route` field to bind it to a specific
+# group or backend name. If omitted, the inbound uses the global `failover_order`.
+#
+# Routing topology example:
+#
+#   Inbound A (socks5 :1081)  ──route──▶  "proxy-group"   (urltest over US+EU)
+#   Inbound B (ss :8389)      ──route──▶  "telegram-group" (failover US only)
+#   Inbound C (http :8081)    ──(none)──▶  global failover_order (default)
 #
 inbounds:
+  # ── Inbound A: binds to "proxy-group" ────────────────────────────────────────
   - type: socks5
     listen: "0.0.0.0:1081"
-    username: "inbound-user"     # Optional: SOCKS5 Username authentication
-    password: "inbound-password" # Optional: SOCKS5 Password authentication
-    # tls: auto                 # Optional: Auto-generate self-signed cert
-    # tls:                      # Optional: Manual TLS Server config (SOCKS5-over-TLS)
-    #   cert: "/etc/proxylb/certs/server.crt"
-    #   key: "/etc/proxylb/certs/server.key"
+    username: "inbound-user"
+    password: "inbound-password"
+    route: "proxy-group"          # ◀ Bound to "proxy-group" (nested: region-us + region-eu)
     filter:
-      enabled: false # Custom override to allow private targets for this listener
+      enabled: false
 
-  - type: socks5
-    listen: "unix:///tmp/proxylb-socks5.sock" # SOCKS5 inbound running over Unix Domain Socket
-
-  - type: socks5
-    listen: "0.0.0.0:1082"
-    filter:
-      enabled: false 
-
+  # ── Inbound B: binds to "telegram-group" ─────────────────────────────────────
   - type: shadowsocks
     listen: "0.0.0.0:8389"
     password: "another-password"
     method: "chacha20-ietf-poly1305"
-    # tls: auto                 # Optional: Auto-generate self-signed cert
-    # tls:                      # Optional: Manual TLS Server config (Shadowsocks-over-TLS/wrapper)
-    #   cert: "/etc/proxylb/certs/server.crt"
-    #   key: "/etc/proxylb/certs/server.key"
+    route: "telegram-group"       # ◀ Bound to "telegram-group" (failover: region-us → direct)
+
+  - type: mtproto
+    listen: "0.0.0.0:8443"
+    password: "00000000000000000000000000000000"
+    route: "telegram-group"       # ◀ Same group as Shadowsocks above
+
+  # ── Inbound C: no route → uses global failover_order ─────────────────────────
+  - type: http
+    listen: "0.0.0.0:8081"
+    username: "http-user"
+    password: "http-password"
+    # no `route` — falls back to global failover_order
+
+  - type: socks5
+    listen: "0.0.0.0:1082"
+    # no `route` — falls back to global failover_order
+
+  - type: socks5
+    listen: "unix:///tmp/proxylb-socks5.sock"
 
   - type: shadowsocks
-    listen: "unix:///tmp/proxylb-ss.sock" # Shadowsocks inbound running over Unix Domain Socket
+    listen: "unix:///tmp/proxylb-ss.sock"
     password: "another-password"
     method: "chacha20-ietf-poly1305"
 
   - type: http
-    listen: "0.0.0.0:8081"
-    username: "http-user"        # Optional: HTTP Proxy authentication
-    password: "http-password"    # Optional: HTTP Proxy authentication
-    # tls: auto                 # Optional: Auto-generate self-signed cert
-    # tls:                      # Optional: Manual TLS Server config (HTTPS Proxy)
-    #   cert: "/etc/proxylb/certs/server.crt"
-    #   key: "/etc/proxylb/certs/server.key"
-
-  - type: http
-    listen: "unix:///tmp/proxylb-http.sock" # HTTP inbound running over Unix Domain Socket
-
-  - type: mtproto
-    listen: "0.0.0.0:8443"
-    password: "00000000000000000000000000000000" # 32-character (16-byte) hex secret for Telegram clients
+    listen: "unix:///tmp/proxylb-http.sock"
 
 
 # Global outbound interface to bind to (selection logic: backend specific -> global -> default)
 # bind_interface: "eno" # Linux interface (or "en0" on macOS)
 
 # All individual physical backends.
-# Each backend must specify:
-#   type:             "socks5", "ss", "uds", or "direct"
-#   address:          "host:port", absolute path, or "unix://path" to support UDS/TCP transport
-#   username/password: SOCKS5 credentials or Shadowsocks cipher-method/passphrase
 backends:
+  # ── US region ────────────────────────────────────────────────────────────────
   - type: socks5
     address: "127.0.0.1:10800"
-    name: "backend-us-1"
+    name: "us-east-1"
     username: "user1"
     password: "pass1"
-    # enabled: true # Whether this backend is initially active (default: true)
 
   - type: socks5
     address: "127.0.0.1:10801"
-    name: "backend-us-2"
-    # Example: Bind to a specific network interface
-    # Forces all outbound connections through this interface (avoids using default route).
-    # bind_interface: "eno" # Linux interface (or "en0" on macOS)
+    name: "us-west-1"
 
-  # Example: SOCKS5 over Unix domain socket backend
+  # ── EU region ────────────────────────────────────────────────────────────────
+  - type: socks5
+    address: "127.0.0.1:10802"
+    name: "eu-west-1"
+    username: "user3"
+    password: "pass3"
+
+  - type: socks5
+    address: "127.0.0.1:10803"
+    name: "eu-central-1"
+
+  # ── Asia-Pacific region ──────────────────────────────────────────────────────
+  - type: socks5
+    address: "127.0.0.1:10804"
+    name: "ap-east-1"
+
+  - type: socks5
+    address: "127.0.0.1:10805"
+    name: "ap-southeast-1"
+
+  # ── Special backends ─────────────────────────────────────────────────────────
   - type: socks5
     address: "unix:///run/my-proxy/socks5.sock"
     name: "local-socks5-uds"
 
-  # Example: Legacy UDS backend type (remains compatible)
-  - type: uds
-    address: "/run/my-proxy/socks5-legacy.sock"
-    name: "local-legacy-uds"
-
-  # Example: Direct outbound connection
-  # Connects directly to the target address without using any remote proxy backend.
   - type: direct
     name: "direct-out"
 
-  # Example: Shadowsocks backend running over Unix domain socket
-  - type: ss
-    address: "unix:///run/my-proxy/ss.sock"
-    name: "local-ss-uds"
-    username: "chacha20-ietf-poly1305" # cipher method
-    password: "my-shadowsocks-password"
-    pool_size: 10
-
-  # Example: Shadowsocks backend running over TCP
   - type: ss
     address: "ss-server.example.com:8388"
     name: "ss-backend-1"
@@ -118,7 +115,6 @@ backends:
     password: "my-shadowsocks-password"
     pool_size: 10
 
-  # Example: SOCKS5 backend with TLS client encryption
   - type: socks5
     address: "tls-socks5-server.example.com:10802"
     name: "backend-tls-1"
@@ -126,29 +122,85 @@ backends:
     password: "pass"
     tls:
       server_name: "tls-socks5-server.example.com"
-      insecure: false # set to true to disable certificate validation (not recommended)
+      insecure: false
     pool_size: 5
 
-# Backend groups let you cluster individual backends.
+
+# Backend groups
 # Strategy options:
-#   urltest  - Dynamically routes to the healthy backend with the lowest health check latency.
-#   failover - Routes in configured order: tries first backend, falls back to second if first is down.
+#   urltest      - Pick the healthy member with lowest latency.
+#   failover     - Try members in order; fall back to next if current is down.
+#   loadbalance  - Distribute connections by least active connections.
+#
+# Members can be backend names OR other group names (nested groups).
+#
+# ┌──────────────────────────────────────────────────────────────────┐
+# │                        Group Topology                           │
+# │                                                                 │
+# │  proxy-group (urltest)          telegram-group (failover)       │
+# │  ├── region-us (urltest)        ├── region-us (urltest)         │
+# │  │   ├── us-east-1              │   ├── us-east-1              │
+# │  │   └── us-west-1              │   └── us-west-1              │
+# │  └── region-eu (failover)       └── direct-out                  │
+# │      ├── eu-west-1                                              │
+# │      └── eu-central-1           global-fallback (failover)      │
+# │                                  ├── proxy-group                │
+# │  region-ap (loadbalance)         ├── region-ap                  │
+# │  ├── ap-east-1                   └── direct-out                 │
+# │  └── ap-southeast-1                                             │
+# └──────────────────────────────────────────────────────────────────┘
 groups:
-  - name: "group-us"
+  # ─── Leaf groups: physical backends only ─────────────────────────────────────
+  - name: "region-us"
     strategy: "urltest"
-    backends:
-      - "backend-us-1"
-      - "backend-us-2"
+    members:
+      - "us-east-1"
+      - "us-west-1"
+
+  - name: "region-eu"
+    strategy: "failover"
+    members:
+      - "eu-west-1"
+      - "eu-central-1"
+
+  - name: "region-ap"
+    strategy: "loadbalance"
+    members:
+      - "ap-east-1"
+      - "ap-southeast-1"
+
+  # ─── Nested group A: used by Inbound A (socks5 :1081) ───────────────────────
+  # Picks the fastest backend across US and EU regions.
+  - name: "proxy-group"
+    strategy: "urltest"
+    members:
+      - "region-us"               # nested group
+      - "region-eu"               # nested group
+
+  # ─── Nested group B: used by Inbound B (ss :8389, mtproto :8443) ─────────────
+  # Tries US backends first; falls back to direct if all US are down.
+  - name: "telegram-group"
+    strategy: "failover"
+    members:
+      - "region-us"               # nested group (shared with proxy-group)
+      - "direct-out"              # standalone backend
+
+  # ─── Nested group C: used as the global fallback (Inbound C and others) ──────
+  # Tries proxy-group first, then AP, then direct.
+  - name: "global-fallback"
+    strategy: "failover"
+    members:
+      - "proxy-group"             # nested group (itself contains nested groups)
+      - "region-ap"               # nested group
+      - "direct-out"              # standalone backend
 
 
 # Global priority failover order.
-# The load balancer attempts to resolve targets in this order.
-# Targets can be group names or single ungrouped backend names.
-# If omitted, default behavior falls back in sequential order: all groups first, followed by ungrouped backends.
+# Used by inbounds that do NOT specify a `route` field.
+# When an inbound has `route: "some-group"`, this global order is ignored for it.
 failover_order:
-  - "group-us"
+  - "global-fallback"
   - "local-socks5-uds"
-  - "direct-out"
 
 # Health check settings
 health_check:
@@ -162,32 +214,19 @@ web:
   listen: "127.0.0.1:9090"
 
 # CPU Affinity settings
-# Bind Tokio worker threads (main proxy traffic relay tasks) and ancillary threads
-# (health check, candidate selection, status dashboard) to specific CPU cores.
 cpu_affinity:
-  worker_cores: [0, 1]      # Core IDs to pin worker threads (hot path)
-  ancillary_cores: [2]     # Core IDs to pin ancillary/background tasks
+  worker_cores: [0, 1]
+  ancillary_cores: [2]
 
-
-# Experimental section
 # AdBlock Guard settings
-# ---------------------
-# Enables domain name filtering on inbound requests.
-# Supports AdGuard Home, ABP (Adblock Plus), and standard hosts file formats.
 adblock:
   enabled: true
-  # Optional: proxy backend or group name to fetch rule updates through.
-  # If omitted, updates will be downloaded via direct connection.
   backend: "direct-out"
-  # Remote rule lists to download and update periodically.
   urls:
     - "https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/SpiderFilter/sections/adservers.txt"
-  # Local rule files on the disk.
   files:
     - "/etc/proxylb/custom-blocklist.txt"
-  # Periodic update check interval for remote URLs (in hours).
   update_interval_hours: 24
-
 
 advanced:
   zero_copy: true

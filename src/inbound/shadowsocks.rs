@@ -29,6 +29,7 @@ pub async fn run_shadowsocks_inbound(
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
     tls_cfg: Option<crate::config::TlsServerConfig>,
+    route_idx: Option<usize>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let method: CipherKind = method_str
@@ -68,6 +69,7 @@ pub async fn run_shadowsocks_inbound(
                 stats,
                 filter_enabled,
                 tls_acceptor.as_deref().cloned(),
+                route_idx,
             )
             .await
             {
@@ -89,6 +91,7 @@ async fn handle_ss_connection<S>(
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    route_idx: Option<usize>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -132,7 +135,7 @@ where
 
     // Try backends in order with fallback.
     let (backend_stream, chosen_traffic) =
-        match crate::inbound::route_and_connect(&pool, &target).await {
+        match crate::inbound::route_and_connect(&pool, &target, route_idx).await {
             Ok((s, t)) => (s, t),
             Err(e) => {
                 tracing::warn!(

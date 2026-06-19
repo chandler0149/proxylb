@@ -103,7 +103,10 @@ pub struct GroupConfig {
     pub name: String,
     #[serde(default)]
     pub strategy: GroupStrategy,
-    pub backends: Vec<String>,
+    /// Members can be backend names or other group names (nested groups).
+    /// Accepts both `members` and legacy `backends` key in YAML.
+    #[serde(alias = "backends")]
+    pub members: Vec<String>,
 }
 
 /// Inbound listener configuration.
@@ -131,6 +134,9 @@ pub enum InboundItemConfig {
         tls: Option<TlsServerConfig>,
         #[serde(default)]
         filter: Option<FilterConfig>,
+        /// Optional route binding: group or backend name to route through.
+        #[serde(default)]
+        route: Option<String>,
     },
     Shadowsocks {
         listen: String,
@@ -140,6 +146,8 @@ pub enum InboundItemConfig {
         tls: Option<TlsServerConfig>,
         #[serde(default)]
         filter: Option<FilterConfig>,
+        #[serde(default)]
+        route: Option<String>,
     },
     Http {
         listen: String,
@@ -151,6 +159,8 @@ pub enum InboundItemConfig {
         tls: Option<TlsServerConfig>,
         #[serde(default)]
         filter: Option<FilterConfig>,
+        #[serde(default)]
+        route: Option<String>,
     },
     Mtproto {
         listen: String,
@@ -159,6 +169,8 @@ pub enum InboundItemConfig {
         tls: Option<TlsServerConfig>,
         #[serde(default)]
         filter: Option<FilterConfig>,
+        #[serde(default)]
+        route: Option<String>,
     },
 }
 
@@ -326,6 +338,7 @@ impl Config {
                 password: s5.password.clone(),
                 tls: None,
                 filter: Some(self.inbound.filter.clone()),
+                route: None,
             });
         }
         if let Some(ref ss) = self.inbound.shadowsocks {
@@ -335,6 +348,7 @@ impl Config {
                 method: ss.method.clone(),
                 tls: None,
                 filter: Some(self.inbound.filter.clone()),
+                route: None,
             });
         }
         if let Some(ref http) = self.inbound.http {
@@ -344,6 +358,7 @@ impl Config {
                 password: http.password.clone(),
                 tls: None,
                 filter: Some(self.inbound.filter.clone()),
+                route: None,
             });
         }
         if let Some(ref mtproto) = self.inbound.mtproto {
@@ -352,27 +367,16 @@ impl Config {
                 password: mtproto.secret.clone(),
                 tls: None,
                 filter: Some(self.inbound.filter.clone()),
+                route: None,
             });
         }
         for item in &self.inbounds {
             let mut resolved_item = item.clone();
             match &mut resolved_item {
-                InboundItemConfig::Socks5 { filter, .. } => {
-                    if filter.is_none() {
-                        *filter = Some(self.inbound.filter.clone());
-                    }
-                }
-                InboundItemConfig::Shadowsocks { filter, .. } => {
-                    if filter.is_none() {
-                        *filter = Some(self.inbound.filter.clone());
-                    }
-                }
-                InboundItemConfig::Http { filter, .. } => {
-                    if filter.is_none() {
-                        *filter = Some(self.inbound.filter.clone());
-                    }
-                }
-                InboundItemConfig::Mtproto { filter, .. } => {
+                InboundItemConfig::Socks5 { filter, .. }
+                | InboundItemConfig::Shadowsocks { filter, .. }
+                | InboundItemConfig::Http { filter, .. }
+                | InboundItemConfig::Mtproto { filter, .. } => {
                     if filter.is_none() {
                         *filter = Some(self.inbound.filter.clone());
                     }
@@ -437,9 +441,8 @@ impl Config {
             }
         }
 
-        // Validate groups
+        // Validate groups — members can be backends OR other groups (nested).
         let mut group_names = std::collections::HashSet::new();
-        let mut grouped_backends = std::collections::HashSet::new();
         for group in &self.groups {
             if group_names.contains(&group.name) {
                 anyhow::bail!("duplicate group name: {}", group.name);
@@ -449,21 +452,49 @@ impl Config {
             }
             group_names.insert(group.name.clone());
 
-            if group.backends.is_empty() {
-                anyhow::bail!("group '{}' has no backends", group.name);
+            if group.members.is_empty() {
+                anyhow::bail!("group '{}' has no members", group.name);
             }
+        }
 
-            for member in &group.backends {
-                if !backend_names.contains(member) {
+        // Second pass: validate that every member references a known backend or group.
+        for group in &self.groups {
+            for member in &group.members {
+                if !backend_names.contains(member) && !group_names.contains(member) {
                     anyhow::bail!(
-                        "group '{}' refers to non-existent backend '{}'",
+                        "group '{}' refers to non-existent member '{}' (must be a backend or group name)",
                         group.name,
                         member
                     );
                 }
-                // Enforce: the same backend cannot be used in multiple groups
-                if !grouped_backends.insert(member.clone()) {
-                    anyhow::bail!("backend '{}' cannot be used in multiple groups", member);
+            }
+        }
+
+        // Detect cycles in nested group references using DFS.
+        {
+            let group_map: std::collections::HashMap<&str, &[String]> = self
+                .groups
+                .iter()
+                .map(|g| (g.name.as_str(), g.members.as_slice()))
+                .collect();
+
+            for group in &self.groups {
+                let mut visited = std::collections::HashSet::new();
+                let mut stack = vec![group.name.as_str()];
+                while let Some(current) = stack.pop() {
+                    if !visited.insert(current) {
+                        anyhow::bail!(
+                            "cycle detected in group hierarchy involving '{}'",
+                            current
+                        );
+                    }
+                    if let Some(members) = group_map.get(current) {
+                        for m in *members {
+                            if group_names.contains(m.as_str()) {
+                                stack.push(m.as_str());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -477,11 +508,22 @@ impl Config {
                         target
                     );
                 }
-                // Enforce: a backend cannot be used as a standalone target in failover_order if it belongs to a group
-                if backend_names.contains(target) && grouped_backends.contains(target) {
+            }
+        }
+
+        // Validate inbound route bindings reference existing groups or backends.
+        for item in &self.all_inbounds() {
+            let route = match item {
+                InboundItemConfig::Socks5 { route, .. }
+                | InboundItemConfig::Shadowsocks { route, .. }
+                | InboundItemConfig::Http { route, .. }
+                | InboundItemConfig::Mtproto { route, .. } => route,
+            };
+            if let Some(r) = route {
+                if !group_names.contains(r.as_str()) && !backend_names.contains(r.as_str()) {
                     anyhow::bail!(
-                        "backend '{}' cannot be used as a standalone target in failover_order because it belongs to a group",
-                        target
+                        "inbound route '{}' refers to unknown group or backend",
+                        r
                     );
                 }
             }
@@ -551,7 +593,7 @@ mod tests {
             groups: vec![GroupConfig {
                 name: "g1".to_string(),
                 strategy: GroupStrategy::UrlTest,
-                backends: vec!["b1".to_string()],
+                members: vec!["b1".to_string()],
             }],
             failover_order: Some(vec!["g1".to_string(), "b2".to_string()]),
             health_check: HealthCheckConfig::default(),
@@ -565,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_duplicate_backend_in_multiple_groups() {
+    fn test_invalid_cycle_in_groups() {
         let cfg = Config {
             inbound: InboundConfig::default(),
             inbounds: vec![],
@@ -584,12 +626,12 @@ mod tests {
                 GroupConfig {
                     name: "g1".to_string(),
                     strategy: GroupStrategy::UrlTest,
-                    backends: vec!["b1".to_string()],
+                    members: vec!["g2".to_string()],
                 },
                 GroupConfig {
                     name: "g2".to_string(),
                     strategy: GroupStrategy::Failover,
-                    backends: vec!["b1".to_string()],
+                    members: vec!["g1".to_string()],
                 },
             ],
             failover_order: None,
@@ -602,33 +644,54 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(
-            err.to_string()
-                .contains("cannot be used in multiple groups")
+            err.to_string().contains("cycle detected"),
+            "expected cycle error, got: {}",
+            err
         );
     }
 
     #[test]
-    fn test_invalid_grouped_backend_as_standalone_in_failover_order() {
+    fn test_valid_nested_groups() {
         let cfg = Config {
             inbound: InboundConfig::default(),
             inbounds: vec![],
-            backends: vec![BackendConfig {
-                backend_type: "socks5".to_string(),
-                address: Some("127.0.0.1:8081".to_string()),
-                name: Some("b1".to_string()),
-                username: None,
-                password: None,
-                pool_size: 1,
-                bind_interface: None,
-                tls: None,
-                enabled: None,
-            }],
-            groups: vec![GroupConfig {
-                name: "g1".to_string(),
-                strategy: GroupStrategy::UrlTest,
-                backends: vec!["b1".to_string()],
-            }],
-            failover_order: Some(vec!["g1".to_string(), "b1".to_string()]),
+            backends: vec![
+                BackendConfig {
+                    backend_type: "socks5".to_string(),
+                    address: Some("127.0.0.1:8081".to_string()),
+                    name: Some("b1".to_string()),
+                    username: None,
+                    password: None,
+                    pool_size: 1,
+                    bind_interface: None,
+                    tls: None,
+                    enabled: None,
+                },
+                BackendConfig {
+                    backend_type: "socks5".to_string(),
+                    address: Some("127.0.0.1:8082".to_string()),
+                    name: Some("b2".to_string()),
+                    username: None,
+                    password: None,
+                    pool_size: 1,
+                    bind_interface: None,
+                    tls: None,
+                    enabled: None,
+                },
+            ],
+            groups: vec![
+                GroupConfig {
+                    name: "leaf".to_string(),
+                    strategy: GroupStrategy::UrlTest,
+                    members: vec!["b1".to_string(), "b2".to_string()],
+                },
+                GroupConfig {
+                    name: "parent".to_string(),
+                    strategy: GroupStrategy::Failover,
+                    members: vec!["leaf".to_string()],
+                },
+            ],
+            failover_order: Some(vec!["parent".to_string()]),
             health_check: HealthCheckConfig::default(),
             web: WebConfig::default(),
             bind_interface: None,
@@ -636,11 +699,7 @@ mod tests {
             adblock: AdBlockConfig::default(),
             advanced: AdvancedConfig::default(),
         };
-        let err = cfg.validate().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot be used as a standalone target")
-        );
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

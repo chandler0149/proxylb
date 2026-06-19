@@ -19,6 +19,7 @@ pub async fn run_mtproto_inbound(
     filter_enabled: bool,
     secret_hex: String,
     _tls_cfg: Option<crate::config::TlsServerConfig>,
+    route_idx: Option<usize>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut secret = [0u8; MTPROTO_SECRET_BYTES];
@@ -48,6 +49,7 @@ pub async fn run_mtproto_inbound(
                 filter_enabled,
                 secret,
                 SecureRandom::new(),
+                route_idx,
             )
             .await
             {
@@ -135,6 +137,7 @@ async fn handle_mtproto_connection<S>(
     filter_enabled: bool,
     secret: [u8; MTPROTO_SECRET_BYTES],
     rng: SecureRandom,
+    route_idx: Option<usize>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + crate::relay::AsRawStreamRef + 'static,
@@ -206,7 +209,7 @@ where
         handshake.copy_from_slice(&handshake_bytes);
 
         let (backend_stream, chosen_traffic, target_addr, validation) = connect_and_proxy(
-            &handshake, secret, pool, stats.clone(), filter_enabled, true
+            &handshake, secret, pool, stats.clone(), filter_enabled, true, route_idx
         ).await?;
 
         let client_combined = CombinedStream::new(
@@ -237,7 +240,7 @@ where
         handshake.copy_from_slice(&peek_buf[..HANDSHAKE_LEN]);
 
         let (backend_stream, chosen_traffic, target_addr, validation) = connect_and_proxy(
-            &handshake, secret, pool, stats.clone(), filter_enabled, false
+            &handshake, secret, pool, stats.clone(), filter_enabled, false, route_idx
         ).await?;
 
         let peek_stream = PeekStream::new(stream, peek_buf[HANDSHAKE_LEN..peek_len].to_vec());
@@ -265,6 +268,7 @@ async fn connect_and_proxy(
     _stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
     _is_tls: bool,
+    route_idx: Option<usize>,
 ) -> anyhow::Result<(
     crate::outbound::BackendStream,
     std::sync::Arc<crate::backend::TrafficCounters>,
@@ -331,7 +335,7 @@ async fn connect_and_proxy(
         anyhow::bail!("Connection blocked by adblock");
     }
 
-    let (mut backend_stream, chosen_traffic) = crate::inbound::route_and_connect(&pool, &target_addr).await?;
+    let (mut backend_stream, chosen_traffic) = crate::inbound::route_and_connect(&pool, &target_addr, route_idx).await?;
     
     let (nonce, tg_encryptor, tg_decryptor) = generate_and_encrypt_tg_nonce(
         validation.proto_tag,

@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{BackendConfig, GroupConfig, GroupStrategy};
 use crate::outbound::BackendStream;
 use tokio_rustls::TlsConnector;
+use std::collections::HashMap;
 
 /// Lock-free per-backend traffic counters.
 ///
@@ -346,10 +347,35 @@ pub struct PooledConn {
 }
 
 #[derive(Debug, Clone)]
+pub enum GroupMember {
+    Backend(usize),
+    Group(usize),
+}
+
+#[derive(Debug, Clone)]
 pub struct Group {
     pub name: String,
     pub strategy: GroupStrategy,
-    pub backend_indices: Vec<usize>,
+    pub members: Vec<GroupMember>,
+}
+
+impl Group {
+    /// Recursively flatten this group into an ordered list of backend indices,
+    /// applying each nested group's strategy along the way.
+    pub fn flatten_backend_indices(&self, all_groups: &[Group]) -> Vec<usize> {
+        let mut result = Vec::new();
+        for member in &self.members {
+            match member {
+                GroupMember::Backend(idx) => result.push(*idx),
+                GroupMember::Group(g_idx) => {
+                    if let Some(nested) = all_groups.get(*g_idx) {
+                        result.extend(nested.flatten_backend_indices(all_groups));
+                    }
+                }
+            }
+        }
+        result
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,6 +428,8 @@ pub struct BackendHotPath {
 pub struct BackendPool {
     inner: Arc<RwLock<BackendPoolInner>>,
     cached: Arc<ArcSwap<CachedCandidates>>,
+    route_map: Arc<HashMap<String, usize>>,
+    route_caches: Arc<ArcSwap<Vec<Arc<CachedCandidates>>>>,
     pub hot_paths: Arc<ArcSwap<Vec<BackendHotPath>>>,
     pub inbound_stats: Arc<parking_lot::Mutex<Vec<Arc<InboundStats>>>>,
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
@@ -414,25 +442,35 @@ fn build_groups_and_failover_order(
     group_configs: &[GroupConfig],
     failover_order_cfg: Option<&Vec<String>>,
 ) -> (Vec<Group>, Vec<Target>) {
+    // First pass: create groups with name-only references so we can build an
+    // index map. We resolve the actual GroupMember variants in a second pass.
+    let group_name_to_idx: HashMap<&str, usize> = group_configs
+        .iter()
+        .enumerate()
+        .map(|(i, gc)| (gc.name.as_str(), i))
+        .collect();
+
     let mut groups = Vec::with_capacity(group_configs.len());
     for gc in group_configs {
-        let mut indices = Vec::new();
-        for member_name in &gc.backends {
-            if let Some(pos) = entries.iter().position(|e| e.info.name == *member_name) {
-                indices.push(pos);
+        let mut members = Vec::new();
+        for member_name in &gc.members {
+            if let Some(&g_idx) = group_name_to_idx.get(member_name.as_str()) {
+                members.push(GroupMember::Group(g_idx));
+            } else if let Some(pos) = entries.iter().position(|e| e.info.name == *member_name) {
+                members.push(GroupMember::Backend(pos));
             }
         }
         groups.push(Group {
             name: gc.name.clone(),
             strategy: gc.strategy,
-            backend_indices: indices,
+            members,
         });
     }
 
     let mut failover_order = Vec::new();
     if let Some(order) = failover_order_cfg {
         for target_name in order {
-            if let Some(pos) = groups.iter().position(|g| g.name == *target_name) {
+            if let Some(&pos) = group_name_to_idx.get(target_name.as_str()) {
                 failover_order.push(Target::Group(pos));
             } else if let Some(pos) = entries.iter().position(|e| e.info.name == *target_name) {
                 failover_order.push(Target::Backend(pos));
@@ -457,7 +495,7 @@ fn build_groups_and_failover_order(
         // 3. Standalone backends (not in any group)
         let mut grouped_indices = std::collections::HashSet::new();
         for g in &groups {
-            for &idx in &g.backend_indices {
+            for idx in g.flatten_backend_indices(&groups) {
                 grouped_indices.insert(idx);
             }
         }
@@ -472,137 +510,176 @@ fn build_groups_and_failover_order(
     (groups, failover_order)
 }
 
+/// Recursively collect backend candidates from a group, returning ordered blocks of indices.
+fn collect_group_candidates_recursive(
+    group: &Group,
+    entries: &[BackendEntry],
+    groups: &[Group],
+) -> (Vec<usize>, Vec<usize>) {
+    let mut member_results = Vec::new();
+
+    for member in &group.members {
+        let (h, u) = match member {
+            GroupMember::Backend(idx) => {
+                if let Some(entry) = entries.get(*idx) {
+                    let status = entry.status.lock();
+                    if status.enabled {
+                        if status.healthy {
+                            (vec![*idx], vec![])
+                        } else {
+                            (vec![], vec![*idx])
+                        }
+                    } else {
+                        (vec![], vec![])
+                    }
+                } else {
+                    (vec![], vec![])
+                }
+            }
+            GroupMember::Group(g_idx) => {
+                if let Some(nested) = groups.get(*g_idx) {
+                    collect_group_candidates_recursive(nested, entries, groups)
+                } else {
+                    (vec![], vec![])
+                }
+            }
+        };
+        member_results.push((h, u));
+    }
+
+    let mut sorted_healthy: Vec<_> = member_results.iter().map(|(h, _)| h.clone()).collect();
+    apply_strategy_sort_nested(&group.strategy, entries, &mut sorted_healthy);
+
+    let mut sorted_unhealthy: Vec<_> = member_results.iter().map(|(_, u)| u.clone()).collect();
+    apply_strategy_sort_nested(&group.strategy, entries, &mut sorted_unhealthy);
+
+    let flat_h = sorted_healthy.into_iter().flatten().collect();
+    let flat_u = sorted_unhealthy.into_iter().flatten().collect();
+
+    (flat_h, flat_u)
+}
+
+fn apply_strategy_sort_nested(
+    strategy: &GroupStrategy,
+    entries: &[BackendEntry],
+    blocks: &mut Vec<Vec<usize>>,
+) {
+    match strategy {
+        GroupStrategy::UrlTest => {
+            blocks.sort_by_key(|block| {
+                block
+                    .first()
+                    .and_then(|&idx| entries.get(idx).and_then(|e| e.status.lock().last_latency))
+                    .unwrap_or(Duration::MAX)
+            });
+        }
+        GroupStrategy::Failover => {
+            // Keep configured order
+        }
+        GroupStrategy::LoadBalance => {
+            blocks.sort_by_key(|block| {
+                if let Some(&idx) = block.first() {
+                    if let Some(entry) = entries.get(idx) {
+                        let tc = &entry.traffic;
+                        return (
+                            tc.total_connections.load(Ordering::Relaxed),
+                            tc.active_connections.load(Ordering::Relaxed),
+                        );
+                    }
+                }
+                (u64::MAX, i64::MAX)
+            });
+        }
+    }
+}
+
+fn deduplicate_candidates(
+    raw_h: Vec<usize>,
+    raw_u: Vec<usize>,
+    entries: &[BackendEntry],
+) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
+    let mut h = Vec::new();
+    let mut u = Vec::new();
+    let mut added_h = std::collections::HashSet::new();
+    let mut added_u = std::collections::HashSet::new();
+
+    for idx in raw_h {
+        if added_h.insert(idx) {
+            if let Some(entry) = entries.get(idx) {
+                h.push((idx, entry.info.clone()));
+            }
+        }
+    }
+    for idx in raw_u {
+        if !added_h.contains(&idx) && added_u.insert(idx) {
+            if let Some(entry) = entries.get(idx) {
+                u.push((idx, entry.info.clone()));
+            }
+        }
+    }
+    (h, u)
+}
+
 fn calculate_candidates(
     entries: &[BackendEntry],
     groups: &[Group],
     failover_order: &[Target],
 ) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
-    let mut healthy_candidates = Vec::new();
-    let mut unhealthy_candidates = Vec::new();
+    let mut raw_h = Vec::new();
+    let mut raw_u = Vec::new();
 
-    let mut added_healthy = std::collections::HashSet::new();
-    let mut added_unhealthy = std::collections::HashSet::new();
-
-    // 1. First pass: Populate healthy candidates in order.
     for target in failover_order {
         match target {
             Target::Backend(idx) => {
                 if let Some(entry) = entries.get(*idx) {
                     let status = entry.status.lock();
-                    if status.enabled && status.healthy && !added_healthy.contains(idx) {
-                        healthy_candidates.push((*idx, entry.info.clone()));
-                        added_healthy.insert(*idx);
+                    if status.enabled {
+                        if status.healthy {
+                            raw_h.push(*idx);
+                        } else {
+                            raw_u.push(*idx);
+                        }
                     }
                 }
             }
             Target::Group(g_idx) => {
                 if let Some(group) = groups.get(*g_idx) {
-                    // Gather healthy backends in group
-                    let mut group_healthy = Vec::new();
-                    for &idx in &group.backend_indices {
-                        if let Some(entry) = entries.get(idx) {
-                            let status = entry.status.lock();
-                            if status.enabled && status.healthy && !added_healthy.contains(&idx) {
-                                group_healthy.push((idx, entry.info.clone(), status.last_latency));
-                            }
-                        }
-                    }
-
-                    // Apply group selection strategy
-                    match group.strategy {
-                        GroupStrategy::UrlTest => {
-                            // Sort by latency ascending. None is treated as Duration::MAX (lowest priority).
-                            group_healthy.sort_by_key(|(_, _, lat)| lat.unwrap_or(Duration::MAX));
-                        }
-                        GroupStrategy::Failover => {
-                            // Keep configured order
-                        }
-                        GroupStrategy::LoadBalance => {
-                            // Sort by total historical connections, then active connections.
-                            group_healthy.sort_by_key(|&(idx, _, _)| {
-                                let tc = &entries[idx].traffic;
-                                (
-                                    tc.total_connections.load(Ordering::Relaxed),
-                                    tc.active_connections.load(Ordering::Relaxed),
-                                )
-                            });
-                        }
-                    }
-
-                    // Add to final list
-                    for (idx, info, _) in group_healthy {
-                        healthy_candidates.push((idx, info));
-                        added_healthy.insert(idx);
-                    }
+                    let (gh, gu) = collect_group_candidates_recursive(group, entries, groups);
+                    raw_h.extend(gh);
+                    raw_u.extend(gu);
                 }
             }
         }
     }
 
-    // 2. Second pass: Populate unhealthy candidates (fallbacks) in order.
-    for target in failover_order {
-        match target {
-            Target::Backend(idx) => {
-                if let Some(entry) = entries.get(*idx) {
-                    let status = entry.status.lock();
-                    if status.enabled
-                        && !status.healthy
-                        && !added_healthy.contains(idx)
-                        && !added_unhealthy.contains(idx)
-                    {
-                        unhealthy_candidates.push((*idx, entry.info.clone()));
-                        added_unhealthy.insert(*idx);
-                    }
-                }
-            }
-            Target::Group(g_idx) => {
-                if let Some(group) = groups.get(*g_idx) {
-                    // Gather unhealthy backends in group
-                    let mut group_unhealthy = Vec::new();
-                    for &idx in &group.backend_indices {
-                        if let Some(entry) = entries.get(idx) {
-                            let status = entry.status.lock();
-                            if status.enabled
-                                && !status.healthy
-                                && !added_healthy.contains(&idx)
-                                && !added_unhealthy.contains(&idx)
-                            {
-                                group_unhealthy.push((
-                                    idx,
-                                    entry.info.clone(),
-                                    status.last_latency,
-                                ));
-                            }
-                        }
-                    }
+    deduplicate_candidates(raw_h, raw_u, entries)
+}
 
-                    // Sort if urltest or loadbalance
-                    match group.strategy {
-                        GroupStrategy::UrlTest => {
-                            group_unhealthy.sort_by_key(|(_, _, lat)| lat.unwrap_or(Duration::MAX));
-                        }
-                        GroupStrategy::Failover => {}
-                        GroupStrategy::LoadBalance => {
-                            group_unhealthy.sort_by_key(|&(idx, _, _)| {
-                                let tc = &entries[idx].traffic;
-                                (
-                                    tc.total_connections.load(Ordering::Relaxed),
-                                    tc.active_connections.load(Ordering::Relaxed),
-                                )
-                            });
-                        }
-                    }
+/// Calculate candidates for a specific route target (group or backend name).
+fn calculate_route_candidates(
+    route: &str,
+    entries: &[BackendEntry],
+    groups: &[Group],
+) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
+    if let Some(group) = groups.iter().find(|g| g.name == route) {
+        let (raw_h, raw_u) = collect_group_candidates_recursive(group, entries, groups);
+        return deduplicate_candidates(raw_h, raw_u, entries);
+    }
 
-                    for (idx, info, _) in group_unhealthy {
-                        unhealthy_candidates.push((idx, info));
-                        added_unhealthy.insert(idx);
-                    }
+    if let Some(idx) = entries.iter().position(|e| e.info.name == route) {
+        if let Some(entry) = entries.get(idx) {
+            let status = entry.status.lock();
+            if status.enabled {
+                if status.healthy {
+                    return (vec![(idx, entry.info.clone())], vec![]);
+                } else {
+                    return (vec![], vec![(idx, entry.info.clone())]);
                 }
             }
         }
     }
 
-    (healthy_candidates, unhealthy_candidates)
+    (vec![], vec![])
 }
 
 impl BackendPool {
@@ -615,6 +692,7 @@ impl BackendPool {
         rt_chg_signal: tokio::sync::watch::Receiver<u64>,
         adblock_config: &crate::config::AdBlockConfig,
         ancillary_handle: tokio::runtime::Handle,
+        active_routes: std::collections::HashSet<String>,
     ) -> anyhow::Result<Self> {
         let mut entries = Vec::with_capacity(configs.len());
         for (i, cfg) in configs.iter().enumerate() {
@@ -670,6 +748,13 @@ impl BackendPool {
 
         let adblock_manager = Arc::new(crate::adblock::AdBlockManager::new(adblock_config.enabled));
 
+        let mut route_map = HashMap::new();
+        for (i, route) in active_routes.into_iter().enumerate() {
+            route_map.insert(route, i);
+        }
+        let route_map = Arc::new(route_map);
+        let route_caches = Arc::new(ArcSwap::from_pointee(vec![Arc::new(CachedCandidates { healthy: vec![], unhealthy: vec![] }); route_map.len()]));
+
         Ok(Self {
             inner: Arc::new(RwLock::new(BackendPoolInner {
                 entries,
@@ -677,6 +762,8 @@ impl BackendPool {
                 failover_order,
             })),
             cached,
+            route_map,
+            route_caches,
             hot_paths,
             inbound_stats: Arc::new(parking_lot::Mutex::new(Vec::new())),
             rt_chg_signal,
@@ -906,15 +993,35 @@ impl BackendPool {
     }
 
     /// Get the order of backends to try, separated into healthy and unhealthy lists.
-    #[allow(dead_code)]
-    pub async fn get_candidates(&self) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
-        let guard = self.cached.load();
-        (guard.healthy.clone(), guard.unhealthy.clone())
-    }
+    // #[allow(dead_code)]
+    // pub async fn get_candidates(&self) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
+    //     let guard = self.cached.load();
+    //     (guard.healthy.clone(), guard.unhealthy.clone())
+    // }
 
     /// Get a lock-free guard to the cached candidates (avoiding any Arc clone/refcount overhead).
-    pub fn get_candidates_guard(&self) -> arc_swap::Guard<Arc<CachedCandidates>> {
-        self.cached.load()
+    // pub fn get_candidates_guard(&self) -> arc_swap::Guard<Arc<CachedCandidates>> {
+    //     self.cached.load()
+    // }
+
+    /// Get the array index for a given route name to use in O(1) lookups.
+    pub fn get_route_index(&self, route: &str) -> Option<usize> {
+        self.route_map.get(route).copied()
+    }
+
+    /// Get a lock-free guard to cached candidates for a specific route index.
+    /// Falls back to global candidates if no route index is provided.
+    pub fn get_route_candidates(
+        &self,
+        route_idx: Option<usize>,
+    ) -> Arc<CachedCandidates> {
+        if let Some(idx) = route_idx {
+            let caches = self.route_caches.load();
+            if let Some(cached) = caches.get(idx) {
+                return cached.clone();
+            }
+        }
+        self.cached.load_full()
     }
 
     /// Mark a backend as healthy with measured latency.
@@ -1024,6 +1131,19 @@ impl BackendPool {
             healthy: ch,
             unhealthy: cu,
         }));
+
+        let mut new_route_caches = vec![
+            Arc::new(CachedCandidates { healthy: vec![], unhealthy: vec![] });
+            self.route_map.len()
+        ];
+        for (name, &idx) in self.route_map.iter() {
+            let (gh, gu) = calculate_route_candidates(name, &guard.entries, &guard.groups);
+            new_route_caches[idx] = Arc::new(CachedCandidates {
+                healthy: gh,
+                unhealthy: gu,
+            });
+        }
+        self.route_caches.store(Arc::new(new_route_caches));
     }
 
     /// Get status views for the web dashboard.
@@ -1031,10 +1151,13 @@ impl BackendPool {
         let guard = self.inner.read().await;
         let mut views = Vec::with_capacity(guard.entries.len());
         for (i, e) in guard.entries.iter().enumerate() {
+            // Find the most immediate group containing this backend
             let group_name = guard
                 .groups
                 .iter()
-                .find(|g| g.backend_indices.contains(&i))
+                .find(|g| {
+                    g.members.iter().any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
+                })
                 .map(|g| g.name.clone());
 
             let status = e.status.lock();
@@ -1069,7 +1192,9 @@ impl BackendPool {
             let group_name = guard
                 .groups
                 .iter()
-                .find(|g| g.backend_indices.contains(&i))
+                .find(|g| {
+                    g.members.iter().any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
+                })
                 .map(|g| g.name.clone());
 
             let status = e.status.lock();
@@ -1103,8 +1228,9 @@ impl BackendPool {
                 }
                 Target::Group(g_idx) => {
                     if let Some(group) = guard.groups.get(*g_idx) {
+                        let flat_indices = group.flatten_backend_indices(&guard.groups);
                         let mut group_backends = Vec::new();
-                        for &b_idx in &group.backend_indices {
+                        for b_idx in flat_indices {
                             if let Some(status) = views.get(b_idx) {
                                 group_backends.push(status.clone());
                             }
@@ -1330,6 +1456,7 @@ mod tests {
             rx,
             &crate::config::AdBlockConfig::default(),
             tokio::runtime::Handle::current(),
+            std::collections::HashSet::new(),
         )
     }
 
@@ -1343,14 +1470,14 @@ mod tests {
         let g1 = GroupConfig {
             name: "group-urltest".to_string(),
             strategy: GroupStrategy::UrlTest,
-            backends: vec!["b1".to_string(), "b2".to_string()],
+            members: vec!["b1".to_string(), "b2".to_string()],
         };
 
         // Group 2 uses failover
         let g2 = GroupConfig {
             name: "group-failover".to_string(),
             strategy: GroupStrategy::Failover,
-            backends: vec!["b2".to_string(), "b3".to_string()],
+            members: vec!["b2".to_string(), "b3".to_string()],
         };
 
         let pool = new_test_pool(
@@ -1407,7 +1534,7 @@ mod tests {
             &[GroupConfig {
                 name: "group-fo".to_string(),
                 strategy: GroupStrategy::Failover,
-                backends: vec!["b2".to_string(), "b1".to_string()],
+                members: vec!["b2".to_string(), "b1".to_string()],
             }],
             Some(&vec!["group-fo".to_string()]),
             None,
@@ -1433,7 +1560,7 @@ mod tests {
         let g = GroupConfig {
             name: "group-lb".to_string(),
             strategy: GroupStrategy::LoadBalance,
-            backends: vec!["b1".to_string(), "b2".to_string()],
+            members: vec!["b1".to_string(), "b2".to_string()],
         };
 
         let pool =
@@ -1497,14 +1624,14 @@ mod tests {
         let g1 = GroupConfig {
             name: "g-lb".to_string(),
             strategy: GroupStrategy::LoadBalance,
-            backends: vec!["b1".to_string()],
+            members: vec!["b1".to_string()],
         };
 
         // g2 is failover (static)
         let g2 = GroupConfig {
             name: "g-fo".to_string(),
             strategy: GroupStrategy::Failover,
-            backends: vec!["b2".to_string()],
+            members: vec!["b2".to_string()],
         };
 
         // b3 is standalone (not in any group)
@@ -1535,7 +1662,7 @@ mod tests {
         let g1 = GroupConfig {
             name: "group-1".to_string(),
             strategy: GroupStrategy::Failover,
-            backends: vec!["b1".to_string()],
+            members: vec!["b1".to_string()],
         };
 
         let pool = new_test_pool(
@@ -1554,7 +1681,7 @@ mod tests {
         let g1_new = GroupConfig {
             name: "group-1".to_string(),
             strategy: GroupStrategy::Failover,
-            backends: vec!["b1".to_string(), "b2".to_string()],
+            members: vec!["b1".to_string(), "b2".to_string()],
         };
 
         let (added, removed, kept) = pool

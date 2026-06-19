@@ -163,6 +163,7 @@ mod tests {
             rx,
             &AdBlockConfig::default(),
             tokio::runtime::Handle::current(),
+            std::collections::HashSet::new(),
         )
         .unwrap();
 
@@ -197,6 +198,7 @@ mod tests {
             rx,
             &AdBlockConfig::default(),
             tokio::runtime::Handle::current(),
+            std::collections::HashSet::new(),
         )
         .unwrap();
 

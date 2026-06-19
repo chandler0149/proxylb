@@ -23,6 +23,7 @@ pub async fn run_http_inbound(
     tls_cfg: Option<crate::config::TlsServerConfig>,
     username: Option<String>,
     password: Option<String>,
+    route_idx: Option<usize>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let tls_acceptor = tls_cfg
@@ -52,6 +53,7 @@ pub async fn run_http_inbound(
                 tls_acceptor.as_deref().cloned(),
                 username,
                 password,
+                route_idx,
             )
             .await
             {
@@ -72,6 +74,7 @@ async fn handle_http_connection<S>(
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     username: Option<Arc<String>>,
     password: Option<Arc<String>>,
+    route_idx: Option<usize>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -150,7 +153,7 @@ where
 
     // Try backends in order with fallback.
     let (mut backend_stream, chosen_traffic) =
-        match crate::inbound::route_and_connect(&pool, &target).await {
+        match crate::inbound::route_and_connect(&pool, &target, route_idx).await {
             Ok((s, t)) => (s, t),
             Err(e) => {
                 tracing::warn!(

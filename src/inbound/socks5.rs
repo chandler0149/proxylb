@@ -27,6 +27,7 @@ pub async fn run_socks5_inbound(
     tls_cfg: Option<crate::config::TlsServerConfig>,
     username: Option<String>,
     password: Option<String>,
+    route_idx: Option<usize>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let tls_acceptor = tls_cfg
@@ -55,6 +56,7 @@ pub async fn run_socks5_inbound(
                 tls_acceptor.as_deref().cloned(),
                 username,
                 password,
+                route_idx,
             )
             .await
             {
@@ -75,6 +77,7 @@ async fn handle_socks5_connection<S>(
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     username: Option<Arc<String>>,
     password: Option<Arc<String>>,
+    route_idx: Option<usize>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -96,13 +99,13 @@ where
             password: p.as_ref().clone(),
         });
         let socks5_socket = Socks5Socket::new(stream, std::sync::Arc::new(config));
-        handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled).await
+        handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled, route_idx).await
     } else {
         let mut config = Config::<DenyAuthentication>::default();
         config.set_execute_command(false);
         config.set_dns_resolve(false);
         let socks5_socket = Socks5Socket::new(stream, std::sync::Arc::new(config));
-        handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled).await
+        handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled, route_idx).await
     }
 }
 
@@ -112,6 +115,7 @@ async fn handle_socks5_handshake<S, A>(
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
+    route_idx: Option<usize>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -162,7 +166,7 @@ where
 
     // Try backends in order with fallback.
     let (backend_stream, chosen_traffic) =
-        match crate::inbound::route_and_connect(&pool, &target).await {
+        match crate::inbound::route_and_connect(&pool, &target, route_idx).await {
             Ok((s, t)) => (s, t),
             Err(e) => {
                 tracing::warn!(target = %target, error = %e, "all backends failed");

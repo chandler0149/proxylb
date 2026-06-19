@@ -169,9 +169,13 @@ pub fn unlikely(b: bool) -> bool {
 pub fn cold_path() {}
 
 /// Consolidates high-performance routing and load-balanced/failover backend connection establishment.
+///
+/// When `route` is `Some`, uses route-specific candidates (bound to a group or backend).
+/// When `route` is `None`, uses the global failover order.
 pub async fn route_and_connect(
     pool: &crate::backend::BackendPool,
     target: &TargetAddr,
+    route_idx: Option<usize>,
 ) -> Result<
     (
         crate::outbound::BackendStream,
@@ -187,13 +191,17 @@ pub async fn route_and_connect(
     use std::time::Duration;
 
     let backend_timeout = Duration::from_secs(10);
-    let candidates = pool.get_candidates_guard();
+
+    // Use route-specific candidates if a route is bound, otherwise global.
+    let candidates = pool.get_route_candidates(route_idx);
+    let healthy = &candidates.healthy;
+    let unhealthy = &candidates.unhealthy;
 
     let mut backend_stream: Option<crate::outbound::BackendStream> = None;
     let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
 
     // First pass: try healthy backends.
-    for (index, info) in &candidates.healthy {
+    for (index, info) in healthy {
         // Lock-free cache lookup: yields both the pooled stream (if any) and the traffic Arc.
         let pc = pool.get_pooled_connection(*index);
         let (pool_stream, traffic) = match pc {
@@ -226,7 +234,7 @@ pub async fn route_and_connect(
                     if let Some(ref tc) = traffic {
                         tc.pool_misses.fetch_add(1, Ordering::Relaxed);
                     }
-                    ss_connect_fresh(&info, ss_cfg, ss_ctx, target, backend_timeout).await
+                    ss_connect_fresh(info, ss_cfg, ss_ctx, target, backend_timeout).await
                 }
             }
         } else {
@@ -280,13 +288,13 @@ pub async fn route_and_connect(
 
     // Second pass: try unhealthy backends as last resort.
     if backend_stream.is_none() {
-        for (index, info) in &candidates.unhealthy {
+        for (index, info) in unhealthy {
             let result: std::io::Result<BackendStream> = if info.is_direct() {
                 direct_connect(target, backend_timeout, info.bind_interface.as_deref()).await
             } else if info.is_shadowsocks() {
                 let ss_cfg = info.ss_config.as_ref().unwrap();
                 let ss_ctx = info.ss_context.as_ref().unwrap().clone();
-                ss_connect_fresh(&info, ss_cfg, ss_ctx, target, backend_timeout).await
+                ss_connect_fresh(info, ss_cfg, ss_ctx, target, backend_timeout).await
             } else {
                 socks5h_connect(info, target, backend_timeout).await
             };

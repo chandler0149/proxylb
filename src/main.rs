@@ -176,6 +176,20 @@ async fn main_async(
     let (route_tx, route_rx) = tokio::sync::watch::channel(0u64);
     route_watcher::start_route_watcher(&ancillary_handle, route_tx);
 
+    // Compute all active routes used by inbounds
+    let mut active_routes = std::collections::HashSet::new();
+    for item in config.all_inbounds() {
+        let route = match item {
+            config::InboundItemConfig::Socks5 { route, .. } => route,
+            config::InboundItemConfig::Shadowsocks { route, .. } => route,
+            config::InboundItemConfig::Http { route, .. } => route,
+            config::InboundItemConfig::Mtproto { route, .. } => route,
+        };
+        if let Some(r) = route {
+            active_routes.insert(r.clone());
+        }
+    }
+
     // Initialize backend pool.
     let pool = backend::BackendPool::new(
         &config.backends,
@@ -185,6 +199,7 @@ async fn main_async(
         route_rx.clone(),
         &config.adblock,
         ancillary_handle.clone(),
+        active_routes,
     )?;
 
     let mut ancillary_handles = Vec::new();
@@ -244,6 +259,7 @@ async fn main_async(
                 tls: tls_cfg,
                 username,
                 password,
+                route,
             } => {
                 let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
                 let stats = pool.register_inbound(
@@ -251,6 +267,7 @@ async fn main_async(
                     listen.clone(),
                     "socks5".to_string(),
                 );
+                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
                 handles.push(worker_handle.spawn(async move {
                     if let Err(e) = inbound::socks5::run_socks5_inbound(
                         listen,
@@ -260,6 +277,7 @@ async fn main_async(
                         tls_cfg,
                         username,
                         password,
+                        route_idx,
                         cancel,
                     )
                     .await
@@ -274,6 +292,7 @@ async fn main_async(
                 method,
                 filter,
                 tls: tls_cfg,
+                route,
             } => {
                 let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
                 let stats = pool.register_inbound(
@@ -281,6 +300,7 @@ async fn main_async(
                     listen.clone(),
                     "shadowsocks".to_string(),
                 );
+                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
                 handles.push(worker_handle.spawn(async move {
                     if let Err(e) = inbound::shadowsocks::run_shadowsocks_inbound(
                         listen,
@@ -290,6 +310,7 @@ async fn main_async(
                         stats,
                         filter_enabled,
                         tls_cfg,
+                        route_idx,
                         cancel,
                     )
                     .await
@@ -304,6 +325,7 @@ async fn main_async(
                 tls: tls_cfg,
                 username,
                 password,
+                route,
             } => {
                 let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
                 let stats = pool.register_inbound(
@@ -311,6 +333,7 @@ async fn main_async(
                     listen.clone(),
                     "http".to_string(),
                 );
+                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
                 handles.push(worker_handle.spawn(async move {
                     if let Err(e) = inbound::http::run_http_inbound(
                         listen,
@@ -320,6 +343,7 @@ async fn main_async(
                         tls_cfg,
                         username,
                         password,
+                        route_idx,
                         cancel,
                     )
                     .await
@@ -333,6 +357,7 @@ async fn main_async(
                 password: secret,
                 tls: tls_cfg,
                 filter,
+                route,
             } => {
                 let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
                 let stats = pool.register_inbound(
@@ -340,6 +365,7 @@ async fn main_async(
                     listen.clone(),
                     "mtproto".to_string(),
                 );
+                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
                 handles.push(worker_handle.spawn(async move {
                     if let Err(e) = inbound::mtproto::run_mtproto_inbound(
                         listen,
@@ -348,6 +374,7 @@ async fn main_async(
                         filter_enabled,
                         secret,
                         tls_cfg,
+                        route_idx,
                         cancel,
                     )
                     .await

@@ -15,7 +15,7 @@ shadowsocks = { version = "1.24", features = ["aead-cipher-extra"] }
 fast-socks5 = "1.0.0"
 
 # MTProto Server implementation
-mtproto-server = { path = "../telemt/mtproto-server" }
+mtproto-server = { path = "./submodules/telemt/mtproto-server" }
 
 # Web dashboard
 axum = "0.8"
