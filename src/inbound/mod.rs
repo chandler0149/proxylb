@@ -1,4 +1,5 @@
 pub mod http;
+pub mod mtproto;
 pub mod shadowsocks;
 pub mod socks5;
 

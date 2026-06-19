@@ -14,6 +14,9 @@ shadowsocks = { version = "1.24", features = ["aead-cipher-extra"] }
 # SOCKS5 server
 fast-socks5 = "1.0.0"
 
+# MTProto Server implementation
+mtproto-server = { path = "../telemt/mtproto-server" }
+
 # Web dashboard
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }

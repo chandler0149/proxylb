@@ -328,6 +328,34 @@ async fn main_async(
                     }
                 }));
             }
+            config::InboundItemConfig::Mtproto {
+                listen,
+                secret,
+                tls: tls_cfg,
+                filter,
+            } => {
+                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
+                let stats = pool.register_inbound(
+                    format!("MTProto ({})", listen),
+                    listen.clone(),
+                    "mtproto".to_string(),
+                );
+                handles.push(worker_handle.spawn(async move {
+                    if let Err(e) = inbound::mtproto::run_mtproto_inbound(
+                        listen,
+                        inbound_pool,
+                        stats,
+                        filter_enabled,
+                        secret,
+                        tls_cfg,
+                        cancel,
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %e, "MTProto inbound failed");
+                    }
+                }));
+            }
         }
     }
 

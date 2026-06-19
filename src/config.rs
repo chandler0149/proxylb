@@ -112,6 +112,7 @@ pub struct InboundConfig {
     pub socks5: Option<Socks5InboundConfig>,
     pub shadowsocks: Option<ShadowsocksInboundConfig>,
     pub http: Option<HttpInboundConfig>,
+    pub mtproto: Option<MtprotoInboundConfig>,
     #[serde(default)]
     pub filter: FilterConfig,
 }
@@ -151,6 +152,14 @@ pub enum InboundItemConfig {
         #[serde(default)]
         filter: Option<FilterConfig>,
     },
+    Mtproto {
+        listen: String,
+        secret: String,
+        #[serde(default)]
+        tls: Option<TlsServerConfig>,
+        #[serde(default)]
+        filter: Option<FilterConfig>,
+    },
 }
 
 /// SOCKS5 inbound listener.
@@ -176,6 +185,13 @@ pub struct HttpInboundConfig {
     pub listen: String,
     pub username: Option<String>,
     pub password: Option<String>,
+}
+
+/// MTProto inbound listener.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct MtprotoInboundConfig {
+    pub listen: String,
+    pub secret: String,
 }
 
 fn default_filter_enabled() -> bool {
@@ -330,6 +346,14 @@ impl Config {
                 filter: Some(self.inbound.filter.clone()),
             });
         }
+        if let Some(ref mtproto) = self.inbound.mtproto {
+            res.push(InboundItemConfig::Mtproto {
+                listen: mtproto.listen.clone(),
+                secret: mtproto.secret.clone(),
+                tls: None,
+                filter: Some(self.inbound.filter.clone()),
+            });
+        }
         for item in &self.inbounds {
             let mut resolved_item = item.clone();
             match &mut resolved_item {
@@ -344,6 +368,11 @@ impl Config {
                     }
                 }
                 InboundItemConfig::Http { filter, .. } => {
+                    if filter.is_none() {
+                        *filter = Some(self.inbound.filter.clone());
+                    }
+                }
+                InboundItemConfig::Mtproto { filter, .. } => {
                     if filter.is_none() {
                         *filter = Some(self.inbound.filter.clone());
                     }
