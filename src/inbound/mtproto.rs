@@ -6,7 +6,7 @@ use super::BoundListener;
 use crate::backend::BackendPool;
 use crate::outbound::TargetAddr;
 
-use mtproto_server::protocol::constants::*;
+use mtproto_server::protocol::constants::{self, *};
 use mtproto_server::handshake::*;
 use mtproto_server::stream::{FakeTlsReader, FakeTlsWriter, CryptoReader, CryptoWriter};
 use mtproto_server::protocol::tls;
@@ -21,6 +21,7 @@ pub async fn run_mtproto_inbound(
     _tls_cfg: Option<crate::config::TlsServerConfig>,
     route_idx: Option<usize>,
     cancel: CancellationToken,
+    prebound_uds: Option<std::os::unix::net::UnixListener>,
 ) -> anyhow::Result<()> {
     let mut secret = [0u8; MTPROTO_SECRET_BYTES];
     let decoded = (0..secret_hex.len())
@@ -33,7 +34,7 @@ pub async fn run_mtproto_inbound(
         anyhow::bail!("Invalid mtproto secret length, must be 32 hex chars");
     }
 
-    let listener = BoundListener::bind(&listen_addr).await?;
+    let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, "MTProto inbound listener started");
 
     crate::inbound::run_accept_loop(listener, cancel, "MTProto", move |stream, addr| {
@@ -218,7 +219,7 @@ where
 
         let client_combined = CombinedStream::new(
             CryptoReader::new(fake_tls_reader, validation.decryptor),
-            CryptoWriter::new(fake_tls_writer, validation.encryptor, 8192),
+            CryptoWriter::new(fake_tls_writer, validation.encryptor, 65536),
         );
 
         crate::inbound::relay_and_track(
@@ -251,7 +252,7 @@ where
         let (read_half, write_half) = tokio::io::split(peek_stream);
         let client_combined = CombinedStream::new(
             CryptoReader::new(read_half, validation.decryptor),
-            CryptoWriter::new(write_half, validation.encryptor, 8192),
+            CryptoWriter::new(write_half, validation.encryptor, 65536),
         );
 
         crate::inbound::relay_and_track(
@@ -308,23 +309,12 @@ async fn connect_and_proxy(
 
     let dc_idx = validation.dc_idx.abs();
     
-    // Map DC index to IP. If we want to be exact, we use standard Telegram IPs.
-    // 1 -> 149.154.175.50
-    // 2 -> 149.154.167.51
-    // 3 -> 149.154.175.100
-    // 4 -> 149.154.167.91
-    // 5 -> 91.108.56.110
-    let ip = match dc_idx {
-        1 => "149.154.175.50",
-        2 => "149.154.167.51",
-        3 => "149.154.175.100",
-        4 => "149.154.167.91",
-        5 => "91.108.56.110",
-        _ => "149.154.167.51", // fallback to DC2
-    };
+    // Map DC index to IP using canonical Telegram datacenter addresses.
+    let dc_array_idx = (dc_idx as usize).saturating_sub(1).min(constants::TG_DATACENTERS_V4.len() - 1);
+    let ip = constants::TG_DATACENTERS_V4[dc_array_idx];
 
     let target_addr = TargetAddr::Ip(std::net::SocketAddr::new(
-        ip.parse().unwrap(),
+        ip,
         443,
     ));
 
@@ -351,7 +341,7 @@ async fn connect_and_proxy(
 
     let (read_half, write_half) = tokio::io::split(backend_stream);
     let tg_reader = CryptoReader::new(read_half, tg_decryptor);
-    let tg_writer = CryptoWriter::new(write_half, tg_encryptor, 8192);
+    let tg_writer = CryptoWriter::new(write_half, tg_encryptor, 65536);
 
     let wrapped_backend = crate::outbound::BackendStream::boxed(Box::pin(CombinedStream::new(tg_reader, tg_writer)));
 
@@ -444,6 +434,12 @@ impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for CombinedStream<R, W> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        // Flush the entire write chain before initiating shutdown
+        match std::pin::Pin::new(&mut self.writer).poll_flush(cx) {
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+            std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+            std::task::Poll::Ready(Ok(())) => {}
+        }
         std::pin::Pin::new(&mut self.writer).poll_shutdown(cx)
     }
 }

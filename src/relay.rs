@@ -146,7 +146,153 @@ where
         }
     }
 
-    tokio::io::copy_bidirectional(client, backend).await
+    large_copy_bidirectional_fallback(client, backend).await
+}
+
+struct TransferState {
+    read_done: bool,
+    pos: usize,
+    cap: usize,
+    amt: u64,
+    buf: Box<[u8]>,
+}
+
+impl TransferState {
+    fn new(size: usize) -> Self {
+        Self {
+            read_done: false,
+            pos: 0,
+            cap: 0,
+            amt: 0,
+            buf: vec![0; size].into_boxed_slice(),
+        }
+    }
+}
+
+fn transfer_one_direction<R, W>(
+    cx: &mut std::task::Context<'_>,
+    state: &mut TransferState,
+    r: &mut R,
+    w: &mut W,
+) -> std::task::Poll<std::io::Result<()>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    loop {
+        // Read into buffer if empty
+        if state.pos == state.cap && !state.read_done {
+            let mut buf = tokio::io::ReadBuf::new(&mut state.buf);
+            match std::pin::Pin::new(&mut *r).poll_read(cx, &mut buf) {
+                std::task::Poll::Ready(Ok(())) => {
+                    if buf.filled().is_empty() {
+                        state.read_done = true;
+                    } else {
+                        state.pos = 0;
+                        state.cap = buf.filled().len();
+                    }
+                }
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => {
+                    let _ = std::pin::Pin::new(&mut *w).poll_flush(cx);
+                    return std::task::Poll::Pending;
+                }
+            }
+        }
+
+        // Write from buffer if it has data
+        if state.pos < state.cap {
+            match std::pin::Pin::new(&mut *w).poll_write(cx, &state.buf[state.pos..state.cap]) {
+                std::task::Poll::Ready(Ok(0)) => {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "write zero byte into writer",
+                    )));
+                }
+                std::task::Poll::Ready(Ok(n)) => {
+                    state.pos += n;
+                    state.amt += n as u64;
+                }
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+
+        // Flush and finish if read is done and buffer is empty
+        if state.pos == state.cap && state.read_done {
+            match std::pin::Pin::new(&mut *w).poll_flush(cx) {
+                std::task::Poll::Ready(Ok(())) => return std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+    }
+}
+
+struct LargeBidirectionalCopy<'a, A: ?Sized, B: ?Sized> {
+    a: &'a mut A,
+    b: &'a mut B,
+    a_to_b: TransferState,
+    b_to_a: TransferState,
+}
+
+impl<'a, A, B> std::future::Future for LargeBidirectionalCopy<'a, A, B>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    type Output = std::io::Result<(u64, u64)>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let mut a_to_b_poll = transfer_one_direction(cx, &mut this.a_to_b, &mut *this.a, &mut *this.b);
+        let mut b_to_a_poll = transfer_one_direction(cx, &mut this.b_to_a, &mut *this.b, &mut *this.a);
+
+        // Half-close handling: if one direction is fully done, shutdown the write half on the receiving end.
+        if let std::task::Poll::Ready(Ok(())) = a_to_b_poll {
+            match std::pin::Pin::new(&mut *this.b).poll_shutdown(cx) {
+                std::task::Poll::Ready(Ok(())) => {}
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => {
+                    a_to_b_poll = std::task::Poll::Pending;
+                }
+            }
+        }
+
+        if let std::task::Poll::Ready(Ok(())) = b_to_a_poll {
+            match std::pin::Pin::new(&mut *this.a).poll_shutdown(cx) {
+                std::task::Poll::Ready(Ok(())) => {}
+                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Pending => {
+                    b_to_a_poll = std::task::Poll::Pending;
+                }
+            }
+        }
+
+        match (a_to_b_poll, b_to_a_poll) {
+            (std::task::Poll::Ready(Ok(())), std::task::Poll::Ready(Ok(()))) => {
+                std::task::Poll::Ready(Ok((this.a_to_b.amt, this.b_to_a.amt)))
+            }
+            (std::task::Poll::Ready(Err(e)), _) | (_, std::task::Poll::Ready(Err(e))) => {
+                std::task::Poll::Ready(Err(e))
+            }
+            _ => std::task::Poll::Pending,
+        }
+    }
+}
+
+pub async fn large_copy_bidirectional_fallback<A, B>(client: &mut A, backend: &mut B) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    LargeBidirectionalCopy {
+        a: client,
+        b: backend,
+        a_to_b: TransferState::new(65536), // 64KB buffer
+        b_to_a: TransferState::new(65536), // 64KB buffer
+    }
+    .await
 }
 
 #[cfg(target_os = "linux")]
@@ -211,6 +357,14 @@ fn create_pipe() -> std::io::Result<(RawFd, RawFd)> {
     if res == -1 {
         return Err(std::io::Error::last_os_error());
     }
+    
+    // Attempt to increase the pipe capacity to 1MB (1048576 bytes) for higher throughput.
+    // F_SETPIPE_SZ is 1031 in Linux. Ignore errors if we hit hard limits.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::fcntl(fds[1], libc::F_SETPIPE_SZ, 1048576);
+    }
+    
     Ok((fds[0], fds[1]))
 }
 
