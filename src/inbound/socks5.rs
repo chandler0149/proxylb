@@ -200,7 +200,6 @@ where
     // Send SOCKS5 success reply to the client.
     let reply = build_socks5_reply(consts::SOCKS5_REPLY_SUCCEEDED);
     client_stream.write_all(&reply).await?;
-    client_stream.flush().await?;
 
     crate::inbound::relay_and_track(
         client_stream,

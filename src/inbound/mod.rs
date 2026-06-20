@@ -301,8 +301,7 @@ pub async fn route_and_connect(
             }
             Err(e) => {
                 tracing::debug!(backend = %info.name, error = %e, "backend connect failed, trying next");
-                pool.mark_unhealthy(*index, &format!("connect failed: {}", e))
-                    .await;
+                pool.mark_unhealthy(*index, &format!("connect failed: {}", e));
             }
         }
     }

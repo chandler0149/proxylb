@@ -286,8 +286,8 @@ impl Default for BackendStatus {
 /// A single backend entry: info + status + traffic counters.
 #[derive(Debug)]
 pub struct BackendEntry {
-    pub info: BackendInfo,
-    pub status: parking_lot::Mutex<BackendStatus>,
+    pub info: Arc<BackendInfo>,
+    pub status: Arc<parking_lot::Mutex<BackendStatus>>,
     pub traffic: Arc<TrafficCounters>,
     /// Pre-authenticated connection pool.
     /// `flume::Receiver` is Clone + Send + Sync, so no Mutex is needed.
@@ -413,14 +413,16 @@ struct BackendPoolInner {
 }
 
 pub struct CachedCandidates {
-    pub healthy: Vec<(usize, BackendInfo)>,
-    pub unhealthy: Vec<(usize, BackendInfo)>,
+    pub healthy: Vec<(usize, Arc<BackendInfo>)>,
+    pub unhealthy: Vec<(usize, Arc<BackendInfo>)>,
 }
 
 #[derive(Clone)]
 pub struct BackendHotPath {
     pub pool_rx: flume::Receiver<BackendStream>,
     pub traffic: Arc<TrafficCounters>,
+    pub status: Arc<parking_lot::Mutex<BackendStatus>>,
+    pub info_name: Arc<str>,
 }
 
 /// Thread-safe backend pool.
@@ -597,7 +599,7 @@ fn deduplicate_candidates(
     raw_h: Vec<usize>,
     raw_u: Vec<usize>,
     entries: &[BackendEntry],
-) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
+) -> (Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
     let mut h = Vec::new();
     let mut u = Vec::new();
     let mut added_h = std::collections::HashSet::new();
@@ -606,14 +608,14 @@ fn deduplicate_candidates(
     for idx in raw_h {
         if added_h.insert(idx) {
             if let Some(entry) = entries.get(idx) {
-                h.push((idx, entry.info.clone()));
+                h.push((idx, Arc::clone(&entry.info)));
             }
         }
     }
     for idx in raw_u {
         if !added_h.contains(&idx) && added_u.insert(idx) {
             if let Some(entry) = entries.get(idx) {
-                u.push((idx, entry.info.clone()));
+                u.push((idx, Arc::clone(&entry.info)));
             }
         }
     }
@@ -624,7 +626,7 @@ fn calculate_candidates(
     entries: &[BackendEntry],
     groups: &[Group],
     failover_order: &[Target],
-) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
+) -> (Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
     let mut raw_h = Vec::new();
     let mut raw_u = Vec::new();
 
@@ -660,7 +662,7 @@ fn calculate_route_candidates(
     route: &str,
     entries: &[BackendEntry],
     groups: &[Group],
-) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
+) -> (Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
     if let Some(group) = groups.iter().find(|g| g.name == route) {
         let (raw_h, raw_u) = collect_group_candidates_recursive(group, entries, groups);
         return deduplicate_candidates(raw_h, raw_u, entries);
@@ -671,9 +673,9 @@ fn calculate_route_candidates(
             let status = entry.status.lock();
             if status.enabled {
                 if status.healthy {
-                    return (vec![(idx, entry.info.clone())], vec![]);
+                    return (vec![(idx, Arc::clone(&entry.info))], vec![]);
                 } else {
-                    return (vec![], vec![(idx, entry.info.clone())]);
+                    return (vec![], vec![(idx, Arc::clone(&entry.info))]);
                 }
             }
         }
@@ -706,8 +708,8 @@ impl BackendPool {
             status.enabled = initial_enabled;
 
             let entry = BackendEntry {
-                info: info.clone(),
-                status: parking_lot::Mutex::new(status),
+                info: Arc::new(info.clone()),
+                status: Arc::new(parking_lot::Mutex::new(status)),
                 traffic: Arc::new(TrafficCounters::default()),
                 pool_rx: rx.clone(),
                 cancel: cancel.clone(),
@@ -742,6 +744,8 @@ impl BackendPool {
             .map(|e| BackendHotPath {
                 pool_rx: e.pool_rx.clone(),
                 traffic: Arc::clone(&e.traffic),
+                status: Arc::clone(&e.status),
+                info_name: Arc::from(e.info.name.as_str()),
             })
             .collect::<Vec<_>>();
         let hot_paths = Arc::new(ArcSwap::from_pointee(hot_paths));
@@ -861,7 +865,7 @@ impl BackendPool {
                     }
                 }
 
-                entry.info = new_info.clone();
+                entry.info = Arc::new(new_info.clone());
 
                 if creds_or_pool_changed {
                     // Cancel old refill task
@@ -899,8 +903,8 @@ impl BackendPool {
                 status.enabled = initial_enabled;
 
                 let entry = BackendEntry {
-                    info: new_info.clone(),
-                    status: parking_lot::Mutex::new(status),
+                    info: Arc::new(new_info.clone()),
+                    status: Arc::new(parking_lot::Mutex::new(status)),
                     traffic: Arc::new(TrafficCounters::default()),
                     pool_rx: rx.clone(),
                     cancel: cancel.clone(),
@@ -941,6 +945,8 @@ impl BackendPool {
             .map(|e| BackendHotPath {
                 pool_rx: e.pool_rx.clone(),
                 traffic: Arc::clone(&e.traffic),
+                status: Arc::clone(&e.status),
+                info_name: Arc::from(e.info.name.as_str()),
             })
             .collect::<Vec<_>>();
         self.hot_paths.store(Arc::new(hot_paths_vec));
@@ -979,7 +985,7 @@ impl BackendPool {
 
     /// Get the info of all backends with their index, current health, and enabled state.
     /// Returns (index, BackendInfo, is_healthy, is_enabled) for each backend in priority order.
-    pub async fn get_backends_in_order(&self) -> Vec<(usize, BackendInfo, bool, bool)> {
+    pub async fn get_backends_in_order(&self) -> Vec<(usize, Arc<BackendInfo>, bool, bool)> {
         let guard = self.inner.read().await;
         guard
             .entries
@@ -993,7 +999,7 @@ impl BackendPool {
     }
 
     #[allow(dead_code)]
-    pub async fn get_candidates(&self) -> (Vec<(usize, BackendInfo)>, Vec<(usize, BackendInfo)>) {
+    pub async fn get_candidates(&self) -> (Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
         let guard = self.cached.load();
         (guard.healthy.clone(), guard.unhealthy.clone())
     }
@@ -1019,10 +1025,12 @@ impl BackendPool {
     }
 
     /// Mark a backend as healthy with measured latency.
-    pub async fn mark_healthy(&self, index: usize, latency: Duration) {
-        let guard = self.inner.read().await;
-        if let Some(entry) = guard.entries.get(index) {
-            let mut status = entry.status.lock();
+    ///
+    /// Lock-free: accesses status via the `hot_paths` ArcSwap, avoiding the async RwLock.
+    pub fn mark_healthy(&self, index: usize, latency: Duration) {
+        let hot_paths = self.hot_paths.load();
+        if let Some(hp) = hot_paths.get(index) {
+            let mut status = hp.status.lock();
             let was_unhealthy = !status.healthy;
             status.healthy = true;
             status.last_check = Some(Instant::now());
@@ -1039,7 +1047,7 @@ impl BackendPool {
 
             if was_unhealthy {
                 tracing::info!(
-                    backend = %entry.info.name,
+                    backend = %hp.info_name,
                     latency_ms = latency.as_millis() as u64,
                     "backend recovered"
                 );
@@ -1048,10 +1056,12 @@ impl BackendPool {
     }
 
     /// Mark a backend as unhealthy with an error message.
-    pub async fn mark_unhealthy(&self, index: usize, error: &str) {
-        let guard = self.inner.read().await;
-        if let Some(entry) = guard.entries.get(index) {
-            let mut status = entry.status.lock();
+    ///
+    /// Lock-free: accesses status via the `hot_paths` ArcSwap, avoiding the async RwLock.
+    pub fn mark_unhealthy(&self, index: usize, error: &str) {
+        let hot_paths = self.hot_paths.load();
+        if let Some(hp) = hot_paths.get(index) {
+            let mut status = hp.status.lock();
             let was_healthy = status.healthy;
             status.healthy = false;
             status.last_check = Some(Instant::now());
@@ -1067,7 +1077,7 @@ impl BackendPool {
 
             if was_healthy {
                 tracing::warn!(
-                    backend = %entry.info.name,
+                    backend = %hp.info_name,
                     error = %error,
                     "backend became unhealthy"
                 );

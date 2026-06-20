@@ -203,7 +203,7 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                         latency_ms = latency.as_millis() as u64,
                         "health check passed"
                     );
-                    pool.mark_healthy(index, latency).await;
+                    pool.mark_healthy(index, latency);
                 }
                 Ok(Err(e)) => {
                     tracing::debug!(
@@ -211,14 +211,14 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                         error = %e,
                         "health check failed"
                     );
-                    pool.mark_unhealthy(index, &e.to_string()).await;
+                    pool.mark_unhealthy(index, &e.to_string());
                 }
                 Err(_) => {
                     tracing::debug!(
                         backend = %info.name,
                         "health check timed out"
                     );
-                    pool.mark_unhealthy(index, "health check timed out").await;
+                    pool.mark_unhealthy(index, "health check timed out");
                 }
             }
         }));

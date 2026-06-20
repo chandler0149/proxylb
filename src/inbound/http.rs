@@ -176,10 +176,8 @@ where
         client_stream
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
-        client_stream.flush().await?;
     } else {
         backend_stream.write_all(&buf).await?;
-        backend_stream.flush().await?;
     }
 
     crate::inbound::relay_and_track(

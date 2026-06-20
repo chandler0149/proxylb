@@ -46,7 +46,6 @@ where
     } else {
         stream.write_all(&[SOCKS5_VERSION, 1, AUTH_NONE]).await?;
     }
-    stream.flush().await?;
 
     // Read method selection response: [version, method]
     let mut resp = [0u8; 2];
@@ -78,7 +77,6 @@ where
             auth_req.push(pass.len() as u8);
             auth_req.extend_from_slice(pass.as_bytes());
             stream.write_all(&auth_req).await?;
-            stream.flush().await?;
 
             let mut auth_resp = [0u8; 2];
             stream.read_exact(&mut auth_resp).await?;
@@ -115,7 +113,6 @@ where
     let mut req = [0u8; 262];
     let req_len = build_connect_request_buf(target, &mut req)?;
     stream.write_all(&req[..req_len]).await?;
-    stream.flush().await?;
 
     // === Step 3: Read CONNECT response ===
     let mut resp_header = [0u8; 4];
