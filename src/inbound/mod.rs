@@ -20,7 +20,12 @@ pub enum BoundListener {
 impl BoundListener {
     /// Bind to `addr`. A `unix://…` prefix selects a UDS listener; anything
     /// else is treated as a TCP `host:port`.
-    pub async fn bind(addr: &str) -> anyhow::Result<Self> {
+    pub async fn bind(addr: &str, prebound_uds: Option<std::os::unix::net::UnixListener>) -> anyhow::Result<Self> {
+        if let Some(uds) = prebound_uds {
+            uds.set_nonblocking(true)?;
+            return Ok(Self::Unix(UnixListener::from_std(uds)?));
+        }
+        
         if let Some(path) = addr.strip_prefix("unix://") {
             if let Some(parent) = std::path::Path::new(path).parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -30,7 +35,23 @@ impl BoundListener {
             }
             Ok(Self::Unix(UnixListener::bind(path)?))
         } else {
-            Ok(Self::Tcp(TcpListener::bind(addr).await?))
+            let addr_parsed: std::net::SocketAddr = addr.parse()?;
+            let socket = if addr_parsed.is_ipv6() {
+                socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None)?
+            } else {
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?
+            };
+            
+            socket.set_reuse_address(true)?;
+            #[cfg(not(windows))]
+            socket.set_reuse_port(true)?;
+            
+            socket.set_nonblocking(true)?;
+            socket.bind(&addr_parsed.into())?;
+            socket.listen(1024)?;
+            
+            let std_listener: std::net::TcpListener = socket.into();
+            Ok(Self::Tcp(TcpListener::from_std(std_listener)?))
         }
     }
 

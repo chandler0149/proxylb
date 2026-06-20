@@ -31,6 +31,7 @@ pub async fn run_shadowsocks_inbound(
     tls_cfg: Option<crate::config::TlsServerConfig>,
     route_idx: Option<usize>,
     cancel: CancellationToken,
+    prebound_uds: Option<std::os::unix::net::UnixListener>,
 ) -> anyhow::Result<()> {
     let method: CipherKind = method_str
         .parse()
@@ -49,7 +50,7 @@ pub async fn run_shadowsocks_inbound(
         .transpose()?
         .map(Arc::new);
 
-    let listener = BoundListener::bind(&listen_addr).await?;
+    let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, method = %method_str, "Shadowsocks inbound listener started");
 
     crate::inbound::run_accept_loop(listener, cancel, "Shadowsocks", move |stream, addr| {

@@ -77,45 +77,6 @@ fn main() -> anyhow::Result<()> {
     let closer_core = ancillary_cores.as_ref().and_then(|v| v.first().copied());
     crate::relay::init_deferred_dropper(closer_core);
 
-    // Builder for worker runtime.
-    let mut worker_builder = tokio::runtime::Builder::new_multi_thread();
-    worker_builder.enable_all();
-    worker_builder.thread_name("proxylb-worker");
-    if let Some(ref cores) = worker_cores {
-        if !cores.is_empty() {
-            let next_core_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let cores = cores.clone();
-            worker_builder.on_thread_start(move || {
-                let thread = std::thread::current();
-                let name = thread.name().unwrap_or("");
-                if name.starts_with("proxylb-worker") {
-                    let idx = next_core_idx.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if let Some(&core_num) = cores.get(idx % cores.len()) {
-                        if let Some(core_ids) = core_affinity::get_core_ids() {
-                            if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
-                                if core_affinity::set_for_current(core_id) {
-                                    tracing::info!(
-                                        "Bound tokio worker thread ({}) to CPU core {}",
-                                        name,
-                                        core_num
-                                    );
-                                } else {
-                                    tracing::warn!(
-                                        "Failed to bind tokio worker thread ({}) to CPU core {}",
-                                        name,
-                                        core_num
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    }
-    let worker_runtime = worker_builder.build()?;
-    let worker_handle = worker_runtime.handle().clone();
-
     // Builder for ancillary runtime.
     let mut ancillary_builder = tokio::runtime::Builder::new_multi_thread();
     ancillary_builder.enable_all();
@@ -155,12 +116,10 @@ fn main() -> anyhow::Result<()> {
     let ancillary_runtime = ancillary_builder.build()?;
     let ancillary_handle = ancillary_runtime.handle().clone();
 
-    worker_runtime
-        .block_on(main_async(config, args, worker_handle, ancillary_handle))
+    ancillary_runtime
+        .block_on(main_async(config, args, worker_cores, ancillary_handle))
         .ok();
 
-    tracing::info!("waiting for worker tasks to finish...");
-    worker_runtime.shutdown_timeout(std::time::Duration::from_secs(5));
     tracing::info!("waiting for ancillary tasks to finish...");
     ancillary_runtime.shutdown_timeout(std::time::Duration::from_secs(5));
     Ok(())
@@ -169,7 +128,7 @@ fn main() -> anyhow::Result<()> {
 async fn main_async(
     config: config::Config,
     args: Args,
-    worker_handle: tokio::runtime::Handle,
+    worker_cores: Option<Vec<usize>>,
     ancillary_handle: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     // Initialize route change monitoring.
@@ -245,145 +204,195 @@ async fn main_async(
         }));
     }
 
-    // Spawn inbound listeners.
-    let inbound_cancel = CancellationToken::new();
-    let mut handles = Vec::new();
+    // Spawn independent OS threads for each worker core
+    let worker_cores = worker_cores.unwrap_or_else(|| {
+        if let Some(core_ids) = core_affinity::get_core_ids() {
+            core_ids.into_iter().map(|c| c.id).collect()
+        } else {
+            vec![0]
+        }
+    });
 
+    // Pre-bind all UDS listeners so they can be cloned across multiple threads.
+    // This allows the Linux kernel to natively load-balance incoming UDS
+    // connections across all worker thread epoll instances (thundering herd).
+    let mut uds_listeners: std::collections::HashMap<String, std::os::unix::net::UnixListener> = std::collections::HashMap::new();
     for inbound_item in config.all_inbounds() {
-        let inbound_pool = pool.clone();
-        let cancel = inbound_cancel.clone();
-        match inbound_item {
-            config::InboundItemConfig::Socks5 {
-                listen,
-                filter,
-                tls: tls_cfg,
-                username,
-                password,
-                route,
-            } => {
-                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
-                let stats = pool.register_inbound(
-                    format!("SOCKS5 ({})", listen),
-                    listen.clone(),
-                    "socks5".to_string(),
-                );
-                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
-                handles.push(worker_handle.spawn(async move {
-                    if let Err(e) = inbound::socks5::run_socks5_inbound(
-                        listen,
-                        inbound_pool,
-                        stats,
-                        filter_enabled,
-                        tls_cfg,
-                        username,
-                        password,
-                        route_idx,
-                        cancel,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %e, "SOCKS5 inbound failed");
-                    }
-                }));
-            }
-            config::InboundItemConfig::Shadowsocks {
-                listen,
-                password,
-                method,
-                filter,
-                tls: tls_cfg,
-                route,
-            } => {
-                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
-                let stats = pool.register_inbound(
-                    format!("Shadowsocks ({})", listen),
-                    listen.clone(),
-                    "shadowsocks".to_string(),
-                );
-                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
-                handles.push(worker_handle.spawn(async move {
-                    if let Err(e) = inbound::shadowsocks::run_shadowsocks_inbound(
-                        listen,
-                        password,
-                        method,
-                        inbound_pool,
-                        stats,
-                        filter_enabled,
-                        tls_cfg,
-                        route_idx,
-                        cancel,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %e, "Shadowsocks inbound failed");
-                    }
-                }));
-            }
-            config::InboundItemConfig::Http {
-                listen,
-                filter,
-                tls: tls_cfg,
-                username,
-                password,
-                route,
-            } => {
-                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
-                let stats = pool.register_inbound(
-                    format!("HTTP ({})", listen),
-                    listen.clone(),
-                    "http".to_string(),
-                );
-                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
-                handles.push(worker_handle.spawn(async move {
-                    if let Err(e) = inbound::http::run_http_inbound(
-                        listen,
-                        inbound_pool,
-                        stats,
-                        filter_enabled,
-                        tls_cfg,
-                        username,
-                        password,
-                        route_idx,
-                        cancel,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %e, "HTTP inbound failed");
-                    }
-                }));
-            }
-            config::InboundItemConfig::Mtproto {
-                listen,
-                password: secret,
-                tls: tls_cfg,
-                filter,
-                route,
-            } => {
-                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
-                let stats = pool.register_inbound(
-                    format!("MTProto ({})", listen),
-                    listen.clone(),
-                    "mtproto".to_string(),
-                );
-                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
-                handles.push(worker_handle.spawn(async move {
-                    if let Err(e) = inbound::mtproto::run_mtproto_inbound(
-                        listen,
-                        inbound_pool,
-                        stats,
-                        filter_enabled,
-                        secret,
-                        tls_cfg,
-                        route_idx,
-                        cancel,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %e, "MTProto inbound failed");
-                    }
-                }));
+        let listen = match &inbound_item {
+            crate::config::InboundItemConfig::Socks5 { listen, .. } => listen,
+            crate::config::InboundItemConfig::Shadowsocks { listen, .. } => listen,
+            crate::config::InboundItemConfig::Http { listen, .. } => listen,
+            crate::config::InboundItemConfig::Mtproto { listen, .. } => listen,
+        };
+        if let Some(path) = listen.strip_prefix("unix://") {
+            if !uds_listeners.contains_key(listen) {
+                if let Some(parent) = std::path::Path::new(path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::metadata(path).is_ok() {
+                    let _ = std::fs::remove_file(path);
+                }
+                match std::os::unix::net::UnixListener::bind(path) {
+                    Ok(l) => { uds_listeners.insert(listen.clone(), l); }
+                    Err(e) => { tracing::error!("Failed to pre-bind UDS socket {}: {}", path, e); }
+                }
             }
         }
+    }
+
+    let inbound_cancel = CancellationToken::new();
+    let mut worker_threads = Vec::new();
+
+    for (i, &core_num) in worker_cores.iter().enumerate() {
+        let pool = pool.clone();
+        let config = config.clone();
+        let cancel = inbound_cancel.clone();
+        
+        let mut local_uds_listeners = std::collections::HashMap::new();
+        for (k, v) in &uds_listeners {
+            if let Ok(cloned) = v.try_clone() {
+                local_uds_listeners.insert(k.clone(), cloned);
+            }
+        }
+
+        let thread = std::thread::Builder::new()
+            .name(format!("proxylb-worker-{}", i))
+            .spawn(move || {
+                if let Some(core_ids) = core_affinity::get_core_ids() {
+                    if let Some(core_id) = core_ids.into_iter().find(|c| c.id == core_num) {
+                        core_affinity::set_for_current(core_id);
+                    }
+                }
+
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async move {
+                    let mut handles = Vec::new();
+                    
+                    for inbound_item in config.all_inbounds() {
+                        let listen_addr = match &inbound_item {
+                            crate::config::InboundItemConfig::Socks5 { listen, .. } => listen,
+                            crate::config::InboundItemConfig::Shadowsocks { listen, .. } => listen,
+                            crate::config::InboundItemConfig::Http { listen, .. } => listen,
+                            crate::config::InboundItemConfig::Mtproto { listen, .. } => listen,
+                        };
+                        let prebound_uds = local_uds_listeners.remove(listen_addr);
+                        
+                        let inbound_pool = pool.clone();
+                        let cancel_clone = cancel.clone();
+                        match inbound_item {
+                            crate::config::InboundItemConfig::Socks5 {
+                                listen,
+                                filter,
+                                tls: tls_cfg,
+                                username,
+                                password,
+                                route,
+                            } => {
+                                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
+                                let stats = pool.register_inbound(
+                                    format!("SOCKS5 ({})", listen),
+                                    listen.clone(),
+                                    "socks5".to_string(),
+                                );
+                                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
+                                handles.push(tokio::spawn(async move {
+                                    if let Err(e) = crate::inbound::socks5::run_socks5_inbound(
+                                        listen, inbound_pool, stats, filter_enabled, tls_cfg, username, password, route_idx, cancel_clone, prebound_uds
+                                    ).await {
+                                        tracing::error!(error = %e, "SOCKS5 inbound failed");
+                                    }
+                                }));
+                            }
+                            crate::config::InboundItemConfig::Shadowsocks {
+                                listen,
+                                password,
+                                method,
+                                filter,
+                                tls: tls_cfg,
+                                route,
+                            } => {
+                                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
+                                let stats = pool.register_inbound(
+                                    format!("Shadowsocks ({})", listen),
+                                    listen.clone(),
+                                    "shadowsocks".to_string(),
+                                );
+                                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
+                                handles.push(tokio::spawn(async move {
+                                    if let Err(e) = crate::inbound::shadowsocks::run_shadowsocks_inbound(
+                                        listen, password, method, inbound_pool, stats, filter_enabled, tls_cfg, route_idx, cancel_clone, prebound_uds
+                                    ).await {
+                                        tracing::error!(error = %e, "Shadowsocks inbound failed");
+                                    }
+                                }));
+                            }
+                            crate::config::InboundItemConfig::Http {
+                                listen,
+                                filter,
+                                tls: tls_cfg,
+                                username,
+                                password,
+                                route,
+                            } => {
+                                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
+                                let stats = pool.register_inbound(
+                                    format!("HTTP ({})", listen),
+                                    listen.clone(),
+                                    "http".to_string(),
+                                );
+                                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
+                                handles.push(tokio::spawn(async move {
+                                    if let Err(e) = crate::inbound::http::run_http_inbound(
+                                        listen, inbound_pool, stats, filter_enabled, tls_cfg, username, password, route_idx, cancel_clone, prebound_uds
+                                    ).await {
+                                        tracing::error!(error = %e, "HTTP inbound failed");
+                                    }
+                                }));
+                            }
+                            crate::config::InboundItemConfig::Mtproto {
+                                listen,
+                                password: secret,
+                                tls: tls_cfg,
+                                filter,
+                                route,
+                            } => {
+                                let filter_enabled = filter.map(|f| f.enabled).unwrap_or(true);
+                                let stats = pool.register_inbound(
+                                    format!("MTProto ({})", listen),
+                                    listen.clone(),
+                                    "mtproto".to_string(),
+                                );
+                                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
+                                handles.push(tokio::spawn(async move {
+                                    if let Err(e) = crate::inbound::mtproto::run_mtproto_inbound(
+                                        listen, inbound_pool, stats, filter_enabled, secret, tls_cfg, route_idx, cancel_clone, prebound_uds
+                                    ).await {
+                                        tracing::error!(error = %e, "MTProto inbound failed");
+                                    }
+                                }));
+                            }
+                        }
+                    }
+
+                    // Wait forever unless cancelled
+                    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+                    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+                    tokio::select! {
+                        _ = sigterm.recv() => {}
+                        _ = sigint.recv() => {}
+                        _ = cancel.cancelled() => {}
+                    }
+                    
+                    for h in handles {
+                        let _ = h.await;
+                    }
+                });
+            }).unwrap();
+        worker_threads.push(thread);
     }
 
     // Keep a snapshot of the initial inbound config to detect unsupported
@@ -419,9 +428,12 @@ async fn main_async(
 
     // Cancel all inbound accept loops and wait for them to exit.
     inbound_cancel.cancel();
-    for handle in handles {
-        let _ = handle.await;
-    }
+    // Wait for all worker OS threads to finish
+    tokio::task::spawn_blocking(move || {
+        for handle in worker_threads {
+            let _ = handle.join();
+        }
+    }).await?;
 
     adblock_cancel.cancel();
     health_cancel.cancel();

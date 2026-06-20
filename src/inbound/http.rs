@@ -25,6 +25,7 @@ pub async fn run_http_inbound(
     password: Option<String>,
     route_idx: Option<usize>,
     cancel: CancellationToken,
+    prebound_uds: Option<std::os::unix::net::UnixListener>,
 ) -> anyhow::Result<()> {
     let tls_acceptor = tls_cfg
         .as_ref()
@@ -34,7 +35,7 @@ pub async fn run_http_inbound(
     let username = username.map(Arc::new);
     let password = password.map(Arc::new);
 
-    let listener = BoundListener::bind(&listen_addr).await?;
+    let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, "HTTP inbound listener started");
 
     crate::inbound::run_accept_loop(listener, cancel, "HTTP", move |stream, addr| {

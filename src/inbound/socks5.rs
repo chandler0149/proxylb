@@ -29,58 +29,94 @@ pub async fn run_socks5_inbound(
     password: Option<String>,
     route_idx: Option<usize>,
     cancel: CancellationToken,
+    prebound_uds: Option<std::os::unix::net::UnixListener>,
 ) -> anyhow::Result<()> {
     let tls_acceptor = tls_cfg
         .as_ref()
         .map(|c| crate::tls::create_tls_acceptor(c))
         .transpose()?
         .map(Arc::new);
-    let username = username.map(Arc::new);
-    let password = password.map(Arc::new);
 
-    let listener = BoundListener::bind(&listen_addr).await?;
+    let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, "SOCKS5 inbound listener started");
 
-    crate::inbound::run_accept_loop(listener, cancel, "SOCKS5", move |stream, addr| {
-        let pool = pool.clone();
-        let stats = Arc::clone(&stats);
-        let tls_acceptor = tls_acceptor.clone();
-        let username = username.clone();
-        let password = password.clone();
-        async move {
-            if let Err(e) = handle_socks5_connection(
-                stream,
-                pool,
-                stats,
-                filter_enabled,
-                tls_acceptor.as_deref().cloned(),
-                username,
-                password,
-                route_idx,
-            )
-            .await
-            {
-                tracing::debug!(client = %addr, error = %e, "SOCKS5 connection failed");
+    if let (Some(u), Some(p)) = (username, password) {
+        let mut config = Config::<DenyAuthentication>::default();
+        config.set_execute_command(false);
+        config.set_dns_resolve(false);
+        let config = config.with_authentication(SimpleUserPassword {
+            username: u.clone(),
+            password: p.clone(),
+        });
+        let arc_config = std::sync::Arc::new(config);
+
+        crate::inbound::run_accept_loop(listener, cancel, "SOCKS5", move |stream, addr| {
+            let pool = pool.clone();
+            let stats = Arc::clone(&stats);
+            let tls_acceptor = tls_acceptor.clone();
+            let arc_config = arc_config.clone();
+            async move {
+                if let Err(e) = handle_socks5_connection(
+                    stream,
+                    pool,
+                    stats,
+                    filter_enabled,
+                    tls_acceptor.as_deref().cloned(),
+                    arc_config,
+                    route_idx,
+                )
+                .await
+                {
+                    tracing::debug!(client = %addr, error = %e, "SOCKS5 connection failed");
+                }
             }
-        }
-    })
-    .await
+        })
+        .await
+    } else {
+        let mut config = Config::<DenyAuthentication>::default();
+        config.set_execute_command(false);
+        config.set_dns_resolve(false);
+        let arc_config = std::sync::Arc::new(config);
+
+        crate::inbound::run_accept_loop(listener, cancel, "SOCKS5", move |stream, addr| {
+            let pool = pool.clone();
+            let stats = Arc::clone(&stats);
+            let tls_acceptor = tls_acceptor.clone();
+            let arc_config = arc_config.clone();
+            async move {
+                if let Err(e) = handle_socks5_connection(
+                    stream,
+                    pool,
+                    stats,
+                    filter_enabled,
+                    tls_acceptor.as_deref().cloned(),
+                    arc_config,
+                    route_idx,
+                )
+                .await
+                {
+                    tracing::debug!(client = %addr, error = %e, "SOCKS5 connection failed");
+                }
+            }
+        })
+        .await
+    }
 }
 
 /// Handle a single SOCKS5 connection.
 #[allow(deprecated)]
-async fn handle_socks5_connection<S>(
+async fn handle_socks5_connection<S, A>(
     stream: S,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     filter_enabled: bool,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
-    username: Option<Arc<String>>,
-    password: Option<Arc<String>>,
+    config: Arc<Config<A>>,
     route_idx: Option<usize>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
+    A: fast_socks5::server::Authentication + Send + Sync + 'static,
 {
     // Apply TLS if configured.
     let stream = if let Some(ref acceptor) = tls_acceptor {
@@ -90,23 +126,8 @@ where
         MaybeTlsStream::Plain(stream)
     };
 
-    if let (Some(u), Some(p)) = (username, password) {
-        let mut config = Config::<DenyAuthentication>::default();
-        config.set_execute_command(false);
-        config.set_dns_resolve(false);
-        let config = config.with_authentication(SimpleUserPassword {
-            username: u.as_ref().clone(),
-            password: p.as_ref().clone(),
-        });
-        let socks5_socket = Socks5Socket::new(stream, std::sync::Arc::new(config));
-        handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled, route_idx).await
-    } else {
-        let mut config = Config::<DenyAuthentication>::default();
-        config.set_execute_command(false);
-        config.set_dns_resolve(false);
-        let socks5_socket = Socks5Socket::new(stream, std::sync::Arc::new(config));
-        handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled, route_idx).await
-    }
+    let socks5_socket = Socks5Socket::new(stream, config);
+    handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled, route_idx).await
 }
 
 #[allow(deprecated)]
