@@ -2,138 +2,74 @@
 
 [English](README_en.md) | [简体中文](README.md)
 
-A high-performance proxy load balancer written in Rust. Supports SOCKS5, Shadowsocks, and HTTP inbound protocols with advanced load balancing, health checking, and zero-downtime hot reload.
+A high-performance proxy load balancer written in Rust. It supports SOCKS5, Shadowsocks, HTTP, and MTProto inbound protocols. ProxyLB provides advanced load balancing, health checks, and zero-downtime config reloads.
 
 ![web](./web/web.jpg)
 
 ---
 
-
 ## 🛠️ Features
 
-**Inbound**
-- SOCKS5 — TCP or Unix socket, optional auth, optional TLS
-- Shadowsocks — AEAD ciphers (`aes-256-gcm`, `chacha20-ietf-poly1305`, …)
-- HTTP — `CONNECT` tunnel and plain `GET` proxy, optional Basic Auth, optional TLS
-- MTProto — FakeTLS support, can be used as a direct proxy for Telegram
+### Protocols & Transport
+- **Inbound:** SOCKS5 (TCP/UDS, auth, TLS), Shadowsocks (AEAD ciphers), HTTP (`CONNECT` tunnel, `GET` proxy, Basic Auth, TLS), and MTProto (FakeTLS for Telegram).
+- **Outbound:** Direct, SOCKS5h (TCP/UDS), and Shadowsocks.
+- **Transport Layer:** Both inbound and outbound connections support TCP and Unix Domain Sockets (UDS).
 
-**Outbound**
-- Direct, SOCKS5h (TCP or Unix socket), Shadowsocks
-- Hierarchical nested backend groups with flexible inbound route binding:
-  - `failover` — first healthy backend
-  - `urltest` — lowest measured latency
-  - `loadbalance` — fewest active connections
+### Routing & Load Balancing
+- **Hierarchical Routing:** Bind specific inbounds to nested backend groups.
+- **Routing Strategies:**
+  - `failover` — Uses the first healthy backend.
+  - `urltest` — Routes to the backend with the lowest latency.
+  - `loadbalance` — Routes to the backend with the fewest active connections.
+- **Global Fallback:** Any inbound without an explicit route uses the global `failover_order`.
 
-**Routing**
-- Inbound Route Binding — Each inbound listener can optionally bind to a specific backend or nested group via the `route` configuration.
-- Global Fallback — Inbounds without an explicit route will automatically fall back to the global `failover_order`.
-
-**Operations**
-- Hot reload via `SIGHUP` — rewires backends without dropping active sessions
-- Network change detection — auto-reprobes on link or gateway changes
-- Web dashboard & REST API — live traffic stats, per-backend latency, active connections
-- AdBlock — AdGuard/Hosts-format lists fetched and refreshed in the background
-
-## ⚡ Performance
-
-
-What makes it fast:
-
-- **Zero-copy relay** — `splice(2)` enables kernel-level data transfer, bypassing userspace entirely
-- **Pre-warmed connection pools** — outbound handshakes happen in the background, making connection latency near-zero
-- **Dedicated CPU runtimes** — forwarding threads and background tasks are isolated on pinned CPU cores, preventing control-plane jitter from affecting the data path
-- **jemalloc** — optimized memory allocation for high-concurrency workloads
+### Operations
+- **Zero-Downtime Reload:** Send `SIGHUP` to reload configurations without dropping active sessions.
+- **Network Awareness:** Automatically triggers reprobes when link or gateway changes are detected.
+- **Web Dashboard & API:** Real-time visibility into traffic, backend latency, and connections.
+- **Built-in AdBlock:** Periodically fetches and updates AdGuard/Hosts blocklists in the background.
 
 ---
 
-Test environment:
+## ⚡ Performance
 
-Parallels Desktop on macOS 14 running linux guest: M3 Macbook Air
+ProxyLB is optimized for throughput and low latency:
 
-```
-Linux dev 6.12.85+deb13-arm64 aarch64 GNU/Linux
-1 worker cores (CPU-pinned) · pool_size=5 · 300 concurrent clients · 10 s
-```
+- **Zero-Copy Relay:** Uses Linux `splice(2)` for kernel-level data transfer, bypassing userspace entirely.
+- **Pre-warmed Connection Pools:** Handshakes with outbounds are completed in the background so the hot-path latency is kept minimal.
+- **Lock-free Architecture:** Relies on atomics and `ArcSwap` to prevent thread contention.
+- **Dedicated CPU Runtimes:** Forwarding threads and background tasks are pinned to specific CPU cores.
+- **jemalloc:** Uses the `jemalloc` memory allocator optimized for concurrency.
 
-A rough CPS benchmark, UDS inbound CPS reaches 37485, TCP inbound CPS reaches 15346.
+### Benchmarks
 
-```bash
-root@dev:~/code/gfw/proxylb# make bench BENCH_UDS=1
-cargo build --release
-    Finished `release` profile [optimized] target(s) in 0.08s
-Starting SOCKS5 CPS benchmark...
-Starting Rust SOCKS5 mock backend...
-Starting ProxyLB in release mode...
-Running Rust SOCKS5 CPS benchmark...
-Proxy:  unix:///tmp/proxylb_bench.sock
-Target: 127.0.0.1:10800
-Concurrency: 300, Duration: 10s
-Starting SOCKS5 CPS benchmark...
+Tested on a Debian 13 guest via Parallels Desktop on macOS 14 (M3 Macbook Air).
+*Parameters: 1 worker core (CPU-pinned) · pool_size=5 · 300 concurrent clients · 10s duration*
 
-=== Consolidated Results ===
-Total Successful Connections: 375073
-Total Failed Connections:     0
-Max Elapsed Time:             10.01s
-Combined Connections Per Second (CPS): 37485.10
-Cleaning up processes...
-Benchmark complete.
-root@dev:~/code/gfw/proxylb# make bench
-cargo build --release
-    Finished `release` profile [optimized] target(s) in 0.09s
-Starting SOCKS5 CPS benchmark...
-Starting Rust SOCKS5 mock backend...
-Starting ProxyLB in release mode...
-Running Rust SOCKS5 CPS benchmark...
-Proxy:  127.0.0.1:1080
-Target: 127.0.0.1:10800
-Concurrency: 300, Duration: 10s
-Starting SOCKS5 CPS benchmark...
+| Inbound | Connections Per Second (CPS) |
+|---------|------------------------------|
+| **UDS** | **~37,485** |
+| **TCP** | **~15,346** |
 
-=== Consolidated Results ===
-Total Successful Connections: 169099
-Total Failed Connections:     0
-Max Elapsed Time:             11.02s
-Combined Connections Per Second (CPS): 15346.97
-Cleaning up processes...
-Benchmark complete.
-```
-
-
-
-
-
-
-
-
+ProxyLB can handle tens of thousands of connections per second on a single core.
 
 ---
 
 ## 🛠️ Usage Scenarios
 
-### Scenario 1: Highly Reliable Proxy Gateway
+### Scenario 1: Reliable Proxy Gateway
 
-The most common use case is utilizing tools like sing-box, Hysteria, or Mihomo as backends connected to different VPSs, while ProxyLB provides a unified SOCKS5/Shadowsocks gateway for highly reliable network services.
+A common use case is running proxy clients like `sing-box`, `hysteria`, or `mihomo` connected to various VPS nodes, and putting ProxyLB in front of them as a unified, highly reliable SOCKS5 or Shadowsocks entry point.
 
-ProxyLB and the backends can be deployed on different machines or on the same machine depending on the situation:
+**Deployment Options:**
+- **Distributed Deployment:** Run ProxyLB on a stable public cloud server. It routes traffic through WireGuard to a home server running `sing-box`/`hysteria`. ProxyLB's connection pool effectively hides the handshake latency to the home server.
+- **Local Deployment (UDS):** Run ProxyLB and `sing-box` on the same router. They communicate via Unix Domain Sockets (UDS), bypassing the network protocol stack entirely for better performance. You can use `frp` to expose ProxyLB's UDS inbound to the public internet for remote access, while your local devices connect to its local SOCKS5 port.
 
-- **ProxyLB and sing-box deployed on different machines, communicating over the network:**
-  * Since ProxyLB supports connection pooling, it effectively reduces the handshake latency between ProxyLB and the backends.
-  * My friend's deployment method: Deploy ProxyLB on a public cloud to provide a stable entry point, then connect via WireGuard to the home machine running sing-box/Hysteria/Mihomo.
+*(Note: The official `sing-box` and `hysteria` do not support UDS natively. You can use modified versions that add UDS support: [sing-box](https://github.com/chandler0149/sing-box) and [hysteria](https://github.com/chandler0149/hysteria)).*
 
-- **ProxyLB and sing-box deployed on the same machine, communicating via Unix Domain Sockets (UDS):**
-  * Using domain sockets bypasses the network protocol stack, yielding better performance.
-  * My friend's deployment method:
-    - Deploy ProxyLB on a software router.
-    - Use frp to expose ProxyLB's UDS inbound to the public network, allowing mobile devices to connect via the frp server when away from home.
-    - When at home, connect phones and computers directly to ProxyLB's SOCKS5 inbound.
+### Scenario 2: Multi-Protocol Load Balancing
 
-Since sing-box and Hysteria do not natively support domain sockets, you will need to use my modified versions. For details, refer to:
-
-- sing-box: https://github.com/chandler0149/sing-box 
-- Hysteria: https://github.com/chandler0149/hysteria
-
-
-### Scenario 2: SOCKS5 Load Balancer
+ProxyLB can route different inbound protocols to specific backend groups.
 
 ```text
     [ Inbounds ]                                   [ ProxyLB Routing ]                          [ Backends ]
