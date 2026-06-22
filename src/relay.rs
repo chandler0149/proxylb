@@ -480,10 +480,11 @@ pub async fn splice_bidirectional_with_pipes(
         Some(p) => (p.pipe1_rd, p.pipe1_wr, p.pipe2_rd, p.pipe2_wr),
         None => {
             let (p1_rd, p1_wr) = create_pipe()?;
+            let (pipe1_rd, pipe1_wr) = (OwnedFd(p1_rd), OwnedFd(p1_wr));
             let (p2_rd, p2_wr) = create_pipe()?;
             (
-                OwnedFd(p1_rd),
-                OwnedFd(p1_wr),
+                pipe1_rd,
+                pipe1_wr,
                 OwnedFd(p2_rd),
                 OwnedFd(p2_wr),
             )
