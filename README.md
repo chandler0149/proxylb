@@ -2,7 +2,7 @@
 
 [English](README_en.md) | [简体中文](README.md)
 
-一款使用 Rust 编写的高性能代理负载均衡器。支持 SOCKS5、Shadowsocks、HTTP 和 MTProto 入站协议。提供高级负载均衡、健康检查以及零停机热重载功能。
+使用 Rust 编写的高性能代理负载均衡器。支持 SOCKS5、Shadowsocks、HTTP 和 MTProto 入站协议，内置负载均衡、健康检查以及零停机热重载。
 
 ![web](./web/web.jpg)
 
@@ -11,12 +11,12 @@
 ## 🛠️ 功能特性
 
 ### 协议与传输层
-- **入站协议:** SOCKS5 (TCP/UDS，可选认证，可选 TLS)、Shadowsocks (AEAD 加密)、HTTP (`CONNECT` 隧道及 `GET` 代理，可选 Basic Auth，可选 TLS)、MTProto (FakeTLS，可用作 Telegram 代理)。
-- **出站后端:** 直连 (Direct)、SOCKS5h (TCP/UDS)、Shadowsocks。
+- **入站:** SOCKS5 (TCP/UDS，可选认证与 TLS)、Shadowsocks (AEAD 加密)、HTTP (`CONNECT` 隧道与 `GET` 代理，可选 Basic Auth 和 TLS)、MTProto (FakeTLS，可用作 Telegram 代理)。
+- **出站:** 直连 (Direct)、SOCKS5h (TCP/UDS)、Shadowsocks。
 - **传输层:** 入站和出站均支持 TCP 和 Unix 域套接字 (UDS)。
 
 ### 路由与负载均衡
-- **层级路由:** 支持将特定的入站监听器绑定到嵌套策略组。
+- **层级路由:** 将特定的入站监听器绑定到嵌套策略组。
 - **路由策略:**
   - `failover` — 优先使用第一个健康的后端。
   - `urltest` — 路由到延迟最低的后端。
@@ -24,22 +24,22 @@
 - **全局兜底:** 未明确指定路由的入站会默认使用全局的 `failover_order` 进行流量转发。
 
 ### 运维控制
-- **零停机热重载:** 通过发送 `SIGHUP` 信号在不中断活动会话的情况下重新加载配置。
-- **网络状态感知:** 当检测到链路或网关变更时自动触发重新探测。
-- **Web 仪表盘 & REST API:** 实时查看流量统计、后端延迟和活跃连接数。
+- **零停机热重载:** 发送 `SIGHUP` 信号在不中断活动会话的情况下重载配置。
+- **网络状态感知:** 检测到链路或网关变更时自动触发重新探测。
+- **Web 仪表盘 & API:** 实时查看流量统计、后端延迟和活跃连接数。
 - **内置 AdBlock:** 在后台定期获取并刷新 AdGuard/Hosts 格式的过滤规则。
 
 ---
 
 ## ⚡ 性能
 
-ProxyLB 对吞吐量和低延迟进行了深度优化：
+ProxyLB 为最大吞吐量和极低延迟而生：
 
-- **零拷贝中继:** 在 Linux 上使用 `splice(2)` 实现内核级数据传输，完全绕过用户空间。
-- **预热连接池:** 在后台提前完成与出站后端的握手，将后端的握手延迟降到最低。
-- **无锁架构:** 广泛使用原子操作和 `ArcSwap`，避免在高负载下发生线程竞争。
-- **独立 CPU 运行时:** 将转发线程与后台任务绑定到不同的专属 CPU 核心。
-- **jemalloc:** 使用为高并发场景优化的 `jemalloc` 内存分配器。
+- **零拷贝中继:** 在 Linux 上对未加密的中继使用 `splice(2)` 绕过用户空间。加密中继使用优化的缓冲区操作。
+- **预热连接池:** 提前在后台完成出站握手，极大地降低热路径延迟。
+- **无锁热路径:** 使用原子操作和 `ArcSwap` 避免线程竞争。热路径上零策略计算，确保最高速度。
+- **独立 CPU 运行时:** 将转发线程与后台任务绑定到专属的 CPU 核心。
+- **jemalloc:** 采用适合高并发场景的 `jemalloc` 内存分配器。
 
 ### 基准测试
 
@@ -51,25 +51,25 @@ ProxyLB 对吞吐量和低延迟进行了深度优化：
 | **UDS**  | **~37,485** |
 | **TCP**  | **~15,346** |
 
-ProxyLB 在单核下即可轻松处理每秒数万次的连接。
+单核轻松处理每秒数万次连接。
 
 ---
 
 ## 🛠️ 使用场景
 
-### 场景 1: 高可靠代理网关
+### 场景 1: 代理网关
 
-最常见的使用场景是将 `sing-box`、`hysteria` 或 `mihomo` 等工具连接到不同的 VPS 节点，然后在其前面部署 ProxyLB，对外提供一个统一、高度可靠的 SOCKS5/Shadowsocks 入口。
+将 ProxyLB 作为统一的 SOCKS5/Shadowsocks 入口，前置于 `sing-box`、`hysteria` 或 `mihomo` 等本地代理客户端。
 
 **部署方式:**
-- **分布式部署:** 将 ProxyLB 部署在稳定的公有云服务器上，通过 WireGuard 将流量路由到家里运行着 `sing-box` / `hysteria` 的机器。ProxyLB 的连接池可以有效掩盖到家宽的握手延迟。
-- **本地部署 (UDS):** 将 ProxyLB 和 `sing-box` 部署在同一台路由器上。它们之间通过 Unix 域套接字 (UDS) 通信，完全绕过网络协议栈以获得更好的性能。你可以使用 `frp` 将 ProxyLB 的 UDS 入站暴露到公网供远程访问，而局域网设备则直接连接其本地 SOCKS5 端口。
+- **分布式部署:** 将 ProxyLB 部署在公有云，通过 WireGuard 将流量路由到家里运行着 `sing-box` / `hysteria` 的机器。连接池能够掩盖到家宽的握手延迟。
+- **本地部署 (UDS):** 在同一台路由器上运行 ProxyLB 和 `sing-box`。它们之间通过 Unix 域套接字 (UDS) 通信，绕过网络协议栈以提升性能。可通过 `frp` 将 ProxyLB 的 UDS 入站暴露到公网，内网设备则直接连接其 SOCKS5 端口。
 
-*(注：原版 `sing-box` 和 `hysteria` 暂不支持 UDS，你可以使用添加了 UDS 支持的修改版: [sing-box](https://github.com/chandler0149/sing-box) 和 [hysteria](https://github.com/chandler0149/hysteria))。*
+*(注：原版 `sing-box` 和 `hysteria` 暂不支持 UDS，可使用添加了 UDS 支持的分支: [sing-box](https://github.com/chandler0149/sing-box) 和 [hysteria](https://github.com/chandler0149/hysteria))。*
 
 ### 场景 2: 多协议负载均衡
 
-ProxyLB 可以智能地将不同类型的入站流量路由到特定的后端策略组。
+将不同的入站协议路由到指定的后端策略组。
 
 ```text
     [ Inbounds ]                                   [ ProxyLB Routing ]                          [ Backends ]
@@ -118,6 +118,7 @@ inbounds:
 backends:
   - name: "direct-out"
     type: "direct"
+    force_healthy: true
   - name: "socks-us-1"
     type: "socks5"
     address: "12.34.56.78:1080"

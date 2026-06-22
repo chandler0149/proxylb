@@ -2,7 +2,7 @@
 
 [English](README_en.md) | [简体中文](README.md)
 
-A high-performance proxy load balancer written in Rust. It supports SOCKS5, Shadowsocks, HTTP, and MTProto inbound protocols. ProxyLB provides advanced load balancing, health checks, and zero-downtime config reloads.
+High-performance proxy load balancer written in Rust. Supports SOCKS5, Shadowsocks, HTTP, and MTProto inbound protocols, with built-in load balancing, health checks, and zero-downtime config reloads.
 
 ![web](./web/web.jpg)
 
@@ -13,7 +13,7 @@ A high-performance proxy load balancer written in Rust. It supports SOCKS5, Shad
 ### Protocols & Transport
 - **Inbound:** SOCKS5 (TCP/UDS, auth, TLS), Shadowsocks (AEAD ciphers), HTTP (`CONNECT` tunnel, `GET` proxy, Basic Auth, TLS), and MTProto (FakeTLS for Telegram).
 - **Outbound:** Direct, SOCKS5h (TCP/UDS), and Shadowsocks.
-- **Transport Layer:** Both inbound and outbound connections support TCP and Unix Domain Sockets (UDS).
+- **Transport Layer:** TCP and Unix Domain Sockets (UDS) for both inbound and outbound.
 
 ### Routing & Load Balancing
 - **Hierarchical Routing:** Bind specific inbounds to nested backend groups.
@@ -25,19 +25,19 @@ A high-performance proxy load balancer written in Rust. It supports SOCKS5, Shad
 
 ### Operations
 - **Zero-Downtime Reload:** Send `SIGHUP` to reload configurations without dropping active sessions.
-- **Network Awareness:** Automatically triggers reprobes when link or gateway changes are detected.
-- **Web Dashboard & API:** Real-time visibility into traffic, backend latency, and connections.
-- **Built-in AdBlock:** Periodically fetches and updates AdGuard/Hosts blocklists in the background.
+- **Network Awareness:** Automatically reprobes when link or gateway changes are detected.
+- **Web Dashboard & API:** Real-time metrics for traffic, backend latency, and active connections.
+- **Built-in AdBlock:** Periodically fetches and updates AdGuard/Hosts blocklists.
 
 ---
 
 ## ⚡ Performance
 
-ProxyLB is optimized for throughput and low latency:
+ProxyLB is built for maximum throughput and low latency:
 
-- **Zero-Copy Relay:** Uses Linux `splice(2)` for kernel-level data transfer, bypassing userspace entirely.
-- **Pre-warmed Connection Pools:** Handshakes with outbounds are completed in the background so the hot-path latency is kept minimal.
-- **Lock-free Architecture:** Relies on atomics and `ArcSwap` to prevent thread contention.
+- **Zero-Copy Relay:** Uses Linux `splice(2)` to bypass userspace for unencrypted connections. Encrypted relays use optimized buffer manipulation.
+- **Pre-warmed Connection Pools:** Background out-of-band handshakes keep hot-path latency minimal.
+- **Lock-Free Hot-Path:** Uses atomics and `ArcSwap` to prevent thread contention. Zero policy calculation on the hot-path.
 - **Dedicated CPU Runtimes:** Forwarding threads and background tasks are pinned to specific CPU cores.
 - **jemalloc:** Uses the `jemalloc` memory allocator optimized for concurrency.
 
@@ -51,7 +51,7 @@ Tested on a Debian 13 guest via Parallels Desktop on macOS 14 (M3 Macbook Air).
 | **UDS** | **~37,485** |
 | **TCP** | **~15,346** |
 
-ProxyLB can handle tens of thousands of connections per second on a single core.
+ProxyLB handles tens of thousands of connections per second on a single core.
 
 ---
 
@@ -59,17 +59,17 @@ ProxyLB can handle tens of thousands of connections per second on a single core.
 
 ### Scenario 1: Reliable Proxy Gateway
 
-A common use case is running proxy clients like `sing-box`, `hysteria`, or `mihomo` connected to various VPS nodes, and putting ProxyLB in front of them as a unified, highly reliable SOCKS5 or Shadowsocks entry point.
+Deploy ProxyLB as a unified SOCKS5/Shadowsocks entry point in front of local proxy clients like `sing-box`, `hysteria`, or `mihomo`.
 
 **Deployment Options:**
-- **Distributed Deployment:** Run ProxyLB on a stable public cloud server. It routes traffic through WireGuard to a home server running `sing-box`/`hysteria`. ProxyLB's connection pool effectively hides the handshake latency to the home server.
-- **Local Deployment (UDS):** Run ProxyLB and `sing-box` on the same router. They communicate via Unix Domain Sockets (UDS), bypassing the network protocol stack entirely for better performance. You can use `frp` to expose ProxyLB's UDS inbound to the public internet for remote access, while your local devices connect to its local SOCKS5 port.
+- **Distributed Deployment:** Run ProxyLB on a public cloud server, routing traffic through WireGuard to a home server running `sing-box`/`hysteria`. ProxyLB's connection pool hides the handshake latency to the home server.
+- **Local Deployment (UDS):** Run ProxyLB and `sing-box` on the same router. They communicate via Unix Domain Sockets (UDS), bypassing the network stack for better performance. Use `frp` to expose ProxyLB's UDS inbound to the public internet for remote access, while local devices connect to its local SOCKS5 port.
 
-*(Note: The official `sing-box` and `hysteria` do not support UDS natively. You can use modified versions that add UDS support: [sing-box](https://github.com/chandler0149/sing-box) and [hysteria](https://github.com/chandler0149/hysteria)).*
+*(Note: The official `sing-box` and `hysteria` do not natively support UDS. Use modified versions with UDS support: [sing-box](https://github.com/chandler0149/sing-box) and [hysteria](https://github.com/chandler0149/hysteria)).*
 
 ### Scenario 2: Multi-Protocol Load Balancing
 
-ProxyLB can route different inbound protocols to specific backend groups.
+Route different inbound protocols to specific backend groups.
 
 ```text
     [ Inbounds ]                                   [ ProxyLB Routing ]                          [ Backends ]
@@ -118,6 +118,7 @@ inbounds:
 backends:
   - name: "direct-out"
     type: "direct"
+    force_healthy: true
   - name: "socks-us-1"
     type: "socks5"
     address: "12.34.56.78:1080"
