@@ -2,6 +2,7 @@
 //!
 //! Provides JSON API endpoints for real-time status query and enabling/disabling backends.
 
+use axum::http::{StatusCode, Uri, header};
 use axum::{
     Router,
     extract::State,
@@ -9,8 +10,14 @@ use axum::{
     routing::get,
 };
 use memory_stats::memory_stats;
+use mime_guess::from_path;
+use rust_embed::RustEmbed;
 use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
+
+#[derive(RustEmbed)]
+#[folder = "web/dist/"]
+struct Assets;
 
 use crate::backend::BackendPool;
 
@@ -47,6 +54,9 @@ struct ApiResponse {
     tree: Vec<crate::backend::TreeItem>,
     memory: MemStats,
     inbounds: Vec<crate::backend::InboundStatsView>,
+    clients: Vec<crate::stats::ClientStatsView>,
+    domains: Vec<crate::stats::DomainStatsView>,
+    blocked_domains: Vec<crate::stats::DomainStatsView>,
     adblock: AdBlockStatusView,
 }
 
@@ -56,18 +66,51 @@ pub fn create_router(pool: BackendPool) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .allow_private_network(true);
 
     Router::new()
-        .route("/", get(api_info))
+        .route("/api", get(api_info))
         .route("/api/status", get(api_status))
         .route("/api/backends/{name}/enable", post(api_enable_backend))
         .route("/api/backends/{name}/disable", post(api_disable_backend))
+        .route(
+            "/api/filter/items",
+            axum::routing::get(api_get_items)
+                .post(api_add_item)
+                .delete(api_delete_item),
+        )
+        .route("/api/filter/settings", post(api_set_filter_settings))
+        .route("/api/filter/check", axum::routing::get(api_check_rule))
         .layer(cors)
+        .fallback(get(static_handler))
         .with_state(pool)
 }
 
-/// GET /
+async fn static_handler(uri: Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/').to_string();
+
+    if path.is_empty() {
+        return axum::response::Redirect::temporary("/index.html").into_response();
+    }
+
+    match Assets::get(path.as_str()) {
+        Some(content) => {
+            let mime = from_path(path).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+        }
+        None => {
+            if let Some(index) = Assets::get("index.html") {
+                let mime = from_path("index.html").first_or_octet_stream();
+                ([(header::CONTENT_TYPE, mime.as_ref())], index.data).into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "404 Not Found").into_response()
+            }
+        }
+    }
+}
+
+/// GET /api
 async fn api_info() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",
@@ -149,7 +192,7 @@ pub async fn run_web_server(listen_addr: String, pool: BackendPool) -> anyhow::R
 mod tests {
     use super::*;
     use crate::backend::BackendPool;
-    use crate::config::AdBlockConfig;
+    use crate::config::FilterConfig;
     use tokio::sync::watch;
 
     #[tokio::test]
@@ -161,7 +204,7 @@ mod tests {
             None,
             None,
             rx,
-            &AdBlockConfig::default(),
+            &FilterConfig::default(),
             tokio::runtime::Handle::current(),
             std::collections::HashSet::new(),
         )
@@ -196,7 +239,7 @@ mod tests {
             None,
             None,
             rx,
-            &AdBlockConfig::default(),
+            &FilterConfig::default(),
             tokio::runtime::Handle::current(),
             std::collections::HashSet::new(),
         )
@@ -228,23 +271,162 @@ async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
     let tree = pool.status_tree().await;
     let memory = get_memory_usage();
     let inbounds = pool.get_inbound_stats();
+    let clients = pool.client_manager.get_views();
 
-    let engine = pool.adblock_manager.engine.load();
+    let engine = pool.filter_manager.engine.load();
     let adblock = AdBlockStatusView {
-        enabled: **pool.adblock_manager.enabled.load(),
+        enabled: pool.filter_manager.is_enabled(),
         block_rules_count: engine.block_rules_count,
-        allow_rules_count: engine.allow_rules_count,
+        allow_rules_count: 0,
         blocked_requests: pool
-            .adblock_manager
+            .filter_manager
             .blocked_requests
             .load(std::sync::atomic::Ordering::Relaxed),
     };
+
+    let domains = pool.domain_manager.get_views();
+    let blocked_domains = pool.filter_manager.blocked_domains_manager.get_views();
 
     Json(ApiResponse {
         backends,
         tree,
         memory,
         inbounds,
+        clients,
+        domains,
+        blocked_domains,
         adblock,
     })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type")]
+pub enum FilterItemRequest {
+    #[serde(rename = "rule")]
+    Rule { rules: Vec<String> },
+    #[serde(rename = "url")]
+    Url {
+        url: String,
+        #[serde(default)]
+        tag: String,
+    },
+}
+
+#[derive(serde::Serialize)]
+pub struct FilterItemsResponse {
+    pub rules: Vec<String>,
+    pub urls: Vec<crate::filter::FilterUrl>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct FilterSettingsRequest {
+    pub enabled: bool,
+    pub block_private_addresses: bool,
+}
+
+async fn api_get_items(State(pool): State<BackendPool>) -> impl IntoResponse {
+    let rules = pool.filter_manager.get_rules();
+    let mut urls = pool.filter_manager.get_urls();
+    let cache = pool.filter_manager.cached_remote_contents.read().await;
+    for u in &mut urls {
+        if let Some(content) = cache.get(&u.url) {
+            u.rule_count = content
+                .lines()
+                .filter_map(crate::filter::parse_rule_line)
+                .count();
+        }
+    }
+    Json(FilterItemsResponse { rules, urls })
+}
+
+async fn api_add_item(
+    State(pool): State<BackendPool>,
+    Json(req): Json<FilterItemRequest>,
+) -> impl IntoResponse {
+    match req {
+        FilterItemRequest::Rule { rules } => {
+            if pool.filter_manager.add_rules(&rules).await.is_ok() {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+        FilterItemRequest::Url { url, tag } => {
+            match crate::filter::download_url(&pool, pool.filter_manager.backend.as_deref(), &url)
+                .await
+            {
+                Ok(content) => {
+                    if pool
+                        .filter_manager
+                        .add_url(&url, &tag, content)
+                        .await
+                        .is_ok()
+                    {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(url = %url, error = %e, "failed to download filter list from web UI");
+                    axum::http::StatusCode::BAD_REQUEST
+                }
+            }
+        }
+    }
+}
+
+async fn api_delete_item(
+    State(pool): State<BackendPool>,
+    Json(req): Json<FilterItemRequest>,
+) -> impl IntoResponse {
+    match req {
+        FilterItemRequest::Rule { rules } => {
+            if pool.filter_manager.delete_rules(&rules).await.is_ok() {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+        FilterItemRequest::Url { url, tag: _ } => {
+            if pool.filter_manager.delete_url(&url).await.is_ok() {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+    }
+}
+
+async fn api_set_filter_settings(
+    State(pool): State<BackendPool>,
+    Json(req): Json<FilterSettingsRequest>,
+) -> impl IntoResponse {
+    pool.filter_manager.set_enabled(req.enabled);
+    pool.filter_manager
+        .set_block_private(req.block_private_addresses);
+    axum::http::StatusCode::OK
+}
+
+#[derive(serde::Deserialize)]
+pub struct CheckRequest {
+    pub target: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct CheckResponse {
+    pub blocked: bool,
+}
+
+async fn api_check_rule(
+    State(pool): State<BackendPool>,
+    axum::extract::Query(req): axum::extract::Query<CheckRequest>,
+) -> impl IntoResponse {
+    let target_addr = if let Ok(ip) = req.target.parse::<std::net::IpAddr>() {
+        crate::outbound::TargetAddr::Ip(std::net::SocketAddr::new(ip, 0))
+    } else {
+        crate::outbound::TargetAddr::Domain(req.target.clone(), 0)
+    };
+    let blocked = pool.filter_manager.is_blocked(&target_addr);
+    Json(CheckResponse { blocked })
 }

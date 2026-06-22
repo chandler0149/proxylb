@@ -11,6 +11,7 @@
 //!      socket instead of TCP, which has no port-space at all.
 
 use clap::Parser;
+use rand::RngExt;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ struct Args {
     #[arg(long)]
     proxy_uds: Option<String>,
 
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "google.com")]
     target_host: String,
 
     #[arg(long, default_value = "10800")]
@@ -43,6 +44,10 @@ struct Args {
 
     #[arg(long, default_value = "10")]
     duration: u64,
+
+    /// Generate random domains to benchmark the filter engine
+    #[arg(long)]
+    random_domains: bool,
 }
 
 // ─── TCP path ────────────────────────────────────────────────────────────────
@@ -51,6 +56,7 @@ async fn test_socks5_tcp(
     proxy_addr: SocketAddr,
     target_ip_bytes: [u8; 4],
     target_port_bytes: [u8; 2],
+    random_domains: bool,
 ) -> bool {
     // Use TcpSocket so we can set SO_REUSEADDR + SO_REUSEPORT before connect.
     // This lets the kernel reuse ports that are still in TIME_WAIT, preventing
@@ -69,7 +75,13 @@ async fn test_socks5_tcp(
     };
     let _ = stream.set_nodelay(true);
 
-    do_socks5_handshake(&mut stream, &target_ip_bytes, &target_port_bytes).await
+    do_socks5_handshake(
+        &mut stream,
+        &target_ip_bytes,
+        &target_port_bytes,
+        random_domains,
+    )
+    .await
 }
 
 // ─── UDS path ────────────────────────────────────────────────────────────────
@@ -78,12 +90,19 @@ async fn test_socks5_uds(
     proxy_path: &str,
     target_ip_bytes: [u8; 4],
     target_port_bytes: [u8; 2],
+    random_domains: bool,
 ) -> bool {
     let mut stream = match tokio::net::UnixStream::connect(proxy_path).await {
         Ok(s) => s,
         Err(_) => return false,
     };
-    do_socks5_handshake(&mut stream, &target_ip_bytes, &target_port_bytes).await
+    do_socks5_handshake(
+        &mut stream,
+        &target_ip_bytes,
+        &target_port_bytes,
+        random_domains,
+    )
+    .await
 }
 
 // ─── Shared SOCKS5 handshake ─────────────────────────────────────────────────
@@ -92,6 +111,7 @@ async fn do_socks5_handshake<S>(
     stream: &mut S,
     target_ip_bytes: &[u8; 4],
     target_port_bytes: &[u8; 2],
+    random_domains: bool,
 ) -> bool
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
@@ -109,16 +129,37 @@ where
         return false;
     }
 
-    // 2. CONNECT request (IPv4)
-    let mut req = [0u8; 10];
-    req[0] = 0x05;
-    req[1] = 0x01;
-    req[2] = 0x00;
-    req[3] = 0x01; // ATYP = IPv4
-    req[4..8].copy_from_slice(target_ip_bytes);
-    req[8..10].copy_from_slice(target_port_bytes);
-    if stream.write_all(&req).await.is_err() {
-        return false;
+    // 2. CONNECT request
+    if random_domains {
+        let req = {
+            let mut rng = rand::rng();
+            let mut domain = String::with_capacity(16);
+            for _ in 0..10 {
+                let c: u8 = rng.random_range(b'a'..=b'z');
+                domain.push(c as char);
+            }
+            domain.push_str(".com");
+            let domain_bytes = domain.as_bytes();
+            let mut r = Vec::with_capacity(10 + domain_bytes.len());
+            r.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, domain_bytes.len() as u8]);
+            r.extend_from_slice(domain_bytes);
+            r.extend_from_slice(target_port_bytes);
+            r
+        };
+        if stream.write_all(&req).await.is_err() {
+            return false;
+        }
+    } else {
+        let mut req = [0u8; 10];
+        req[0] = 0x05;
+        req[1] = 0x01;
+        req[2] = 0x00;
+        req[3] = 0x01; // ATYP = IPv4
+        req[4..8].copy_from_slice(target_ip_bytes);
+        req[8..10].copy_from_slice(target_port_bytes);
+        if stream.write_all(&req).await.is_err() {
+            return false;
+        }
     }
 
     // 3. CONNECT response
@@ -175,16 +216,24 @@ async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let proxy_uds = proxy_uds.clone();
 
         let task = tokio::spawn(async move {
+            let random_domains = args.random_domains;
             while running.load(Ordering::Relaxed) {
                 let ok = if let Some(ref path) = proxy_uds {
-                    test_socks5_uds(path, target_ip_bytes, target_port_bytes).await
+                    test_socks5_uds(path, target_ip_bytes, target_port_bytes, random_domains).await
                 } else {
-                    test_socks5_tcp(proxy_addr, target_ip_bytes, target_port_bytes).await
+                    test_socks5_tcp(
+                        proxy_addr,
+                        target_ip_bytes,
+                        target_port_bytes,
+                        random_domains,
+                    )
+                    .await
                 };
                 if ok {
                     success_count.fetch_add(1, Ordering::Relaxed);
                 } else {
                     fail_count.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
                 }
             }
         });

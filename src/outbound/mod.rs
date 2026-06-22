@@ -19,7 +19,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UnixStream};
 
 /// Target address to connect to.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TargetAddr {
     /// Domain name + port (DNS resolved by backend or directly resolved).
     Domain(String, u16),
@@ -113,6 +113,7 @@ impl AsyncWrite for RawBackendStream {
 
 pub struct BackendStream {
     pub inner: RawBackendStream,
+    pub base_latency: std::time::Duration,
     #[cfg(target_os = "linux")]
     pub pipes: Option<crate::relay::PreallocatedPipes>,
 }
@@ -121,6 +122,7 @@ impl BackendStream {
     pub fn new(inner: RawBackendStream) -> Self {
         Self {
             inner,
+            base_latency: std::time::Duration::ZERO,
             #[cfg(target_os = "linux")]
             pipes: None,
         }

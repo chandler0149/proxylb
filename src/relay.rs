@@ -4,6 +4,7 @@
 //! If both streams are raw files/sockets on Linux, it utilizes zero-copy `splice`.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(target_os = "linux")]
@@ -127,7 +128,12 @@ pub fn defer_drop(stream: impl Send + 'static) {
 /// Relay data bidirectionally between two streams until one side closes.
 ///
 /// Returns (bytes_client_to_backend, bytes_backend_to_client).
-pub async fn relay<A, B>(client: &mut A, backend: &mut B) -> std::io::Result<(u64, u64)>
+pub async fn relay<'a, A, B>(
+    client: &mut A,
+    backend: &mut B,
+    up_counters: Vec<&'a AtomicU64>,
+    down_counters: Vec<&'a AtomicU64>,
+) -> std::io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + AsRawStreamRef,
     B: AsyncRead + AsyncWrite + Unpin + AsRawStreamRef,
@@ -140,38 +146,48 @@ where
         if let (Some(stream_a), Some(stream_b)) =
             (client.as_raw_stream_ref(), backend.as_raw_stream_ref())
         {
-            if let Ok(res) = splice_bidirectional_with_pipes(stream_a, stream_b, pipes).await {
+            if let Ok(res) = splice_bidirectional_with_pipes(
+                stream_a,
+                stream_b,
+                pipes,
+                up_counters.clone(),
+                down_counters.clone(),
+            )
+            .await
+            {
                 return Ok(res);
             }
         }
     }
 
-    large_copy_bidirectional_fallback(client, backend).await
+    large_copy_bidirectional_fallback(client, backend, up_counters, down_counters).await
 }
 
-struct TransferState {
+struct TransferState<'a> {
     read_done: bool,
     pos: usize,
     cap: usize,
     amt: u64,
     buf: Box<[u8]>,
+    counters: Vec<&'a AtomicU64>,
 }
 
-impl TransferState {
-    fn new(size: usize) -> Self {
+impl<'a> TransferState<'a> {
+    fn new(size: usize, counters: Vec<&'a AtomicU64>) -> Self {
         Self {
             read_done: false,
             pos: 0,
             cap: 0,
             amt: 0,
             buf: vec![0; size].into_boxed_slice(),
+            counters,
         }
     }
 }
 
-fn transfer_one_direction<R, W>(
+fn transfer_one_direction<'a, R, W>(
     cx: &mut std::task::Context<'_>,
-    state: &mut TransferState,
+    state: &mut TransferState<'a>,
     r: &mut R,
     w: &mut W,
 ) -> std::task::Poll<std::io::Result<()>>
@@ -212,6 +228,9 @@ where
                 std::task::Poll::Ready(Ok(n)) => {
                     state.pos += n;
                     state.amt += n as u64;
+                    for c in &state.counters {
+                        c.fetch_add(n as u64, Ordering::Relaxed);
+                    }
                 }
                 std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                 std::task::Poll::Pending => return std::task::Poll::Pending,
@@ -232,8 +251,8 @@ where
 struct LargeBidirectionalCopy<'a, A: ?Sized, B: ?Sized> {
     a: &'a mut A,
     b: &'a mut B,
-    a_to_b: TransferState,
-    b_to_a: TransferState,
+    a_to_b: TransferState<'a>,
+    b_to_a: TransferState<'a>,
 }
 
 impl<'a, A, B> std::future::Future for LargeBidirectionalCopy<'a, A, B>
@@ -243,10 +262,15 @@ where
 {
     type Output = std::io::Result<(u64, u64)>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
-        let mut a_to_b_poll = transfer_one_direction(cx, &mut this.a_to_b, &mut *this.a, &mut *this.b);
-        let mut b_to_a_poll = transfer_one_direction(cx, &mut this.b_to_a, &mut *this.b, &mut *this.a);
+        let mut a_to_b_poll =
+            transfer_one_direction(cx, &mut this.a_to_b, &mut *this.a, &mut *this.b);
+        let mut b_to_a_poll =
+            transfer_one_direction(cx, &mut this.b_to_a, &mut *this.b, &mut *this.a);
 
         // Half-close handling: if one direction is fully done, shutdown the write half on the receiving end.
         if let std::task::Poll::Ready(Ok(())) = a_to_b_poll {
@@ -281,7 +305,12 @@ where
     }
 }
 
-pub async fn large_copy_bidirectional_fallback<A, B>(client: &mut A, backend: &mut B) -> std::io::Result<(u64, u64)>
+pub async fn large_copy_bidirectional_fallback<'a, A, B>(
+    client: &mut A,
+    backend: &mut B,
+    up_counters: Vec<&'a AtomicU64>,
+    down_counters: Vec<&'a AtomicU64>,
+) -> std::io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -289,8 +318,8 @@ where
     LargeBidirectionalCopy {
         a: client,
         b: backend,
-        a_to_b: TransferState::new(65536), // 64KB buffer
-        b_to_a: TransferState::new(65536), // 64KB buffer
+        a_to_b: TransferState::new(65536, up_counters), // 64KB buffer
+        b_to_a: TransferState::new(65536, down_counters), // 64KB buffer
     }
     .await
 }
@@ -357,14 +386,14 @@ fn create_pipe() -> std::io::Result<(RawFd, RawFd)> {
     if res == -1 {
         return Err(std::io::Error::last_os_error());
     }
-    
+
     // Attempt to increase the pipe capacity to 1MB (1048576 bytes) for higher throughput.
     // F_SETPIPE_SZ is 1031 in Linux. Ignore errors if we hit hard limits.
     #[cfg(target_os = "linux")]
     unsafe {
         libc::fcntl(fds[1], libc::F_SETPIPE_SZ, 1048576);
     }
-    
+
     Ok((fds[0], fds[1]))
 }
 
@@ -390,11 +419,12 @@ impl std::ops::Deref for DeferredFd {
 }
 
 #[cfg(target_os = "linux")]
-async fn splice_one_way(
+async fn splice_one_way<'a>(
     r_stream: RawStreamRef<'_>,
     w_stream: RawStreamRef<'_>,
     pipe_rd: OwnedFd,
     pipe_wr: OwnedFd,
+    counters: Vec<&'a AtomicU64>,
 ) -> std::io::Result<u64> {
     use std::os::unix::io::AsRawFd;
 
@@ -466,15 +496,20 @@ async fn splice_one_way(
             written += res as usize;
         }
         total_bytes += written as u64;
+        for c in &counters {
+            c.fetch_add(written as u64, Ordering::Relaxed);
+        }
     }
     Ok(total_bytes)
 }
 
 #[cfg(target_os = "linux")]
-pub async fn splice_bidirectional_with_pipes(
+pub async fn splice_bidirectional_with_pipes<'a>(
     stream_a: RawStreamRef<'_>,
     stream_b: RawStreamRef<'_>,
     pipes: Option<PreallocatedPipes>,
+    up_counters: Vec<&'a AtomicU64>,
+    down_counters: Vec<&'a AtomicU64>,
 ) -> std::io::Result<(u64, u64)> {
     let (pipe1_rd, pipe1_wr, pipe2_rd, pipe2_wr) = match pipes {
         Some(p) => (p.pipe1_rd, p.pipe1_wr, p.pipe2_rd, p.pipe2_wr),
@@ -482,17 +517,12 @@ pub async fn splice_bidirectional_with_pipes(
             let (p1_rd, p1_wr) = create_pipe()?;
             let (pipe1_rd, pipe1_wr) = (OwnedFd(p1_rd), OwnedFd(p1_wr));
             let (p2_rd, p2_wr) = create_pipe()?;
-            (
-                pipe1_rd,
-                pipe1_wr,
-                OwnedFd(p2_rd),
-                OwnedFd(p2_wr),
-            )
+            (pipe1_rd, pipe1_wr, OwnedFd(p2_rd), OwnedFd(p2_wr))
         }
     };
 
-    let task_a_to_b = splice_one_way(stream_a, stream_b, pipe1_rd, pipe1_wr);
-    let task_b_to_a = splice_one_way(stream_b, stream_a, pipe2_rd, pipe2_wr);
+    let task_a_to_b = splice_one_way(stream_a, stream_b, pipe1_rd, pipe1_wr, up_counters);
+    let task_b_to_a = splice_one_way(stream_b, stream_a, pipe2_rd, pipe2_wr, down_counters);
 
     let (res_ab, res_ba) = tokio::join!(task_a_to_b, task_b_to_a);
     Ok((res_ab?, res_ba?))

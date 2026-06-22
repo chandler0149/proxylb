@@ -2,11 +2,16 @@
 # ---------------------
 # A high-performance proxy load balancer with multi-protocol inbound support.
 
-inbound:
-  # Private address target filter (reject private/loopback targets if enabled)
-  filter:
-    enabled: true
-
+# Global filter settings
+filter:
+  enabled: true
+  block_private_addresses: true
+  backend: "direct-out"
+  urls:
+    - url: "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt"
+      tag: "AdblockDNS"
+  files:
+    - "/etc/proxylb/custom-blocklist.txt"
 
 # Multiple Inbound Listeners Reference
 # ------------------------------------
@@ -26,6 +31,7 @@ inbounds:
     username: "inbound-user"
     password: "inbound-password"
     route: "proxy-group"          # ◀ Bound to "proxy-group" (nested: region-us + region-eu)
+    network: "tcp_udp"            # ◀ Enable UDP associate for SOCKS5
     filter:
       enabled: false
 
@@ -35,6 +41,7 @@ inbounds:
     password: "another-password"
     method: "chacha20-ietf-poly1305"
     route: "telegram-group"       # ◀ Bound to "telegram-group" (failover: region-us → direct)
+    network: "tcp_udp"            # ◀ Enable UDP proxying for Shadowsocks
 
   - type: mtproto
     listen: "0.0.0.0:8443"
@@ -75,6 +82,7 @@ backends:
     name: "us-east-1"
     username: "user1"
     password: "pass1"
+    network: "tcp_udp"
 
   - type: socks5
     address: "127.0.0.1:10801"
@@ -109,12 +117,21 @@ backends:
     name: "direct-out"
     force_healthy: true
 
+  - type: socks5
+    address: "127.0.0.1:10806"
+    name: "sa-east-1"
+
+  - type: socks5
+    address: "127.0.0.1:10807"
+    name: "sa-west-1"
+
   - type: ss
     address: "ss-server.example.com:8388"
     name: "ss-backend-1"
     username: "chacha20-ietf-poly1305"
     password: "my-shadowsocks-password"
     pool_size: 10
+    network: "tcp_udp"
 
   - type: socks5
     address: "tls-socks5-server.example.com:10802"
@@ -129,9 +146,11 @@ backends:
 
 # Backend groups
 # Strategy options:
-#   urltest      - Pick the healthy member with lowest latency.
-#   failover     - Try members in order; fall back to next if current is down.
-#   loadbalance  - Distribute connections by least active connections.
+#   urltest              - Pick the healthy member with lowest latency.
+#   failover             - Try members in order; fall back to next if current is down.
+#   loadbalance          - Distribute connections by least active connections.
+#   weighted_round_robin - Distribute connections proportional to inverse historical bandwidth.
+#   consistent_hashing   - Route to same backend based on destination domain hash.
 #
 # Members can be backend names OR other group names (nested groups).
 #
@@ -142,33 +161,52 @@ backends:
 # │  ├── region-us (urltest)        ├── region-us (urltest)         │
 # │  │   ├── us-east-1              │   ├── us-east-1              │
 # │  │   └── us-west-1              │   └── us-west-1              │
-# │  └── region-eu (failover)       └── direct-out                  │
+# │  └── region-eu (consistent_hash)└── direct-out                  │
 # │      ├── eu-west-1                                              │
 # │      └── eu-central-1           global-fallback (failover)      │
 # │                                  ├── proxy-group                │
-# │  region-ap (loadbalance)         ├── region-ap                  │
-# │  ├── ap-east-1                   └── direct-out                 │
-# │  └── ap-southeast-1                                             │
+# │  region-ap (weighted_rr)         ├── region-ap                  │
+# │  ├── ap-east-1                   ├── region-sa                  │
+# │  └── ap-southeast-1              └── direct-out                 │
+# │                                                                 │
+# │  region-sa (loadbalance)                                        │
+# │  ├── sa-east-1                                                  │
+# │  └── sa-west-1                                                  │
 # └──────────────────────────────────────────────────────────────────┘
 groups:
   # ─── Leaf groups: physical backends only ─────────────────────────────────────
+  
+  # URLTest Strategy: Automatically connects to the node with the lowest latency.
+  # Best for general web browsing where response time is critical.
   - name: "region-us"
     strategy: "urltest"
     members:
       - "us-east-1"
       - "us-west-1"
 
+  # Consistent Hashing Strategy: Routes traffic for the same domain to the same node.
+  # Best for websites that require sticky sessions or to maximize CDN cache hits.
   - name: "region-eu"
-    strategy: "failover"
+    strategy: "consistent_hashing"
     members:
       - "eu-west-1"
       - "eu-central-1"
 
+  # Weighted Round Robin Strategy: Distributes traffic proportionally, penalizing nodes
+  # with high historical bandwidth usage. Best for bulk file downloads to spread data caps.
   - name: "region-ap"
-    strategy: "loadbalance"
+    strategy: "weighted_round_robin"
     members:
       - "ap-east-1"
       - "ap-southeast-1"
+
+  # LoadBalance Strategy: Distributes new connections to the node with the fewest active
+  # connections. Best for long-lived protocols (e.g., websockets, SSH) to keep server loads even.
+  - name: "region-sa"
+    strategy: "loadbalance"
+    members:
+      - "sa-east-1"
+      - "sa-west-1"
 
   # ─── Nested group A: used by Inbound A (socks5 :1081) ───────────────────────
   # Picks the fastest backend across US and EU regions.
@@ -187,12 +225,13 @@ groups:
       - "direct-out"              # standalone backend
 
   # ─── Nested group C: used as the global fallback (Inbound C and others) ──────
-  # Tries proxy-group first, then AP, then direct.
+  # Tries proxy-group first, then AP, then SA, then direct.
   - name: "global-fallback"
     strategy: "failover"
     members:
       - "proxy-group"             # nested group (itself contains nested groups)
       - "region-ap"               # nested group
+      - "region-sa"               # nested group
       - "direct-out"              # standalone backend
 
 
@@ -219,15 +258,6 @@ cpu_affinity:
   worker_cores: [0, 1]
   ancillary_cores: [2]
 
-# AdBlock Guard settings
-adblock:
-  enabled: true
-  backend: "direct-out"
-  urls:
-    - "https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/SpiderFilter/sections/adservers.txt"
-  files:
-    - "/etc/proxylb/custom-blocklist.txt"
-  update_interval_hours: 24
 
 advanced:
   zero_copy: true

@@ -44,23 +44,63 @@ pub struct Config {
     #[serde(default)]
     pub cpu_affinity: Option<CpuAffinityConfig>,
     #[serde(default)]
-    pub adblock: AdBlockConfig,
+    pub filter: FilterConfig,
     #[serde(default)]
     #[allow(dead_code)]
     pub advanced: AdvancedConfig,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct AdBlockConfig {
-    #[serde(default)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct FilterConfig {
+    #[serde(default = "default_filter_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub block_private_addresses: bool,
     pub backend: Option<String>,
     #[serde(default)]
-    pub urls: Vec<String>,
+    pub urls: Vec<ConfigUrl>,
     #[serde(default)]
     pub files: Vec<String>,
     #[serde(default = "default_update_interval_hours")]
     pub update_interval_hours: u64,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ConfigUrl {
+    String(String),
+    Struct { url: String, tag: String },
+}
+
+#[allow(dead_code)]
+impl ConfigUrl {
+    pub fn into_filter_url(self) -> crate::filter::FilterUrl {
+        match self {
+            ConfigUrl::String(url) => crate::filter::FilterUrl {
+                url,
+                tag: "Config".to_string(),
+                rule_count: 0,
+            },
+            ConfigUrl::Struct { url, tag } => crate::filter::FilterUrl {
+                url,
+                tag,
+                rule_count: 0,
+            },
+        }
+    }
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_filter_enabled(),
+            block_private_addresses: false,
+            backend: None,
+            urls: Vec::new(),
+            files: Vec::new(),
+            update_interval_hours: default_update_interval_hours(),
+        }
+    }
 }
 
 fn default_update_interval_hours() -> u64 {
@@ -90,6 +130,10 @@ pub enum GroupStrategy {
     UrlTest,
     Failover,
     LoadBalance,
+    #[serde(rename = "consistent_hashing")]
+    ConsistentHashing,
+    #[serde(rename = "weighted_round_robin")]
+    WeightedRoundRobin,
 }
 
 impl Default for GroupStrategy {
@@ -116,8 +160,6 @@ pub struct InboundConfig {
     pub shadowsocks: Option<ShadowsocksInboundConfig>,
     pub http: Option<HttpInboundConfig>,
     pub mtproto: Option<MtprotoInboundConfig>,
-    #[serde(default)]
-    pub filter: FilterConfig,
 }
 
 /// A specific inbound configuration item when running multiple inbounds.
@@ -134,9 +176,10 @@ pub enum InboundItemConfig {
         tls: Option<TlsServerConfig>,
         #[serde(default)]
         filter: Option<FilterConfig>,
-        /// Optional route binding: group or backend name to route through.
         #[serde(default)]
         route: Option<String>,
+        #[serde(default)]
+        network: Option<String>,
     },
     Shadowsocks {
         listen: String,
@@ -148,6 +191,8 @@ pub enum InboundItemConfig {
         filter: Option<FilterConfig>,
         #[serde(default)]
         route: Option<String>,
+        #[serde(default)]
+        network: Option<String>,
     },
     Http {
         listen: String,
@@ -180,6 +225,10 @@ pub struct Socks5InboundConfig {
     pub listen: String,
     pub username: Option<String>,
     pub password: Option<String>,
+    #[serde(default)]
+    pub filter: Option<FilterConfig>,
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 /// Shadowsocks inbound listener.
@@ -189,6 +238,10 @@ pub struct ShadowsocksInboundConfig {
     pub password: String,
     /// Cipher method, e.g. "aes-256-gcm", "aes-128-gcm", "chacha20-ietf-poly1305"
     pub method: String,
+    #[serde(default)]
+    pub filter: Option<FilterConfig>,
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 /// HTTP inbound listener.
@@ -197,6 +250,8 @@ pub struct HttpInboundConfig {
     pub listen: String,
     pub username: Option<String>,
     pub password: Option<String>,
+    #[serde(default)]
+    pub filter: Option<FilterConfig>,
 }
 
 /// MTProto inbound listener.
@@ -204,23 +259,12 @@ pub struct HttpInboundConfig {
 pub struct MtprotoInboundConfig {
     pub listen: String,
     pub secret: String,
+    #[serde(default)]
+    pub filter: Option<FilterConfig>,
 }
 
 fn default_filter_enabled() -> bool {
     true
-}
-
-/// Private address target filter configuration.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-pub struct FilterConfig {
-    #[serde(default = "default_filter_enabled")]
-    pub enabled: bool,
-}
-
-impl Default for FilterConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 /// A backend entry.
@@ -253,6 +297,15 @@ pub struct BackendConfig {
     /// If true, do not perform health check and consider healthy forever (default: false).
     #[serde(default)]
     pub force_healthy: bool,
+    #[serde(default)]
+    pub network: Option<String>,
+    /// Number of consecutive failures before marking the backend as unhealthy (default: 1).
+    #[serde(default = "default_max_fails")]
+    pub max_fails: u32,
+}
+
+fn default_max_fails() -> u32 {
+    1
 }
 
 fn default_pool_size() -> usize {
@@ -340,8 +393,9 @@ impl Config {
                 username: s5.username.clone(),
                 password: s5.password.clone(),
                 tls: None,
-                filter: Some(self.inbound.filter.clone()),
+                filter: None,
                 route: None,
+                network: s5.network.clone(),
             });
         }
         if let Some(ref ss) = self.inbound.shadowsocks {
@@ -350,8 +404,9 @@ impl Config {
                 password: ss.password.clone(),
                 method: ss.method.clone(),
                 tls: None,
-                filter: Some(self.inbound.filter.clone()),
+                filter: None,
                 route: None,
+                network: ss.network.clone(),
             });
         }
         if let Some(ref http) = self.inbound.http {
@@ -360,7 +415,7 @@ impl Config {
                 username: http.username.clone(),
                 password: http.password.clone(),
                 tls: None,
-                filter: Some(self.inbound.filter.clone()),
+                filter: None,
                 route: None,
             });
         }
@@ -369,23 +424,12 @@ impl Config {
                 listen: mtproto.listen.clone(),
                 password: mtproto.secret.clone(),
                 tls: None,
-                filter: Some(self.inbound.filter.clone()),
+                filter: None,
                 route: None,
             });
         }
         for item in &self.inbounds {
-            let mut resolved_item = item.clone();
-            match &mut resolved_item {
-                InboundItemConfig::Socks5 { filter, .. }
-                | InboundItemConfig::Shadowsocks { filter, .. }
-                | InboundItemConfig::Http { filter, .. }
-                | InboundItemConfig::Mtproto { filter, .. } => {
-                    if filter.is_none() {
-                        *filter = Some(self.inbound.filter.clone());
-                    }
-                }
-            }
-            res.push(resolved_item);
+            res.push(item.clone());
         }
         res
     }
@@ -473,7 +517,7 @@ impl Config {
             }
         }
 
-        // Detect cycles in nested group references using DFS.
+        // Detect cycles in nested group references using DFS (3-color algorithm).
         {
             let group_map: std::collections::HashMap<&str, &[String]> = self
                 .groups
@@ -481,23 +525,38 @@ impl Config {
                 .map(|g| (g.name.as_str(), g.members.as_slice()))
                 .collect();
 
-            for group in &self.groups {
-                let mut visited = std::collections::HashSet::new();
-                let mut stack = vec![group.name.as_str()];
-                while let Some(current) = stack.pop() {
-                    if !visited.insert(current) {
-                        anyhow::bail!(
-                            "cycle detected in group hierarchy involving '{}'",
-                            current
-                        );
-                    }
-                    if let Some(members) = group_map.get(current) {
-                        for m in *members {
-                            if group_names.contains(m.as_str()) {
-                                stack.push(m.as_str());
+            // 0: unvisited, 1: visiting, 2: visited
+            let mut state: std::collections::HashMap<&str, u8> = std::collections::HashMap::new();
+
+            fn dfs<'a>(
+                current: &'a str,
+                group_map: &std::collections::HashMap<&str, &'a [String]>,
+                group_names: &std::collections::HashSet<String>,
+                state: &mut std::collections::HashMap<&'a str, u8>,
+            ) -> Result<()> {
+                state.insert(current, 1);
+                if let Some(members) = group_map.get(current) {
+                    for m in *members {
+                        if group_names.contains(m.as_str()) {
+                            let s = *state.get(m.as_str()).unwrap_or(&0);
+                            if s == 1 {
+                                anyhow::bail!(
+                                    "cycle detected in group hierarchy involving '{}'",
+                                    m
+                                );
+                            } else if s == 0 {
+                                dfs(m.as_str(), group_map, group_names, state)?;
                             }
                         }
                     }
+                }
+                state.insert(current, 2);
+                Ok(())
+            }
+
+            for group in &self.groups {
+                if *state.get(group.name.as_str()).unwrap_or(&0) == 0 {
+                    dfs(group.name.as_str(), &group_map, &group_names, &mut state)?;
                 }
             }
         }
@@ -524,10 +583,7 @@ impl Config {
             };
             if let Some(r) = route {
                 if !group_names.contains(r.as_str()) && !backend_names.contains(r.as_str()) {
-                    anyhow::bail!(
-                        "inbound route '{}' refers to unknown group or backend",
-                        r
-                    );
+                    anyhow::bail!("inbound route '{}' refers to unknown group or backend", r);
                 }
             }
         }
@@ -605,7 +661,7 @@ mod tests {
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
-            adblock: AdBlockConfig::default(),
+            filter: FilterConfig::default(),
             advanced: AdvancedConfig::default(),
         };
         assert!(cfg.validate().is_ok());
@@ -645,7 +701,7 @@ mod tests {
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
-            adblock: AdBlockConfig::default(),
+            filter: FilterConfig::default(),
             advanced: AdvancedConfig::default(),
         };
         let err = cfg.validate().unwrap_err();
@@ -704,7 +760,7 @@ mod tests {
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
-            adblock: AdBlockConfig::default(),
+            filter: FilterConfig::default(),
             advanced: AdvancedConfig::default(),
         };
         assert!(cfg.validate().is_ok());
@@ -713,9 +769,6 @@ mod tests {
     #[test]
     fn test_multiple_inbounds_parsing_and_resolution() {
         let yaml = r#"
-inbound:
-  filter:
-    enabled: false
 inbounds:
   - type: socks5
     listen: "127.0.0.1:1080"
@@ -737,7 +790,7 @@ backends:
         match &resolved[0] {
             InboundItemConfig::Socks5 { listen, filter, .. } => {
                 assert_eq!(listen, "127.0.0.1:1080");
-                assert_eq!(filter.as_ref().unwrap().enabled, false);
+                assert!(filter.is_none());
             }
             _ => panic!("Expected Socks5 inbound"),
         }
@@ -753,7 +806,7 @@ backends:
                 assert_eq!(listen, "127.0.0.1:8388");
                 assert_eq!(password, "password123");
                 assert_eq!(method, "aes-256-gcm");
-                assert_eq!(filter.as_ref().unwrap().enabled, false);
+                assert!(filter.is_none());
             }
             _ => panic!("Expected Shadowsocks inbound"),
         }
@@ -761,7 +814,7 @@ backends:
         match &resolved[2] {
             InboundItemConfig::Http { listen, filter, .. } => {
                 assert_eq!(listen, "127.0.0.1:8080");
-                assert_eq!(filter.as_ref().unwrap().enabled, false);
+                assert!(filter.is_none());
             }
             _ => panic!("Expected HTTP inbound"),
         }

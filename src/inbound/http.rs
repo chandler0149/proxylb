@@ -19,7 +19,7 @@ pub async fn run_http_inbound(
     listen_addr: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_cfg: Option<crate::config::TlsServerConfig>,
     username: Option<String>,
     password: Option<String>,
@@ -38,19 +38,20 @@ pub async fn run_http_inbound(
     let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, "HTTP inbound listener started");
 
-    crate::inbound::run_accept_loop(listener, cancel, "HTTP", move |stream, addr| {
+    crate::inbound::run_accept_loop(listener, cancel, "HTTP", move |stream, client_id| {
         let pool = pool.clone();
         let stats = Arc::clone(&stats);
         let tls_acceptor = tls_acceptor.clone();
         let username = username.clone();
         let password = password.clone();
+        let local_filter_manager = local_filter_manager.clone();
         async move {
             if let Err(e) = handle_http_connection(
                 stream,
-                addr.clone(),
+                client_id.clone(),
                 pool,
                 stats,
-                filter_enabled,
+                local_filter_manager.clone(),
                 tls_acceptor.as_deref().cloned(),
                 username,
                 password,
@@ -58,7 +59,7 @@ pub async fn run_http_inbound(
             )
             .await
             {
-                tracing::debug!(client = %addr, error = %e, "HTTP connection failed");
+                tracing::debug!(client = %client_id, error = %e, "HTTP connection failed");
             }
         }
     })
@@ -68,10 +69,10 @@ pub async fn run_http_inbound(
 /// Handle a single HTTP connection.
 async fn handle_http_connection<S>(
     stream: S,
-    client_addr: String,
+    client_id: crate::stats::ClientId,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     username: Option<Arc<String>>,
     password: Option<Arc<String>>,
@@ -91,7 +92,7 @@ where
     let (buf, pos) = match read_headers(&mut client_stream).await {
         Ok(res) => res,
         Err(e) => {
-            tracing::debug!(client = %client_addr, error = %e, "failed to read HTTP headers");
+            tracing::debug!(client = %client_id, error = %e, "failed to read HTTP headers");
             return Ok(());
         }
     };
@@ -100,7 +101,7 @@ where
     let (method, target, headers) = match parse_http_request_with_headers(&buf[..pos]) {
         Some(res) => res,
         None => {
-            tracing::debug!(client = %client_addr, "invalid HTTP proxy request or unsupported headers");
+            tracing::debug!(client = %client_id, "invalid HTTP proxy request or unsupported headers");
             let _ = client_stream
                 .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
                 .await;
@@ -127,30 +128,29 @@ where
         }
 
         if !auth_ok {
-            tracing::debug!(client = %client_addr, "HTTP Proxy Authentication failed");
+            tracing::debug!(client = %client_id, "HTTP Proxy Authentication failed");
             let _ = client_stream.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"ProxyLB\"\r\nConnection: close\r\n\r\n").await;
             return Ok(());
         }
     }
 
-    let is_private = crate::inbound::is_private_target(&target).await;
-    if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
-        tracing::warn!(target = %target, "HTTP connection rejected: private target");
-        let _ = client_stream.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nPrivate address targets are rejected.\r\n").await;
-        return Ok(());
-    }
+    let is_blocked = if let Some(ref m) = local_filter_manager {
+        m.is_blocked(&target)
+    } else {
+        pool.filter_manager.is_blocked(&target)
+    };
 
-    if pool.adblock_manager.is_blocked(&target) {
-        tracing::warn!(target = %target, "HTTP connection blocked by adblock");
+    if is_blocked {
+        tracing::debug!(target = %target, "HTTP connection blocked by filter");
         let _ = client_stream
             .write_all(
-                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nBlocked by AdBlock rules.\r\n",
+                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nBlocked by Filter rules.\r\n",
             )
             .await;
         return Ok(());
     }
 
-    tracing::debug!(client = %client_addr, method = %method, target = %target, "HTTP CONNECT request" );
+    tracing::debug!(client = %client_id, method = %method, target = %target, "HTTP CONNECT request" );
 
     // Try backends in order with fallback.
     let (mut backend_stream, chosen_traffic) =
@@ -158,7 +158,7 @@ where
             Ok((s, t)) => (s, t),
             Err(e) => {
                 tracing::warn!(
-                    client = %client_addr,
+                    client = %client_id,
                     target = %target,
                     error = %e,
                     "all backends failed"
@@ -185,8 +185,10 @@ where
         backend_stream,
         chosen_traffic,
         Some(stats),
+        client_id,
         &target,
         "HTTP",
+        &pool,
     )
     .await
 }

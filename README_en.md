@@ -26,7 +26,7 @@ High-performance proxy load balancer written in Rust. Supports SOCKS5, Shadowsoc
 ### Operations
 - **Zero-Downtime Reload:** Send `SIGHUP` to reload configurations without dropping active sessions.
 - **Network Awareness:** Automatically reprobes when link or gateway changes are detected.
-- **Web Dashboard & API:** Real-time metrics for traffic, backend latency, and active connections.
+- **Web Dashboard & API:** Real-time metrics for traffic, backend latency, and active connections. See [REST API Documentation](./restapi.md).
 - **Built-in AdBlock:** Periodically fetches and updates AdGuard/Hosts blocklists.
 
 ---

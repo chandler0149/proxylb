@@ -15,7 +15,7 @@ use shadowsocks::relay::tcprelay::proxy_stream::client::ProxyClientStream;
 use super::{BackendStream, TargetAddr};
 
 /// Convert our [`TargetAddr`] to the shadowsocks [`SsAddress`] type.
-fn to_ss_address(target: &TargetAddr) -> SsAddress {
+pub fn to_ss_address(target: &TargetAddr) -> SsAddress {
     match target {
         TargetAddr::Domain(host, port) => SsAddress::DomainNameAddress(host.clone(), *port),
         TargetAddr::Ip(addr) => SsAddress::SocketAddress(*addr),
@@ -38,16 +38,16 @@ pub async fn ss_connect_fresh(
 
 /// Wrap an **already-established** raw stream (from the connection pool)
 /// with the Shadowsocks AEAD layer for `target`.
-pub fn ss_connect_pooled<S>(
-    raw: S,
+pub fn ss_connect_pooled(
+    raw: BackendStream,
     svr_cfg: &Arc<SsServerConfig>,
     ctx: SharedContext,
     target: &TargetAddr,
-) -> BackendStream
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
+) -> BackendStream {
+    let base_latency = raw.base_latency;
     let ss_addr = to_ss_address(target);
     let client_stream = ProxyClientStream::from_stream(ctx, raw, svr_cfg.as_ref(), ss_addr);
-    BackendStream::boxed(Box::pin(client_stream))
+    let mut stream = BackendStream::boxed(Box::pin(client_stream));
+    stream.base_latency = base_latency;
+    stream
 }

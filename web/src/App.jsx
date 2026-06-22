@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { LineChart, Line, ResponsiveContainer, YAxis, Tooltip } from 'recharts';
 import './App.css';
 
 function App() {
@@ -8,7 +9,23 @@ function App() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState('all'); // 'all', 'groups', 'backends'
+  const [activeTab, setActiveTab] = useState('all'); // 'all', 'groups', 'backends', 'filter'
+
+  const [filterRules, setFilterRules] = useState([]);
+  const [filterUrls, setFilterUrls] = useState([]);
+  const [newRule, setNewRule] = useState('');
+  const [newUrl, setNewUrl] = useState('');
+  const [newUrlTag, setNewUrlTag] = useState('');
+  const [isAddingRule, setIsAddingRule] = useState(false);
+  const [isAddingUrl, setIsAddingUrl] = useState(false);
+  const [checkTarget, setCheckTarget] = useState('');
+  const [checkResult, setCheckResult] = useState(null); // { blocked: bool } or null or 'loading'
+
+  const previousInboundsRef = useRef({});
+  const previousBackendsRef = useRef({});
+  const lastFetchTimeRef = useRef(Date.now());
+  const [inboundSpeeds, setInboundSpeeds] = useState({});
+  const [backendSpeeds, setBackendSpeeds] = useState({});
 
   // Sync API host to localStorage
   const handleApiHostChange = (e) => {
@@ -26,6 +43,75 @@ function App() {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
       const json = await response.json();
+      
+      const now = Date.now();
+      const timeDiffSec = (now - lastFetchTimeRef.current) / 1000;
+      
+      if (json.inbounds && timeDiffSec > 0) {
+        setInboundSpeeds(prevSpeeds => {
+          const nextSpeeds = { ...prevSpeeds };
+          const timeLabel = new Date(now).toLocaleTimeString([], { hour12: false, minute: '2-digit', second: '2-digit' });
+          json.inbounds.forEach(inbound => {
+            const prev = previousInboundsRef.current[inbound.listen];
+            let txSpeed = 0;
+            let rxSpeed = 0;
+            if (prev) {
+              const txDiff = Math.max(0, inbound.tx_bytes - prev.tx_bytes);
+              const rxDiff = Math.max(0, inbound.rx_bytes - prev.rx_bytes);
+              txSpeed = Number((txDiff / timeDiffSec).toFixed(2));
+              rxSpeed = Number((rxDiff / timeDiffSec).toFixed(2));
+            }
+            
+            if (!nextSpeeds[inbound.listen]) {
+              nextSpeeds[inbound.listen] = Array(10).fill({ time: '', tx_speed: 0, rx_speed: 0 });
+            }
+            const history = [...nextSpeeds[inbound.listen]];
+            history.shift(); // remove oldest
+            history.push({ time: timeLabel, tx_speed: txSpeed, rx_speed: rxSpeed });
+            nextSpeeds[inbound.listen] = history;
+            
+            previousInboundsRef.current[inbound.listen] = {
+              tx_bytes: inbound.tx_bytes,
+              rx_bytes: inbound.rx_bytes
+            };
+          });
+          return nextSpeeds;
+        });
+      }
+
+      if (json.backends && timeDiffSec > 0) {
+        setBackendSpeeds(prevSpeeds => {
+          const nextSpeeds = { ...prevSpeeds };
+          const timeLabel = new Date(now).toLocaleTimeString([], { hour12: false, minute: '2-digit', second: '2-digit' });
+          json.backends.forEach(b => {
+            const prev = previousBackendsRef.current[b.name];
+            let txSpeed = 0;
+            let rxSpeed = 0;
+            if (prev) {
+              const txDiff = Math.max(0, b.bytes_up - prev.bytes_up);
+              const rxDiff = Math.max(0, b.bytes_down - prev.bytes_down);
+              txSpeed = Number((txDiff / timeDiffSec).toFixed(2));
+              rxSpeed = Number((rxDiff / timeDiffSec).toFixed(2));
+            }
+            
+            if (!nextSpeeds[b.name]) {
+              nextSpeeds[b.name] = Array(10).fill({ time: '', tx_speed: 0, rx_speed: 0 });
+            }
+            const history = [...nextSpeeds[b.name]];
+            history.shift();
+            history.push({ time: timeLabel, tx_speed: txSpeed, rx_speed: rxSpeed });
+            nextSpeeds[b.name] = history;
+            
+            previousBackendsRef.current[b.name] = {
+              bytes_up: b.bytes_up,
+              bytes_down: b.bytes_down
+            };
+          });
+          return nextSpeeds;
+        });
+      }
+      lastFetchTimeRef.current = now;
+      
       setData(json);
       setError(null);
     } catch (err) {
@@ -36,10 +122,10 @@ function App() {
     }
   };
 
-  // Poll API every 5 seconds
+  // Poll API every 1 second
   useEffect(() => {
     fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
+    const interval = setInterval(fetchStatus, 1000);
     return () => clearInterval(interval);
   }, [apiHost]);
 
@@ -57,17 +143,132 @@ function App() {
       // Re-fetch status immediately
       fetchStatus();
     } catch (err) {
-      alert(`Error toggling backend: ${err.message}`);
+    }
+  };
+
+  const fetchFilterData = async () => {
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      const res = await fetch(`${host}/api/filter/items`);
+      if (res.ok) {
+        const data = await res.json();
+        setFilterRules(data.rules || []);
+        setFilterUrls(data.urls || []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch filter data', err);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'filter') {
+      fetchFilterData();
+    }
+  }, [activeTab]);
+
+  const handleAddRule = async () => {
+    if (!newRule.trim()) return;
+    const rulesArray = newRule.split('\n').map(r => r.trim()).filter(r => r);
+    if (rulesArray.length === 0) return;
+
+    setIsAddingRule(true);
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      await fetch(`${host}/api/filter/items`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'rule', rules: rulesArray })
+      });
+      setNewRule('');
+      fetchFilterData();
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+    finally { setIsAddingRule(false); }
+  };
+
+  const handleDeleteRule = async (rule) => {
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      await fetch(`${host}/api/filter/items`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'rule', rules: [rule] })
+      });
+      fetchFilterData();
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+  };
+
+  const handleAddUrl = async () => {
+    if (!newUrl.trim()) return;
+    setIsAddingUrl(true);
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      const res = await fetch(`${host}/api/filter/items`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'url', url: newUrl.trim(), tag: newUrlTag.trim() })
+      });
+      if (!res.ok) throw new Error('Failed to add list (maybe invalid or unreachable)');
+      setNewUrl('');
+      setNewUrlTag('');
+      fetchFilterData();
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+    finally { setIsAddingUrl(false); }
+  };
+
+  const handleDeleteUrl = async (urlObj) => {
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      await fetch(`${host}/api/filter/items`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'url', url: urlObj.url })
+      });
+      fetchFilterData();
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+  };
+
+  const handleToggleFilter = async () => {
+    if (!data?.adblock) return;
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      await fetch(`${host}/api/filter/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: !data.adblock.enabled,
+          block_private_addresses: false
+        })
+      });
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+  };
+
+  const handleCheckTarget = async () => {
+    if (!checkTarget.trim()) return;
+    setCheckResult('loading');
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      const res = await fetch(`${host}/api/filter/check?target=${encodeURIComponent(checkTarget.trim())}`);
+      if (!res.ok) throw new Error('Check failed');
+      const data = await res.json();
+      setCheckResult({ blocked: data.blocked });
+    } catch (err) {
+      alert(err.message);
+      setCheckResult(null);
     }
   };
 
   // Utility to format bytes
   const formatBytes = (n) => {
-    if (n === 0 || !n) return '0 B';
+    if (!n || n <= 0) return '0.00 B';
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.min(Math.floor(Math.log2(n) / 10), units.length - 1);
+    const i = Math.max(0, Math.min(Math.floor(Math.log2(n) / 10), units.length - 1));
     const val = n / Math.pow(1024, i);
-    return (i === 0 ? val : val.toFixed(2)) + ' ' + units[i];
+    return val.toFixed(2) + ' ' + units[i];
   };
 
   // Utility to format time
@@ -157,24 +358,39 @@ function App() {
         <div className="metrics">
           <div className="metric">
             <span className="metric-label">Latency</span>
-            <span className="metric-value">{b.last_latency_ms != null ? `${b.last_latency_ms} ms` : '—'}</span>
+            <span className="metric-value">
+              {b.last_latency_ms != null ? `${b.last_latency_ms} ms` : '—'}
+              {b.handshake_latency_ms != null ? ` (HS: ${b.handshake_latency_ms} ms)` : ''}
+            </span>
           </div>
           <div className="metric">
             <span className="metric-label">Failures</span>
             <span className="metric-value" style={{ color: b.consecutive_failures > 0 ? 'var(--accent-red)' : 'var(--accent-green)' }}>
               {b.consecutive_failures}
             </span>
+            <button
+              className={`tab-btn ${activeTab === 'clients' ? 'active' : ''}`}
+              onClick={() => setActiveTab('clients')}
+            >
+              Client IPs
+            </button>
           </div>
         </div>
 
         <div className="traffic-row">
           <div className="traffic-item">
             <span className="traffic-label">Upload</span>
-            <span className="traffic-value upload">{formatBytes(b.bytes_up)}</span>
+            <span className="traffic-value upload" style={{ display: 'flex', flexDirection: 'column' }}>
+              {formatBytes(b.bytes_up)}
+              <span style={{ fontSize: '0.75rem', opacity: 0.8 }}>↑ {formatBytes(backendSpeeds[b.name]?.[9]?.tx_speed || 0)}/s</span>
+            </span>
           </div>
           <div className="traffic-item">
             <span className="traffic-label">Download</span>
-            <span className="traffic-value download">{formatBytes(b.bytes_down)}</span>
+            <span className="traffic-value download" style={{ display: 'flex', flexDirection: 'column' }}>
+              {formatBytes(b.bytes_down)}
+              <span style={{ fontSize: '0.75rem', opacity: 0.8 }}>↓ {formatBytes(backendSpeeds[b.name]?.[9]?.rx_speed || 0)}/s</span>
+            </span>
           </div>
           <div className="traffic-item">
             <span className="traffic-label">Active</span>
@@ -184,6 +400,21 @@ function App() {
             <span className="traffic-label">Total Conn</span>
             <span className="traffic-value">{b.total_connections}</span>
           </div>
+        </div>
+
+        <div style={{ height: '60px', marginTop: '10px' }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={backendSpeeds[b.name] || Array(10).fill({ tx_speed: 0, rx_speed: 0 })}>
+              <Line type="monotone" dataKey="tx_speed" stroke="#ffa726" strokeWidth={2} dot={false} isAnimationActive={false} />
+              <Line type="monotone" dataKey="rx_speed" stroke="var(--accent-green)" strokeWidth={2} dot={false} isAnimationActive={false} />
+              <YAxis hide domain={['auto', 'auto']} />
+              <Tooltip
+                contentStyle={{ backgroundColor: 'rgba(0,0,0,0.8)', border: 'none', borderRadius: '4px', fontSize: '0.75rem', color: '#fff' }}
+                formatter={(value) => `${formatBytes(value)}/s`}
+                labelFormatter={() => ''}
+              />
+            </LineChart>
+          </ResponsiveContainer>
         </div>
 
         <div className="pool-row">
@@ -214,7 +445,7 @@ function App() {
                 <tr>
                   <th>Time</th>
                   <th>Status</th>
-                  <th>Latency</th>
+                  <th>Latency (HS)</th>
                   <th>Error</th>
                 </tr>
               </thead>
@@ -225,7 +456,10 @@ function App() {
                     <td className={h.success ? 'history-success' : 'history-fail'}>
                       {h.success ? '✓ OK' : '✗ FAIL'}
                     </td>
-                    <td>{h.latency_ms != null ? `${h.latency_ms} ms` : '—'}</td>
+                    <td>
+                      {h.latency_ms != null ? `${h.latency_ms} ms` : '—'}
+                      {h.handshake_latency_ms != null ? ` (${h.handshake_latency_ms} ms)` : ''}
+                    </td>
                     <td className="error-text" title={h.error || ''}>
                       {h.error || '—'}
                     </td>
@@ -239,6 +473,16 @@ function App() {
     );
   };
 
+  // Calculate total data usage recursively for a node
+  const getUsage = (node) => {
+    if (node.type === 'backend') {
+       return (node.status.bytes_up || 0) + (node.status.bytes_down || 0);
+    } else if (node.type === 'group') {
+       return (node.members || []).reduce((acc, m) => acc + getUsage(m), 0);
+    }
+    return 0;
+  };
+
   // Helper to render tree/routing nodes
   const renderTreeItem = (item, index) => {
     if (item.type === 'backend') {
@@ -248,25 +492,21 @@ function App() {
         </div>
       );
     } else if (item.type === 'group') {
-      // 3. Backend stats in group sorted by data usage (bytes_up + bytes_down) descending
-      const sortedGroupBackends = [...(item.backends || [])].sort((a, b) => {
-        const usageA = (a.bytes_up || 0) + (a.bytes_down || 0);
-        const usageB = (b.bytes_up || 0) + (b.bytes_down || 0);
-        return usageB - usageA;
-      });
+      // Sort members by data usage descending
+      const sortedMembers = [...(item.members || [])].sort((a, b) => getUsage(b) - getUsage(a));
 
       return (
         <div key={`tree-${item.name}-${index}`} className="tree-node-wrapper">
-          <div className="tree-group-card">
-            <div className="tree-group-header">
-              <div className="tree-group-title">
+          <div className="card group-card">
+            <div className="card-header" style={{ alignItems: 'center' }}>
+              <div className="card-name" style={{ fontSize: '1.15rem' }}>
                 <span>📂 Group: {item.name}</span>
               </div>
-              <span className="tree-group-strategy">{item.strategy}</span>
+              <span className="card-group-tag" style={{ background: 'rgba(0, 176, 255, 0.1)', color: 'var(--accent-blue)', border: '1px solid rgba(0, 176, 255, 0.2)', padding: '3px 10px', borderRadius: '12px', fontSize: '0.8rem', textTransform: 'uppercase', fontWeight: 600 }}>{item.strategy}</span>
             </div>
-            <div className="tree-group-children">
-              {sortedGroupBackends.map((b) => renderBackendCard(b))}
-            </div>
+          </div>
+          <div className="tree-group-children">
+            {sortedMembers.map((m, i) => renderTreeItem(m, i))}
           </div>
         </div>
       );
@@ -380,7 +620,7 @@ function App() {
         {/* AdBlock Guard */}
         <div className={`summary-card ${data?.adblock?.enabled ? 'adblock-enabled' : 'adblock-disabled'}`}>
           <div className="summary-card-header">
-            <span className="summary-card-title">AdBlock Guard</span>
+            <span className="summary-card-title">Filter Engine</span>
             <div className="beacon-container">
               <span className="summary-card-subtext">
                 {data?.adblock?.enabled ? 'Active' : 'Disabled'}
@@ -430,12 +670,32 @@ function App() {
                     </div>
                     <div className="inbound-stat-item" style={{ borderTop: '1px solid rgba(255,255,255,0.03)', paddingTop: '8px' }}>
                       <span className="inbound-stat-label">Uploaded</span>
-                      <span className="inbound-stat-value" style={{ color: '#ffa726' }}>{formatBytes(inbound.tx_bytes)}</span>
+                      <span className="inbound-stat-value" style={{ color: '#ffa726', display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                        {formatBytes(inbound.tx_bytes)}
+                        <span style={{ fontSize: '0.75rem', opacity: 0.8 }}>↑ {formatBytes(inboundSpeeds[inbound.listen]?.[9]?.tx_speed || 0)}/s</span>
+                      </span>
                     </div>
                     <div className="inbound-stat-item" style={{ borderTop: '1px solid rgba(255,255,255,0.03)', paddingTop: '8px' }}>
                       <span className="inbound-stat-label">Downloaded</span>
-                      <span className="inbound-stat-value" style={{ color: 'var(--accent-green)' }}>{formatBytes(inbound.rx_bytes)}</span>
+                      <span className="inbound-stat-value" style={{ color: 'var(--accent-green)', display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                        {formatBytes(inbound.rx_bytes)}
+                        <span style={{ fontSize: '0.75rem', opacity: 0.8 }}>↓ {formatBytes(inboundSpeeds[inbound.listen]?.[9]?.rx_speed || 0)}/s</span>
+                      </span>
                     </div>
+                  </div>
+                  <div style={{ height: '60px', marginTop: '10px' }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={inboundSpeeds[inbound.listen] || Array(10).fill({ tx_speed: 0, rx_speed: 0 })}>
+                        <Line type="monotone" dataKey="tx_speed" stroke="#ffa726" strokeWidth={2} dot={false} isAnimationActive={false} />
+                        <Line type="monotone" dataKey="rx_speed" stroke="var(--accent-green)" strokeWidth={2} dot={false} isAnimationActive={false} />
+                        <YAxis hide domain={['auto', 'auto']} />
+                        <Tooltip
+                          contentStyle={{ backgroundColor: 'rgba(0,0,0,0.8)', border: 'none', borderRadius: '4px', fontSize: '0.75rem', color: '#fff' }}
+                          formatter={(value) => `${formatBytes(value)}/s`}
+                          labelFormatter={() => ''}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
                   </div>
                 </div>
               );
@@ -467,6 +727,24 @@ function App() {
             >
               Standalone Backends
             </button>
+            <button
+              className={`tab-btn ${activeTab === 'filter' ? 'active' : ''}`}
+              onClick={() => setActiveTab('filter')}
+            >
+              Filter Engine
+            </button>
+            <button
+              className={`tab-btn ${activeTab === 'clients' ? 'active' : ''}`}
+              onClick={() => setActiveTab('clients')}
+            >
+              Clients (IP Stats)
+            </button>
+            <button
+              className={`tab-btn ${activeTab === 'domains' ? 'active' : ''}`}
+              onClick={() => setActiveTab('domains')}
+            >
+              Top Domains
+            </button>
           </div>
         </div>
 
@@ -485,28 +763,7 @@ function App() {
             {data?.tree && data.tree.filter(item => item.type === 'group').length > 0 ? (
               data.tree
                 .filter(item => item.type === 'group')
-                .map((item, idx) => {
-                  // Sort backends inside the group by data usage descending
-                  const sortedGroupBackends = [...(item.backends || [])].sort((a, b) => {
-                    const usageA = (a.bytes_up || 0) + (a.bytes_down || 0);
-                    const usageB = (b.bytes_up || 0) + (b.bytes_down || 0);
-                    return usageB - usageA;
-                  });
-
-                  return (
-                    <div key={`group-${item.name}-${idx}`} className="tree-group-card" style={{ borderLeft: '3px solid var(--accent-blue)' }}>
-                      <div className="tree-group-header">
-                        <div className="tree-group-title">
-                          <span>📂 Group: {item.name}</span>
-                        </div>
-                        <span className="tree-group-strategy">{item.strategy}</span>
-                      </div>
-                      <div className="tree-group-children">
-                        {sortedGroupBackends.map((b) => renderBackendCard(b))}
-                      </div>
-                    </div>
-                  );
-                })
+                .map((item, idx) => renderTreeItem(item, idx))
             ) : (
               <div className="empty-state">No backend groups configured</div>
             )}
@@ -522,6 +779,221 @@ function App() {
             ) : (
               <div className="empty-state">No standalone backends configured</div>
             )}
+          </div>
+        )}
+
+        {activeTab === 'clients' && (
+          <div className="filter-panel" style={{ background: 'var(--card-bg)', borderRadius: '16px', padding: '1.5rem', border: '1px solid var(--border-color)' }}>
+            <h3 style={{ margin: '0 0 1.5rem 0', color: 'var(--text-primary)' }}>Client Traffic Statistics</h3>
+            {data?.clients && data.clients.length > 0 ? (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="history-table" style={{ width: '100%', textAlign: 'left' }}>
+                  <thead>
+                    <tr>
+                      <th>IP Address</th>
+                      <th>Total Conn</th>
+                      <th>Upload</th>
+                      <th>Download</th>
+                      <th>Total Bandwidth</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.clients.map((c, idx) => {
+                      const totalBandwidth = (c.tx_bytes || 0) + (c.rx_bytes || 0);
+                      return (
+                        <tr key={idx}>
+                          <td style={{ fontWeight: 'bold', fontFamily: 'monospace' }}>{c.ip}</td>
+                          <td>{c.total_connections}</td>
+                          <td style={{ color: '#ffa726' }}>{formatBytes(c.tx_bytes)}</td>
+                          <td style={{ color: 'var(--accent-green)' }}>{formatBytes(c.rx_bytes)}</td>
+                          <td style={{ fontWeight: 'bold' }}>{formatBytes(totalBandwidth)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state">No client statistics available</div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'domains' && (
+          <div className="filter-panel" style={{ background: 'var(--card-bg)', borderRadius: '16px', padding: '1.5rem', border: '1px solid var(--border-color)' }}>
+            <h3 style={{ margin: '0 0 1.5rem 0', color: 'var(--text-primary)' }}>Top Parent Domains</h3>
+            {data?.domains && data.domains.length > 0 ? (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="history-table" style={{ width: '100%', textAlign: 'left' }}>
+                  <thead>
+                    <tr>
+                      <th>Domain</th>
+                      <th>Total Conn</th>
+                      <th>Upload</th>
+                      <th>Download</th>
+                      <th>Total Bandwidth</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.domains.map((d, idx) => {
+                      const totalBandwidth = (d.tx_bytes || 0) + (d.rx_bytes || 0);
+                      return (
+                        <tr key={idx}>
+                          <td style={{ fontWeight: 'bold' }}>{d.domain}</td>
+                          <td>{d.total_connections}</td>
+                          <td style={{ color: '#ffa726' }}>{formatBytes(d.tx_bytes)}</td>
+                          <td style={{ color: 'var(--accent-green)' }}>{formatBytes(d.rx_bytes)}</td>
+                          <td style={{ fontWeight: 'bold' }}>{formatBytes(totalBandwidth)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state">No domain statistics available</div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'filter' && (
+          <div className="filter-panel" style={{ background: 'var(--card-bg)', borderRadius: '16px', padding: '1.5rem', border: '1px solid var(--border-color)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+              <h3 style={{ margin: 0, color: 'var(--text-primary)' }}>Filter Configuration</h3>
+              <label className="toggle-switch" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Global Filter</span>
+                <div style={{ position: 'relative' }}>
+                  <input
+                    type="checkbox"
+                    checked={data?.adblock?.enabled || false}
+                    onChange={handleToggleFilter}
+                  />
+                  <span className="slider"></span>
+                </div>
+              </label>
+            </div>
+
+            <div style={{ marginBottom: '2rem' }}>
+              <h4>Top Blocked Domains</h4>
+              {data?.blocked_domains && data.blocked_domains.length > 0 ? (
+                <div style={{ overflowX: 'auto' }}>
+                  <table className="history-table" style={{ width: '100%', textAlign: 'left' }}>
+                    <thead>
+                      <tr>
+                        <th>Domain</th>
+                        <th>Times Blocked</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.blocked_domains.map((d, idx) => (
+                        <tr key={idx}>
+                          <td style={{ fontWeight: 'bold', color: 'var(--text-primary)' }}>{d.domain}</td>
+                          <td style={{ color: '#e57373', fontWeight: 'bold' }}>{d.total_connections}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>No domains blocked yet.</div>
+              )}
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem' }}>
+              {/* Rules List */}
+              <div className="filter-list-section">
+                <h4>Dynamic Rules ({filterRules.length})</h4>
+                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', alignItems: 'flex-start' }}>
+                  <textarea 
+                    value={newRule}
+                    onChange={e => setNewRule(e.target.value)}
+                    placeholder="e.g. ad.example.com (one per line)"
+                    rows={3}
+                    style={{ flex: 1, padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)', resize: 'vertical' }}
+                  />
+                  <button onClick={handleAddRule} disabled={isAddingRule} className="tab-btn active" style={{ padding: '0.5rem 1rem', opacity: isAddingRule ? 0.7 : 1, whiteSpace: 'nowrap' }}>
+                    {isAddingRule ? 'Rebuilding...' : 'Add Rules'}
+                  </button>
+                </div>
+                <div style={{ maxHeight: '300px', overflowY: 'auto', background: 'rgba(0,0,0,0.2)', borderRadius: '8px', padding: '0.5rem' }}>
+                  {filterRules.map(rule => (
+                    <div key={rule} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.5rem', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                      <span>{rule}</span>
+                      <button onClick={() => handleDeleteRule(rule)} style={{ background: 'transparent', border: 'none', color: 'var(--accent-red)', cursor: 'pointer' }}>✕</button>
+                    </div>
+                  ))}
+                  {filterRules.length === 0 && <div style={{ color: 'var(--text-secondary)', padding: '1rem', textAlign: 'center' }}>No dynamic rules</div>}
+                </div>
+              </div>
+
+              {/* URLs List */}
+              <div className="filter-list-section">
+                <h4>Remote Lists ({filterUrls.length})</h4>
+                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', flexDirection: 'column' }}>
+                  <input 
+                    type="text" 
+                    value={newUrlTag}
+                    onChange={e => setNewUrlTag(e.target.value)}
+                    placeholder="Tag / Name (optional)"
+                    style={{ width: '100%', padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}
+                  />
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <input 
+                      type="text" 
+                      value={newUrl}
+                      onChange={e => setNewUrl(e.target.value)}
+                      placeholder="e.g. https://example.com/rules.txt"
+                      style={{ flex: 1, padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}
+                    />
+                    <button onClick={handleAddUrl} disabled={isAddingUrl} className="tab-btn active" style={{ padding: '0.5rem 1rem', opacity: isAddingUrl ? 0.7 : 1 }}>
+                      {isAddingUrl ? 'Fetching...' : 'Add'}
+                    </button>
+                  </div>
+                </div>
+                <div style={{ maxHeight: '300px', overflowY: 'auto', background: 'rgba(128,128,128,0.1)', borderRadius: '8px', padding: '0.5rem' }}>
+                  {filterUrls.map(item => (
+                    <div key={item.url} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.5rem', borderBottom: '1px solid var(--border-subtle)' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', marginRight: '1rem' }}>
+                        {item.tag && <span style={{ fontWeight: 'bold', fontSize: '0.9rem', color: 'var(--text-primary)', marginBottom: '4px' }}>{item.tag} <span style={{ fontWeight: 'normal', fontSize: '0.8rem', color: 'var(--text-secondary)', marginLeft: '8px' }}>({item.rule_count?.toLocaleString() || 0} rules)</span></span>}
+                        <span style={{ wordBreak: 'break-all', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{item.url}</span>
+                      </div>
+                      <button onClick={() => handleDeleteUrl(item)} style={{ background: 'transparent', border: 'none', color: 'var(--accent-red)', cursor: 'pointer', alignSelf: 'center', padding: '0.5rem' }}>✕</button>
+                    </div>
+                  ))}
+                  {filterUrls.length === 0 && <div style={{ color: 'var(--text-secondary)', padding: '1rem', textAlign: 'center' }}>No remote lists</div>}
+                </div>
+              </div>
+            </div>
+
+            {/* Test Target Section */}
+            <div style={{ marginTop: '2rem', padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: '8px' }}>
+              <h4 style={{ margin: '0 0 1rem 0' }}>Test Block Status</h4>
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                <input 
+                  type="text" 
+                  value={checkTarget}
+                  onChange={e => { setCheckTarget(e.target.value); setCheckResult(null); }}
+                  placeholder="e.g. tracking.example.com or 192.168.1.1"
+                  style={{ flex: 1, padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}
+                />
+                <button onClick={handleCheckTarget} disabled={checkResult === 'loading'} className="tab-btn active" style={{ padding: '0.5rem 1rem' }}>
+                  {checkResult === 'loading' ? 'Checking...' : 'Check'}
+                </button>
+                {checkResult && checkResult !== 'loading' && (
+                  <span style={{ 
+                    marginLeft: '1rem', 
+                    padding: '0.25rem 0.75rem', 
+                    borderRadius: '4px',
+                    background: checkResult.blocked ? 'rgba(255, 61, 113, 0.2)' : 'rgba(0, 227, 150, 0.2)',
+                    color: checkResult.blocked ? 'var(--accent-red)' : 'var(--accent-green)',
+                    fontWeight: 'bold'
+                  }}>
+                    {checkResult.blocked ? 'BLOCKED ✕' : 'ALLOWED ✓'}
+                  </span>
+                )}
+              </div>
+            </div>
+
           </div>
         )}
       </div>

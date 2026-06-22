@@ -21,6 +21,8 @@ mtproto-server = { path = "./submodules/telemt/mtproto-server" }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 httparse = "1.10.1"
+rust-embed = "8.11.0"
+mime_guess = "2.0.5"
 
 
 # Serialization / config
@@ -58,10 +60,21 @@ core_affinity = "0.8.3"
 rustls-pemfile = "2.2.0"
 base64 = "0.22.1"
 rcgen = "0.14.8"
-socket2 = "0.6.4"
-
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+socket2 = { version = "0.6.4", features = ["all"] }
+rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
+rustc-hash = { version = "2.1.2", optional = true }
+ahash = { version = "0.8.12", optional = true }
 tikv-jemallocator = "0.7"
+dashmap = "6.2.1"
+rand = "0.10.1"
+
+[features]
+default = ["fast-hash"]
+filter = ["dep:rusqlite"]
+fast-hash = ["dep:rustc-hash"]
+ahash = ["dep:ahash"]
+
+
 
 
 
