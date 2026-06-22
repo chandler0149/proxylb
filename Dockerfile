@@ -2,7 +2,7 @@
 FROM rust:trixie AS backend-builder
 WORKDIR /usr/src/app
 COPY . .
-RUN make box
+RUN make release
 
 
 # Stage 2: Build the React frontend
