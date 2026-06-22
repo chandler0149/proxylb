@@ -250,6 +250,9 @@ pub struct BackendConfig {
     pub tls: Option<TlsClientConfig>,
     /// Whether the backend is enabled initially (default: true).
     pub enabled: Option<bool>,
+    /// If true, do not perform health check and consider healthy forever (default: false).
+    #[serde(default)]
+    pub force_healthy: bool,
 }
 
 fn default_pool_size() -> usize {
@@ -577,6 +580,7 @@ mod tests {
                     bind_interface: None,
                     tls: None,
                     enabled: None,
+                    force_healthy: false,
                 },
                 BackendConfig {
                     backend_type: "socks5".to_string(),
@@ -588,6 +592,7 @@ mod tests {
                     bind_interface: None,
                     tls: None,
                     enabled: None,
+                    force_healthy: false,
                 },
             ],
             groups: vec![GroupConfig {
@@ -621,6 +626,7 @@ mod tests {
                 bind_interface: None,
                 tls: None,
                 enabled: None,
+                force_healthy: false,
             }],
             groups: vec![
                 GroupConfig {
@@ -666,6 +672,7 @@ mod tests {
                     bind_interface: None,
                     tls: None,
                     enabled: None,
+                    force_healthy: false,
                 },
                 BackendConfig {
                     backend_type: "socks5".to_string(),
@@ -677,6 +684,7 @@ mod tests {
                     bind_interface: None,
                     tls: None,
                     enabled: None,
+                    force_healthy: false,
                 },
             ],
             groups: vec![

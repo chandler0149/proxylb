@@ -107,6 +107,7 @@ backends:
 
   - type: direct
     name: "direct-out"
+    force_healthy: true
 
   - type: ss
     address: "ss-server.example.com:8388"

@@ -87,6 +87,7 @@ pub struct BackendInfo {
     pub tls_connector: Option<TlsConnector>,
     pub server_name: Option<String>,
     pub enabled: Option<bool>,
+    pub force_healthy: bool,
 }
 
 impl std::fmt::Debug for BackendInfo {
@@ -230,6 +231,7 @@ impl BackendInfo {
             tls_connector,
             server_name,
             enabled: cfg.enabled,
+            force_healthy: cfg.force_healthy,
         })
     }
 
@@ -423,6 +425,7 @@ pub struct BackendHotPath {
     pub traffic: Arc<TrafficCounters>,
     pub status: Arc<parking_lot::Mutex<BackendStatus>>,
     pub info_name: Arc<str>,
+    pub force_healthy: bool,
 }
 
 /// Thread-safe backend pool.
@@ -746,6 +749,7 @@ impl BackendPool {
                 traffic: Arc::clone(&e.traffic),
                 status: Arc::clone(&e.status),
                 info_name: Arc::from(e.info.name.as_str()),
+                force_healthy: e.info.force_healthy,
             })
             .collect::<Vec<_>>();
         let hot_paths = Arc::new(ArcSwap::from_pointee(hot_paths));
@@ -947,6 +951,7 @@ impl BackendPool {
                 traffic: Arc::clone(&e.traffic),
                 status: Arc::clone(&e.status),
                 info_name: Arc::from(e.info.name.as_str()),
+                force_healthy: e.info.force_healthy,
             })
             .collect::<Vec<_>>();
         self.hot_paths.store(Arc::new(hot_paths_vec));
@@ -1061,6 +1066,9 @@ impl BackendPool {
     pub fn mark_unhealthy(&self, index: usize, error: &str) {
         let hot_paths = self.hot_paths.load();
         if let Some(hp) = hot_paths.get(index) {
+            if hp.force_healthy {
+                return;
+            }
             let mut status = hp.status.lock();
             let was_healthy = status.healthy;
             status.healthy = false;
@@ -1442,6 +1450,7 @@ mod tests {
             bind_interface: None,
             tls: None,
             enabled: None,
+            force_healthy: false,
         }
     }
 
@@ -1504,7 +1513,7 @@ mod tests {
         assert_eq!(healthy[2].1.name, "b3");
 
         // Explicitly mark b3 unhealthy to test both passes.
-        pool.mark_unhealthy(2, "connection error").await;
+        pool.mark_unhealthy(2, "connection error");
         pool.recalculate_candidates().await;
 
         let (healthy, unhealthy) = pool.get_candidates().await;
@@ -1515,8 +1524,8 @@ mod tests {
         // 2. Mark b1 healthy with 50ms latency, and b2 healthy with 20ms latency.
         // Since group-urltest contains [b1, b2], and is urltest strategy,
         // it should select b2 first (20ms) then b1 (50ms).
-        pool.mark_healthy(0, Duration::from_millis(50)).await;
-        pool.mark_healthy(1, Duration::from_millis(20)).await;
+        pool.mark_healthy(0, Duration::from_millis(50));
+        pool.mark_healthy(1, Duration::from_millis(20));
         pool.recalculate_candidates().await;
 
         let (healthy, unhealthy) = pool.get_candidates().await;
@@ -1545,8 +1554,8 @@ mod tests {
         )
         .unwrap();
 
-        pool_fo.mark_healthy(0, Duration::from_millis(10)).await; // b1: 10ms
-        pool_fo.mark_healthy(1, Duration::from_millis(100)).await; // b2: 100ms
+        pool_fo.mark_healthy(0, Duration::from_millis(10)); // b1: 10ms
+        pool_fo.mark_healthy(1, Duration::from_millis(100)); // b2: 100ms
         pool_fo.recalculate_candidates().await;
 
         // Since strategy is failover, it should keep configured order [b2, b1] regardless of latency!
@@ -1732,6 +1741,7 @@ mod tests {
             bind_interface: None,
             tls: None,
             enabled: None,
+            force_healthy: false,
         };
 
         let (added, removed, kept) = pool.reload(&[b1_updated], &[], None, None).await.unwrap();
@@ -1830,6 +1840,7 @@ mod tests {
             bind_interface: None,
             tls: None,
             enabled: None,
+            force_healthy: false,
         };
         let info = BackendInfo::from_config(&cfg_s5, 0, None).unwrap();
         match &info.endpoint {
@@ -1848,6 +1859,7 @@ mod tests {
             bind_interface: None,
             tls: None,
             enabled: None,
+            force_healthy: false,
         };
         let info = BackendInfo::from_config(&cfg_ss, 0, None).unwrap();
         match &info.endpoint {
@@ -1866,6 +1878,7 @@ mod tests {
             bind_interface: None,
             tls: None,
             enabled: None,
+            force_healthy: false,
         };
         let info = BackendInfo::from_config(&cfg_legacy, 0, None).unwrap();
         match &info.endpoint {
@@ -1884,6 +1897,7 @@ mod tests {
             bind_interface: None,
             tls: None,
             enabled: None,
+            force_healthy: false,
         };
         let info = BackendInfo::from_config(&cfg_tcp, 0, None).unwrap();
         match &info.endpoint {
