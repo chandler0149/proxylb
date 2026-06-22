@@ -56,7 +56,8 @@ pub fn create_router(pool: BackendPool) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .allow_private_network(true);
 
     Router::new()
         .route("/", get(api_info))
