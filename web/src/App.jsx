@@ -239,6 +239,16 @@ function App() {
     );
   };
 
+  // Calculate total data usage recursively for a node
+  const getUsage = (node) => {
+    if (node.type === 'backend') {
+       return (node.status.bytes_up || 0) + (node.status.bytes_down || 0);
+    } else if (node.type === 'group') {
+       return (node.members || []).reduce((acc, m) => acc + getUsage(m), 0);
+    }
+    return 0;
+  };
+
   // Helper to render tree/routing nodes
   const renderTreeItem = (item, index) => {
     if (item.type === 'backend') {
@@ -248,12 +258,8 @@ function App() {
         </div>
       );
     } else if (item.type === 'group') {
-      // 3. Backend stats in group sorted by data usage (bytes_up + bytes_down) descending
-      const sortedGroupBackends = [...(item.backends || [])].sort((a, b) => {
-        const usageA = (a.bytes_up || 0) + (a.bytes_down || 0);
-        const usageB = (b.bytes_up || 0) + (b.bytes_down || 0);
-        return usageB - usageA;
-      });
+      // Sort members by data usage descending
+      const sortedMembers = [...(item.members || [])].sort((a, b) => getUsage(b) - getUsage(a));
 
       return (
         <div key={`tree-${item.name}-${index}`} className="tree-node-wrapper">
@@ -265,7 +271,7 @@ function App() {
               <span className="tree-group-strategy">{item.strategy}</span>
             </div>
             <div className="tree-group-children">
-              {sortedGroupBackends.map((b) => renderBackendCard(b))}
+              {sortedMembers.map((m, i) => renderTreeItem(m, i))}
             </div>
           </div>
         </div>
@@ -485,28 +491,7 @@ function App() {
             {data?.tree && data.tree.filter(item => item.type === 'group').length > 0 ? (
               data.tree
                 .filter(item => item.type === 'group')
-                .map((item, idx) => {
-                  // Sort backends inside the group by data usage descending
-                  const sortedGroupBackends = [...(item.backends || [])].sort((a, b) => {
-                    const usageA = (a.bytes_up || 0) + (a.bytes_down || 0);
-                    const usageB = (b.bytes_up || 0) + (b.bytes_down || 0);
-                    return usageB - usageA;
-                  });
-
-                  return (
-                    <div key={`group-${item.name}-${idx}`} className="tree-group-card" style={{ borderLeft: '3px solid var(--accent-blue)' }}>
-                      <div className="tree-group-header">
-                        <div className="tree-group-title">
-                          <span>📂 Group: {item.name}</span>
-                        </div>
-                        <span className="tree-group-strategy">{item.strategy}</span>
-                      </div>
-                      <div className="tree-group-children">
-                        {sortedGroupBackends.map((b) => renderBackendCard(b))}
-                      </div>
-                    </div>
-                  );
-                })
+                .map((item, idx) => renderTreeItem(item, idx))
             ) : (
               <div className="empty-state">No backend groups configured</div>
             )}

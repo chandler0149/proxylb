@@ -333,7 +333,7 @@ pub enum TreeItem {
     Group {
         name: String,
         strategy: String,
-        backends: Vec<BackendStatusView>,
+        members: Vec<TreeItem>,
     },
 }
 
@@ -1229,22 +1229,31 @@ impl BackendPool {
             });
         }
 
-        for target in &guard.failover_order {
+        fn build_tree_node(
+            target: &Target,
+            groups: &[Group],
+            views: &[BackendStatusView],
+        ) -> Option<TreeItem> {
             match target {
                 Target::Backend(idx) => {
                     if let Some(status) = views.get(*idx) {
-                        tree.push(TreeItem::Backend {
+                        Some(TreeItem::Backend {
                             status: status.clone(),
-                        });
+                        })
+                    } else {
+                        None
                     }
                 }
                 Target::Group(g_idx) => {
-                    if let Some(group) = guard.groups.get(*g_idx) {
-                        let flat_indices = group.flatten_backend_indices(&guard.groups);
-                        let mut group_backends = Vec::new();
-                        for b_idx in flat_indices {
-                            if let Some(status) = views.get(b_idx) {
-                                group_backends.push(status.clone());
+                    if let Some(group) = groups.get(*g_idx) {
+                        let mut members = Vec::new();
+                        for member in &group.members {
+                            let member_target = match member {
+                                GroupMember::Backend(idx) => Target::Backend(*idx),
+                                GroupMember::Group(idx) => Target::Group(*idx),
+                            };
+                            if let Some(node) = build_tree_node(&member_target, groups, views) {
+                                members.push(node);
                             }
                         }
                         let strategy_str = match group.strategy {
@@ -1254,13 +1263,21 @@ impl BackendPool {
                         }
                         .to_string();
 
-                        tree.push(TreeItem::Group {
+                        Some(TreeItem::Group {
                             name: group.name.clone(),
                             strategy: strategy_str,
-                            backends: group_backends,
-                        });
+                            members,
+                        })
+                    } else {
+                        None
                     }
                 }
+            }
+        }
+
+        for target in &guard.failover_order {
+            if let Some(node) = build_tree_node(target, &guard.groups, &views) {
+                tree.push(node);
             }
         }
 

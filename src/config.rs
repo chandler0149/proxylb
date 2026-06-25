@@ -473,7 +473,7 @@ impl Config {
             }
         }
 
-        // Detect cycles in nested group references using DFS.
+        // Detect cycles in nested group references using DFS (3-color algorithm).
         {
             let group_map: std::collections::HashMap<&str, &[String]> = self
                 .groups
@@ -481,23 +481,35 @@ impl Config {
                 .map(|g| (g.name.as_str(), g.members.as_slice()))
                 .collect();
 
-            for group in &self.groups {
-                let mut visited = std::collections::HashSet::new();
-                let mut stack = vec![group.name.as_str()];
-                while let Some(current) = stack.pop() {
-                    if !visited.insert(current) {
-                        anyhow::bail!(
-                            "cycle detected in group hierarchy involving '{}'",
-                            current
-                        );
-                    }
-                    if let Some(members) = group_map.get(current) {
-                        for m in *members {
-                            if group_names.contains(m.as_str()) {
-                                stack.push(m.as_str());
+            // 0: unvisited, 1: visiting, 2: visited
+            let mut state: std::collections::HashMap<&str, u8> = std::collections::HashMap::new();
+
+            fn dfs<'a>(
+                current: &'a str,
+                group_map: &std::collections::HashMap<&str, &'a [String]>,
+                group_names: &std::collections::HashSet<String>,
+                state: &mut std::collections::HashMap<&'a str, u8>,
+            ) -> Result<()> {
+                state.insert(current, 1);
+                if let Some(members) = group_map.get(current) {
+                    for m in *members {
+                        if group_names.contains(m.as_str()) {
+                            let s = *state.get(m.as_str()).unwrap_or(&0);
+                            if s == 1 {
+                                anyhow::bail!("cycle detected in group hierarchy involving '{}'", m);
+                            } else if s == 0 {
+                                dfs(m.as_str(), group_map, group_names, state)?;
                             }
                         }
                     }
+                }
+                state.insert(current, 2);
+                Ok(())
+            }
+
+            for group in &self.groups {
+                if *state.get(group.name.as_str()).unwrap_or(&0) == 0 {
+                    dfs(group.name.as_str(), &group_map, &group_names, &mut state)?;
                 }
             }
         }
