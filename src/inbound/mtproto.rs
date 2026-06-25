@@ -16,7 +16,7 @@ pub async fn run_mtproto_inbound(
     listen_addr: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     secret_hex: String,
     _tls_cfg: Option<crate::config::TlsServerConfig>,
     route_idx: Option<usize>,
@@ -41,13 +41,14 @@ pub async fn run_mtproto_inbound(
         let pool = pool.clone();
         let stats = Arc::clone(&stats);
         let secret = secret.clone();
+        let local_filter_manager = local_filter_manager.clone();
 
         async move {
             if let Err(e) = handle_mtproto_connection(
                 stream,
                 pool,
                 stats,
-                filter_enabled,
+                local_filter_manager.clone(),
                 secret,
                 SecureRandom::new(),
                 route_idx,
@@ -136,7 +137,7 @@ async fn handle_mtproto_connection<S>(
     mut stream: S,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     secret: [u8; MTPROTO_SECRET_BYTES],
     rng: SecureRandom,
     route_idx: Option<usize>,
@@ -214,7 +215,7 @@ where
         handshake.copy_from_slice(&handshake_bytes);
 
         let (backend_stream, chosen_traffic, target_addr, validation) = connect_and_proxy(
-            &handshake, secret, pool, stats.clone(), filter_enabled, true, route_idx
+            &handshake, secret, pool, stats.clone(), local_filter_manager.clone(), true, route_idx
         ).await?;
 
         let client_combined = CombinedStream::new(
@@ -245,7 +246,7 @@ where
         handshake.copy_from_slice(&peek_buf[..HANDSHAKE_LEN]);
 
         let (backend_stream, chosen_traffic, target_addr, validation) = connect_and_proxy(
-            &handshake, secret, pool, stats.clone(), filter_enabled, false, route_idx
+            &handshake, secret, pool, stats.clone(), local_filter_manager.clone(), false, route_idx
         ).await?;
 
         let peek_stream = PeekStream::new(stream, peek_buf[HANDSHAKE_LEN..peek_len].to_vec());
@@ -271,7 +272,7 @@ async fn connect_and_proxy(
     secret: [u8; MTPROTO_SECRET_BYTES],
     pool: BackendPool,
     _stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     _is_tls: bool,
     route_idx: Option<usize>,
 ) -> anyhow::Result<(
@@ -320,13 +321,14 @@ async fn connect_and_proxy(
 
     tracing::debug!(dc = %dc_idx, target = %target_addr, "MTProto connection matched");
 
-    let is_private = crate::inbound::is_private_target(&target_addr).await;
-    if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
-        anyhow::bail!("Connection rejected: private target");
-    }
+    let is_blocked = if let Some(ref m) = local_filter_manager {
+        m.is_blocked(&target_addr)
+    } else {
+        pool.filter_manager.is_blocked(&target_addr)
+    };
 
-    if pool.adblock_manager.is_blocked(&target_addr) {
-        anyhow::bail!("Connection blocked by adblock");
+    if is_blocked {
+        anyhow::bail!("MTProto connection blocked by filter");
     }
 
     let (mut backend_stream, chosen_traffic) = crate::inbound::route_and_connect(&pool, &target_addr, route_idx).await?;

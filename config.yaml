@@ -2,11 +2,18 @@
 # ---------------------
 # A high-performance proxy load balancer with multi-protocol inbound support.
 
-inbound:
-  # Private address target filter (reject private/loopback targets if enabled)
-  filter:
-    enabled: true
+inbound: {}
 
+# Global filter settings
+filter:
+  enabled: true
+  block_private_addresses: true
+  backend: "direct-out"
+  urls:
+    - url: "https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt"
+      tag: "AdblockDNS"
+  files:
+    - "/etc/proxylb/custom-blocklist.txt"
 
 # Multiple Inbound Listeners Reference
 # ------------------------------------
@@ -219,15 +226,6 @@ cpu_affinity:
   worker_cores: [0, 1]
   ancillary_cores: [2]
 
-# AdBlock Guard settings
-adblock:
-  enabled: true
-  backend: "direct-out"
-  urls:
-    - "https://raw.githubusercontent.com/AdguardTeam/AdguardFilters/master/SpiderFilter/sections/adservers.txt"
-  files:
-    - "/etc/proxylb/custom-blocklist.txt"
-  update_interval_hours: 24
 
 advanced:
   zero_copy: true

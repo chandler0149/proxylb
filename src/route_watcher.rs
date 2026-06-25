@@ -84,7 +84,8 @@ pub fn start_route_watcher(
             
             let mut changed = false;
             if n as usize >= std::mem::size_of::<libc::rt_msghdr>() {
-                let rtm = &*(buf.as_ptr() as *const libc::rt_msghdr);
+                // Read unaligned to avoid panics, as the stack `buf` may not be properly aligned
+                let rtm = std::ptr::read_unaligned(buf.as_ptr() as *const libc::rt_msghdr);
                 let mtype = rtm.rtm_type as i32;
                 if mtype == libc::RTM_ADD || mtype == libc::RTM_DELETE {
                     changed = true;

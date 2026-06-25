@@ -44,23 +44,62 @@ pub struct Config {
     #[serde(default)]
     pub cpu_affinity: Option<CpuAffinityConfig>,
     #[serde(default)]
-    pub adblock: AdBlockConfig,
+    pub filter: FilterConfig,
     #[serde(default)]
     #[allow(dead_code)]
     pub advanced: AdvancedConfig,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
-pub struct AdBlockConfig {
-    #[serde(default)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct FilterConfig {
+    #[serde(default = "default_filter_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub block_private_addresses: bool,
     pub backend: Option<String>,
     #[serde(default)]
-    pub urls: Vec<String>,
+    pub urls: Vec<ConfigUrl>,
     #[serde(default)]
     pub files: Vec<String>,
     #[serde(default = "default_update_interval_hours")]
     pub update_interval_hours: u64,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ConfigUrl {
+    String(String),
+    Struct { url: String, tag: String },
+}
+
+impl ConfigUrl {
+    pub fn into_filter_url(self) -> crate::filter::FilterUrl {
+        match self {
+            ConfigUrl::String(url) => crate::filter::FilterUrl {
+                url,
+                tag: "Config".to_string(),
+                rule_count: 0,
+            },
+            ConfigUrl::Struct { url, tag } => crate::filter::FilterUrl {
+                url,
+                tag,
+                rule_count: 0,
+            },
+        }
+    }
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_filter_enabled(),
+            block_private_addresses: false,
+            backend: None,
+            urls: Vec::new(),
+            files: Vec::new(),
+            update_interval_hours: default_update_interval_hours(),
+        }
+    }
 }
 
 fn default_update_interval_hours() -> u64 {
@@ -116,8 +155,6 @@ pub struct InboundConfig {
     pub shadowsocks: Option<ShadowsocksInboundConfig>,
     pub http: Option<HttpInboundConfig>,
     pub mtproto: Option<MtprotoInboundConfig>,
-    #[serde(default)]
-    pub filter: FilterConfig,
 }
 
 /// A specific inbound configuration item when running multiple inbounds.
@@ -134,7 +171,6 @@ pub enum InboundItemConfig {
         tls: Option<TlsServerConfig>,
         #[serde(default)]
         filter: Option<FilterConfig>,
-        /// Optional route binding: group or backend name to route through.
         #[serde(default)]
         route: Option<String>,
     },
@@ -180,6 +216,8 @@ pub struct Socks5InboundConfig {
     pub listen: String,
     pub username: Option<String>,
     pub password: Option<String>,
+    #[serde(default)]
+    pub filter: Option<FilterConfig>,
 }
 
 /// Shadowsocks inbound listener.
@@ -189,6 +227,8 @@ pub struct ShadowsocksInboundConfig {
     pub password: String,
     /// Cipher method, e.g. "aes-256-gcm", "aes-128-gcm", "chacha20-ietf-poly1305"
     pub method: String,
+    #[serde(default)]
+    pub filter: Option<FilterConfig>,
 }
 
 /// HTTP inbound listener.
@@ -197,6 +237,8 @@ pub struct HttpInboundConfig {
     pub listen: String,
     pub username: Option<String>,
     pub password: Option<String>,
+    #[serde(default)]
+    pub filter: Option<FilterConfig>,
 }
 
 /// MTProto inbound listener.
@@ -204,23 +246,12 @@ pub struct HttpInboundConfig {
 pub struct MtprotoInboundConfig {
     pub listen: String,
     pub secret: String,
+    #[serde(default)]
+    pub filter: Option<FilterConfig>,
 }
 
 fn default_filter_enabled() -> bool {
     true
-}
-
-/// Private address target filter configuration.
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-pub struct FilterConfig {
-    #[serde(default = "default_filter_enabled")]
-    pub enabled: bool,
-}
-
-impl Default for FilterConfig {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
 }
 
 /// A backend entry.
@@ -340,7 +371,7 @@ impl Config {
                 username: s5.username.clone(),
                 password: s5.password.clone(),
                 tls: None,
-                filter: Some(self.inbound.filter.clone()),
+                filter: None,
                 route: None,
             });
         }
@@ -350,7 +381,7 @@ impl Config {
                 password: ss.password.clone(),
                 method: ss.method.clone(),
                 tls: None,
-                filter: Some(self.inbound.filter.clone()),
+                filter: None,
                 route: None,
             });
         }
@@ -360,7 +391,7 @@ impl Config {
                 username: http.username.clone(),
                 password: http.password.clone(),
                 tls: None,
-                filter: Some(self.inbound.filter.clone()),
+                filter: None,
                 route: None,
             });
         }
@@ -369,23 +400,12 @@ impl Config {
                 listen: mtproto.listen.clone(),
                 password: mtproto.secret.clone(),
                 tls: None,
-                filter: Some(self.inbound.filter.clone()),
+                filter: None,
                 route: None,
             });
         }
         for item in &self.inbounds {
-            let mut resolved_item = item.clone();
-            match &mut resolved_item {
-                InboundItemConfig::Socks5 { filter, .. }
-                | InboundItemConfig::Shadowsocks { filter, .. }
-                | InboundItemConfig::Http { filter, .. }
-                | InboundItemConfig::Mtproto { filter, .. } => {
-                    if filter.is_none() {
-                        *filter = Some(self.inbound.filter.clone());
-                    }
-                }
-            }
-            res.push(resolved_item);
+            res.push(item.clone());
         }
         res
     }
@@ -617,7 +637,7 @@ mod tests {
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
-            adblock: AdBlockConfig::default(),
+            filter: FilterConfig::default(),
             advanced: AdvancedConfig::default(),
         };
         assert!(cfg.validate().is_ok());
@@ -657,7 +677,7 @@ mod tests {
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
-            adblock: AdBlockConfig::default(),
+            filter: FilterConfig::default(),
             advanced: AdvancedConfig::default(),
         };
         let err = cfg.validate().unwrap_err();
@@ -716,7 +736,7 @@ mod tests {
             web: WebConfig::default(),
             bind_interface: None,
             cpu_affinity: None,
-            adblock: AdBlockConfig::default(),
+            filter: FilterConfig::default(),
             advanced: AdvancedConfig::default(),
         };
         assert!(cfg.validate().is_ok());
@@ -725,9 +745,6 @@ mod tests {
     #[test]
     fn test_multiple_inbounds_parsing_and_resolution() {
         let yaml = r#"
-inbound:
-  filter:
-    enabled: false
 inbounds:
   - type: socks5
     listen: "127.0.0.1:1080"
@@ -749,7 +766,7 @@ backends:
         match &resolved[0] {
             InboundItemConfig::Socks5 { listen, filter, .. } => {
                 assert_eq!(listen, "127.0.0.1:1080");
-                assert_eq!(filter.as_ref().unwrap().enabled, false);
+                assert!(filter.is_none());
             }
             _ => panic!("Expected Socks5 inbound"),
         }
@@ -765,7 +782,7 @@ backends:
                 assert_eq!(listen, "127.0.0.1:8388");
                 assert_eq!(password, "password123");
                 assert_eq!(method, "aes-256-gcm");
-                assert_eq!(filter.as_ref().unwrap().enabled, false);
+                assert!(filter.is_none());
             }
             _ => panic!("Expected Shadowsocks inbound"),
         }
@@ -773,7 +790,7 @@ backends:
         match &resolved[2] {
             InboundItemConfig::Http { listen, filter, .. } => {
                 assert_eq!(listen, "127.0.0.1:8080");
-                assert_eq!(filter.as_ref().unwrap().enabled, false);
+                assert!(filter.is_none());
             }
             _ => panic!("Expected HTTP inbound"),
         }

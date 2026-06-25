@@ -166,29 +166,6 @@ where
     Ok(())
 }
 
-/// Branch prediction hint: indicates that `b` is highly likely to be true.
-#[inline(always)]
-pub fn likely(b: bool) -> bool {
-    if !b {
-        cold_path();
-    }
-    b
-}
-
-/// Branch prediction hint: indicates that `b` is highly unlikely to be true.
-#[inline(always)]
-pub fn unlikely(b: bool) -> bool {
-    if b {
-        cold_path();
-    }
-    b
-}
-
-/// Helper function representing a cold path.
-#[cold]
-#[inline(never)]
-pub fn cold_path() {}
-
 /// Consolidates high-performance routing and load-balanced/failover backend connection establishment.
 ///
 /// When `route` is `Some`, uses route-specific candidates (bound to a group or backend).
@@ -409,7 +386,7 @@ where
 }
 
 /// Helper function to check if a target address points to a private/loopback address.
-pub async fn is_private_target(target: &TargetAddr) -> bool {
+pub fn is_private_target_sync(target: &TargetAddr) -> bool {
     match target {
         TargetAddr::Ip(addr) => is_private_ip(addr.ip()),
         TargetAddr::Domain(host, _port) => {
@@ -469,18 +446,18 @@ mod tests {
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 
-    #[tokio::test]
-    async fn test_is_private_target() {
+    #[test]
+    fn test_is_private_target() {
         let t1 = TargetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80));
-        assert!(is_private_target(&t1).await);
+        assert!(is_private_target_sync(&t1));
 
         let t2 = TargetAddr::Domain("localhost".to_string(), 80);
-        assert!(is_private_target(&t2).await);
+        assert!(is_private_target_sync(&t2));
 
         let t3 = TargetAddr::Domain("some-service.local".to_string(), 80);
-        assert!(is_private_target(&t3).await);
+        assert!(is_private_target_sync(&t3));
 
         let t4 = TargetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80));
-        assert!(!is_private_target(&t4).await);
+        assert!(!is_private_target_sync(&t4));
     }
 }

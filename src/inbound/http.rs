@@ -19,7 +19,7 @@ pub async fn run_http_inbound(
     listen_addr: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_cfg: Option<crate::config::TlsServerConfig>,
     username: Option<String>,
     password: Option<String>,
@@ -44,13 +44,14 @@ pub async fn run_http_inbound(
         let tls_acceptor = tls_acceptor.clone();
         let username = username.clone();
         let password = password.clone();
+        let local_filter_manager = local_filter_manager.clone();
         async move {
             if let Err(e) = handle_http_connection(
                 stream,
                 addr.clone(),
                 pool,
                 stats,
-                filter_enabled,
+                local_filter_manager.clone(),
                 tls_acceptor.as_deref().cloned(),
                 username,
                 password,
@@ -71,7 +72,7 @@ async fn handle_http_connection<S>(
     client_addr: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     username: Option<Arc<String>>,
     password: Option<Arc<String>>,
@@ -133,18 +134,17 @@ where
         }
     }
 
-    let is_private = crate::inbound::is_private_target(&target).await;
-    if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
-        tracing::warn!(target = %target, "HTTP connection rejected: private target");
-        let _ = client_stream.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nPrivate address targets are rejected.\r\n").await;
-        return Ok(());
-    }
+    let is_blocked = if let Some(ref m) = local_filter_manager {
+        m.is_blocked(&target)
+    } else {
+        pool.filter_manager.is_blocked(&target)
+    };
 
-    if pool.adblock_manager.is_blocked(&target) {
-        tracing::warn!(target = %target, "HTTP connection blocked by adblock");
+    if is_blocked {
+        tracing::debug!(target = %target, "HTTP connection blocked by filter");
         let _ = client_stream
             .write_all(
-                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nBlocked by AdBlock rules.\r\n",
+                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nBlocked by Filter rules.\r\n",
             )
             .await;
         return Ok(());

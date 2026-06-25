@@ -27,7 +27,7 @@ pub async fn run_shadowsocks_inbound(
     method_str: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_cfg: Option<crate::config::TlsServerConfig>,
     route_idx: Option<usize>,
     cancel: CancellationToken,
@@ -59,6 +59,7 @@ pub async fn run_shadowsocks_inbound(
         let key = Arc::clone(&key);
         let stats = Arc::clone(&stats);
         let tls_acceptor = tls_acceptor.clone();
+        let local_filter_manager = local_filter_manager.clone();
         async move {
             if let Err(e) = handle_ss_connection(
                 stream,
@@ -68,7 +69,7 @@ pub async fn run_shadowsocks_inbound(
                 &key,
                 pool,
                 stats,
-                filter_enabled,
+                local_filter_manager.clone(),
                 tls_acceptor.as_deref().cloned(),
                 route_idx,
             )
@@ -90,7 +91,7 @@ async fn handle_ss_connection<S>(
     key: &[u8],
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     route_idx: Option<usize>,
 ) -> anyhow::Result<()>
@@ -121,17 +122,15 @@ where
         "Shadowsocks CONNECT request"
     );
 
-    let is_private = crate::inbound::is_private_target(&target).await;
-    if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
-        tracing::warn!(target = %target, "Shadowsocks connection rejected: private target");
-        return Err(anyhow::anyhow!(
-            "private address target is rejected by filter"
-        ));
-    }
+    let is_blocked = if let Some(ref m) = local_filter_manager {
+        m.is_blocked(&target)
+    } else {
+        pool.filter_manager.is_blocked(&target)
+    };
 
-    if pool.adblock_manager.is_blocked(&target) {
-        tracing::warn!(target = %target, "Shadowsocks connection blocked by adblock");
-        return Err(anyhow::anyhow!("connection blocked by AdBlock rules"));
+    if is_blocked {
+        tracing::debug!(target = %target, "Shadowsocks connection blocked by filter");
+        return Err(anyhow::anyhow!("connection blocked by filter rules"));
     }
 
     // Try backends in order with fallback.

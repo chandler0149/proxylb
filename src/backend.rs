@@ -438,7 +438,7 @@ pub struct BackendPool {
     pub hot_paths: Arc<ArcSwap<Vec<BackendHotPath>>>,
     pub inbound_stats: Arc<parking_lot::Mutex<Vec<Arc<InboundStats>>>>,
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
-    pub adblock_manager: Arc<crate::adblock::AdBlockManager>,
+    pub filter_manager: Arc<crate::filter::FilterManager>,
     pub ancillary_handle: tokio::runtime::Handle,
 }
 
@@ -695,7 +695,7 @@ impl BackendPool {
         failover_order_cfg: Option<&Vec<String>>,
         global_bind_interface: Option<&str>,
         rt_chg_signal: tokio::sync::watch::Receiver<u64>,
-        adblock_config: &crate::config::AdBlockConfig,
+        filter_config: &crate::config::FilterConfig,
         ancillary_handle: tokio::runtime::Handle,
         active_routes: std::collections::HashSet<String>,
     ) -> anyhow::Result<Self> {
@@ -754,7 +754,7 @@ impl BackendPool {
             .collect::<Vec<_>>();
         let hot_paths = Arc::new(ArcSwap::from_pointee(hot_paths));
 
-        let adblock_manager = Arc::new(crate::adblock::AdBlockManager::new(adblock_config.enabled));
+        let filter_config = filter_config.clone();
 
         let mut route_map = HashMap::new();
         for (i, route) in active_routes.into_iter().enumerate() {
@@ -775,7 +775,7 @@ impl BackendPool {
             hot_paths,
             inbound_stats: Arc::new(parking_lot::Mutex::new(Vec::new())),
             rt_chg_signal,
-            adblock_manager,
+            filter_manager: Arc::new(crate::filter::FilterManager::new(&filter_config, Some("proxylb.db"))),
             ancillary_handle,
         })
     }
@@ -1484,7 +1484,7 @@ mod tests {
             failover_order_cfg,
             global_bind_interface,
             rx,
-            &crate::config::AdBlockConfig::default(),
+            &crate::config::FilterConfig::default(),
             tokio::runtime::Handle::current(),
             std::collections::HashSet::new(),
         )

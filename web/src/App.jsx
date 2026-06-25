@@ -8,7 +8,17 @@ function App() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState('all'); // 'all', 'groups', 'backends'
+  const [activeTab, setActiveTab] = useState('all'); // 'all', 'groups', 'backends', 'filter'
+
+  const [filterRules, setFilterRules] = useState([]);
+  const [filterUrls, setFilterUrls] = useState([]);
+  const [newRule, setNewRule] = useState('');
+  const [newUrl, setNewUrl] = useState('');
+  const [newUrlTag, setNewUrlTag] = useState('');
+  const [isAddingRule, setIsAddingRule] = useState(false);
+  const [isAddingUrl, setIsAddingUrl] = useState(false);
+  const [checkTarget, setCheckTarget] = useState('');
+  const [checkResult, setCheckResult] = useState(null); // { blocked: bool } or null or 'loading'
 
   // Sync API host to localStorage
   const handleApiHostChange = (e) => {
@@ -57,7 +67,119 @@ function App() {
       // Re-fetch status immediately
       fetchStatus();
     } catch (err) {
-      alert(`Error toggling backend: ${err.message}`);
+    }
+  };
+
+  const fetchFilterData = async () => {
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      const [rulesRes, urlsRes] = await Promise.all([
+        fetch(`${host}/api/filter/rules`),
+        fetch(`${host}/api/filter/urls`)
+      ]);
+      if (rulesRes.ok) setFilterRules(await rulesRes.json());
+      if (urlsRes.ok) setFilterUrls(await urlsRes.json());
+    } catch (err) {
+      console.error('Failed to fetch filter data', err);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'filter') {
+      fetchFilterData();
+    }
+  }, [activeTab]);
+
+  const handleAddRule = async () => {
+    if (!newRule.trim()) return;
+    setIsAddingRule(true);
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      await fetch(`${host}/api/filter/rules`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rule: newRule.trim() })
+      });
+      setNewRule('');
+      fetchFilterData();
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+    finally { setIsAddingRule(false); }
+  };
+
+  const handleDeleteRule = async (rule) => {
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      await fetch(`${host}/api/filter/rules`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rule })
+      });
+      fetchFilterData();
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+  };
+
+  const handleAddUrl = async () => {
+    if (!newUrl.trim()) return;
+    setIsAddingUrl(true);
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      const res = await fetch(`${host}/api/filter/urls`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: newUrl.trim(), tag: newUrlTag.trim() })
+      });
+      if (!res.ok) throw new Error('Failed to add list (maybe invalid or unreachable)');
+      setNewUrl('');
+      setNewUrlTag('');
+      fetchFilterData();
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+    finally { setIsAddingUrl(false); }
+  };
+
+  const handleDeleteUrl = async (urlObj) => {
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      await fetch(`${host}/api/filter/urls`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: urlObj.url })
+      });
+      fetchFilterData();
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+  };
+
+  const handleToggleFilter = async () => {
+    if (!data?.adblock) return;
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      await fetch(`${host}/api/filter/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabled: !data.adblock.enabled,
+          block_private_addresses: false
+        })
+      });
+      fetchStatus();
+    } catch (err) { alert(err.message); }
+  };
+
+  const handleCheckTarget = async () => {
+    if (!checkTarget.trim()) return;
+    setCheckResult('loading');
+    try {
+      const host = apiHost.replace(/\/$/, '');
+      const res = await fetch(`${host}/api/filter/check?target=${encodeURIComponent(checkTarget.trim())}`);
+      if (!res.ok) throw new Error('Check failed');
+      const data = await res.json();
+      setCheckResult({ blocked: data.blocked });
+    } catch (err) {
+      alert(err.message);
+      setCheckResult(null);
     }
   };
 
@@ -386,7 +508,7 @@ function App() {
         {/* AdBlock Guard */}
         <div className={`summary-card ${data?.adblock?.enabled ? 'adblock-enabled' : 'adblock-disabled'}`}>
           <div className="summary-card-header">
-            <span className="summary-card-title">AdBlock Guard</span>
+            <span className="summary-card-title">Filter Engine</span>
             <div className="beacon-container">
               <span className="summary-card-subtext">
                 {data?.adblock?.enabled ? 'Active' : 'Disabled'}
@@ -473,6 +595,12 @@ function App() {
             >
               Standalone Backends
             </button>
+            <button
+              className={`tab-btn ${activeTab === 'filter' ? 'active' : ''}`}
+              onClick={() => setActiveTab('filter')}
+            >
+              Filter Engine
+            </button>
           </div>
         </div>
 
@@ -507,6 +635,121 @@ function App() {
             ) : (
               <div className="empty-state">No standalone backends configured</div>
             )}
+          </div>
+        )}
+
+        {activeTab === 'filter' && (
+          <div className="filter-panel" style={{ background: 'var(--card-bg)', borderRadius: '16px', padding: '1.5rem', border: '1px solid var(--border-color)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+              <h3 style={{ margin: 0, color: 'var(--text-primary)' }}>Filter Configuration</h3>
+              <label className="toggle-switch" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <span style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Global Filter</span>
+                <div style={{ position: 'relative' }}>
+                  <input
+                    type="checkbox"
+                    checked={data?.adblock?.enabled || false}
+                    onChange={handleToggleFilter}
+                  />
+                  <span className="slider"></span>
+                </div>
+              </label>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem' }}>
+              {/* Rules List */}
+              <div className="filter-list-section">
+                <h4>Dynamic Rules ({filterRules.length})</h4>
+                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
+                  <input 
+                    type="text" 
+                    value={newRule}
+                    onChange={e => setNewRule(e.target.value)}
+                    placeholder="e.g. ad.example.com"
+                    style={{ flex: 1, padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}
+                  />
+                  <button onClick={handleAddRule} disabled={isAddingRule} className="tab-btn active" style={{ padding: '0.5rem 1rem', opacity: isAddingRule ? 0.7 : 1 }}>
+                    {isAddingRule ? 'Adding...' : 'Add'}
+                  </button>
+                </div>
+                <div style={{ maxHeight: '300px', overflowY: 'auto', background: 'rgba(0,0,0,0.2)', borderRadius: '8px', padding: '0.5rem' }}>
+                  {filterRules.map(rule => (
+                    <div key={rule} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.5rem', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                      <span>{rule}</span>
+                      <button onClick={() => handleDeleteRule(rule)} style={{ background: 'transparent', border: 'none', color: 'var(--accent-red)', cursor: 'pointer' }}>✕</button>
+                    </div>
+                  ))}
+                  {filterRules.length === 0 && <div style={{ color: 'var(--text-secondary)', padding: '1rem', textAlign: 'center' }}>No dynamic rules</div>}
+                </div>
+              </div>
+
+              {/* URLs List */}
+              <div className="filter-list-section">
+                <h4>Remote Lists ({filterUrls.length})</h4>
+                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', flexDirection: 'column' }}>
+                  <input 
+                    type="text" 
+                    value={newUrlTag}
+                    onChange={e => setNewUrlTag(e.target.value)}
+                    placeholder="Tag / Name (optional)"
+                    style={{ width: '100%', padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}
+                  />
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <input 
+                      type="text" 
+                      value={newUrl}
+                      onChange={e => setNewUrl(e.target.value)}
+                      placeholder="e.g. https://example.com/rules.txt"
+                      style={{ flex: 1, padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}
+                    />
+                    <button onClick={handleAddUrl} disabled={isAddingUrl} className="tab-btn active" style={{ padding: '0.5rem 1rem', opacity: isAddingUrl ? 0.7 : 1 }}>
+                      {isAddingUrl ? 'Fetching...' : 'Add'}
+                    </button>
+                  </div>
+                </div>
+                <div style={{ maxHeight: '300px', overflowY: 'auto', background: 'rgba(128,128,128,0.1)', borderRadius: '8px', padding: '0.5rem' }}>
+                  {filterUrls.map(item => (
+                    <div key={item.url} style={{ display: 'flex', justifyContent: 'space-between', padding: '0.5rem', borderBottom: '1px solid var(--border-subtle)' }}>
+                      <div style={{ display: 'flex', flexDirection: 'column', marginRight: '1rem' }}>
+                        {item.tag && <span style={{ fontWeight: 'bold', fontSize: '0.9rem', color: 'var(--text-primary)', marginBottom: '4px' }}>{item.tag} <span style={{ fontWeight: 'normal', fontSize: '0.8rem', color: 'var(--text-secondary)', marginLeft: '8px' }}>({item.rule_count?.toLocaleString() || 0} rules)</span></span>}
+                        <span style={{ wordBreak: 'break-all', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{item.url}</span>
+                      </div>
+                      <button onClick={() => handleDeleteUrl(item)} style={{ background: 'transparent', border: 'none', color: 'var(--accent-red)', cursor: 'pointer', alignSelf: 'center', padding: '0.5rem' }}>✕</button>
+                    </div>
+                  ))}
+                  {filterUrls.length === 0 && <div style={{ color: 'var(--text-secondary)', padding: '1rem', textAlign: 'center' }}>No remote lists</div>}
+                </div>
+              </div>
+            </div>
+
+            {/* Test Target Section */}
+            <div style={{ marginTop: '2rem', padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: '8px' }}>
+              <h4 style={{ margin: '0 0 1rem 0' }}>Test Block Status</h4>
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                <input 
+                  type="text" 
+                  value={checkTarget}
+                  onChange={e => { setCheckTarget(e.target.value); setCheckResult(null); }}
+                  placeholder="e.g. tracking.example.com or 192.168.1.1"
+                  style={{ flex: 1, padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}
+                />
+                <button onClick={handleCheckTarget} disabled={checkResult === 'loading'} className="tab-btn active" style={{ padding: '0.5rem 1rem' }}>
+                  {checkResult === 'loading' ? 'Checking...' : 'Check'}
+                </button>
+                {checkResult && checkResult !== 'loading' && (
+                  <span style={{ 
+                    marginLeft: '1rem', 
+                    padding: '0.25rem 0.75rem', 
+                    borderRadius: '4px',
+                    background: checkResult.blocked ? 'rgba(255, 61, 113, 0.2)' : 'rgba(0, 227, 150, 0.2)',
+                    color: checkResult.blocked ? 'var(--accent-red)' : 'var(--accent-green)',
+                    fontWeight: 'bold'
+                  }}>
+                    {checkResult.blocked ? 'BLOCKED ✕' : 'ALLOWED ✓'}
+                  </span>
+                )}
+              </div>
+            </div>
+
           </div>
         )}
       </div>

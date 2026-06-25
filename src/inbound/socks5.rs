@@ -23,7 +23,7 @@ pub async fn run_socks5_inbound(
     listen_addr: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_cfg: Option<crate::config::TlsServerConfig>,
     username: Option<String>,
     password: Option<String>,
@@ -55,12 +55,13 @@ pub async fn run_socks5_inbound(
             let stats = Arc::clone(&stats);
             let tls_acceptor = tls_acceptor.clone();
             let arc_config = arc_config.clone();
+            let local_filter_manager = local_filter_manager.clone();
             async move {
                 if let Err(e) = handle_socks5_connection(
                     stream,
                     pool,
                     stats,
-                    filter_enabled,
+                    local_filter_manager.clone(),
                     tls_acceptor.as_deref().cloned(),
                     arc_config,
                     route_idx,
@@ -83,12 +84,13 @@ pub async fn run_socks5_inbound(
             let stats = Arc::clone(&stats);
             let tls_acceptor = tls_acceptor.clone();
             let arc_config = arc_config.clone();
+            let local_filter_manager = local_filter_manager.clone();
             async move {
                 if let Err(e) = handle_socks5_connection(
                     stream,
                     pool,
                     stats,
-                    filter_enabled,
+                    local_filter_manager.clone(),
                     tls_acceptor.as_deref().cloned(),
                     arc_config,
                     route_idx,
@@ -109,7 +111,7 @@ async fn handle_socks5_connection<S, A>(
     stream: S,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     config: Arc<Config<A>>,
     route_idx: Option<usize>,
@@ -127,7 +129,7 @@ where
     };
 
     let socks5_socket = Socks5Socket::new(stream, config);
-    handle_socks5_handshake(socks5_socket, pool, stats, filter_enabled, route_idx).await
+    handle_socks5_handshake(socks5_socket, pool, stats, local_filter_manager, route_idx).await
 }
 
 #[allow(deprecated)]
@@ -135,7 +137,7 @@ async fn handle_socks5_handshake<S, A>(
     socks5_socket: Socks5Socket<S, A>,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     route_idx: Option<usize>,
 ) -> anyhow::Result<()>
 where
@@ -165,17 +167,14 @@ where
 
     tracing::debug!(target = %target, "SOCKS5 CONNECT request");
 
-    let is_private = crate::inbound::is_private_target(&target).await;
-    if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
-        tracing::warn!(target = %target, "SOCKS5 connection rejected: private target");
-        let mut client_stream = socks5_socket.into_inner();
-        let reply = build_socks5_reply(consts::SOCKS5_REPLY_CONNECTION_NOT_ALLOWED);
-        let _ = client_stream.write_all(&reply).await;
-        return Ok(());
-    }
+    let is_blocked = if let Some(ref m) = local_filter_manager {
+        m.is_blocked(&target)
+    } else {
+        pool.filter_manager.is_blocked(&target)
+    };
 
-    if pool.adblock_manager.is_blocked(&target) {
-        tracing::warn!(target = %target, "SOCKS5 connection blocked by adblock");
+    if is_blocked {
+        tracing::debug!(target = %target, "SOCKS5 connection blocked by filter");
         let mut client_stream = socks5_socket.into_inner();
         let reply = build_socks5_reply(consts::SOCKS5_REPLY_CONNECTION_NOT_ALLOWED);
         let _ = client_stream.write_all(&reply).await;

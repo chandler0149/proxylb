@@ -1,16 +1,16 @@
 :root {
-  --bg-primary: #060613;
-  --bg-secondary: #0c0c24;
-  --bg-card: rgba(22, 22, 59, 0.45);
-  --bg-card-hover: rgba(33, 33, 85, 0.6);
-  --text-primary: #f0f0f8;
-  --text-secondary: #9da4cf;
-  --accent-green: #00e676;
-  --accent-red: #ff3d71;
-  --accent-yellow: #ffc107;
-  --accent-blue: #00b0ff;
-  --border-subtle: rgba(255, 255, 255, 0.08);
-  --shadow-glow: 0 12px 40px 0 rgba(0, 0, 0, 0.5);
+  --bg-primary: #f8f9fa;
+  --bg-secondary: #e9ecef;
+  --bg-card: rgba(255, 255, 255, 0.85);
+  --bg-card-hover: rgba(255, 255, 255, 1);
+  --text-primary: #212529;
+  --text-secondary: #495057;
+  --accent-green: #00c853;
+  --accent-red: #d50000;
+  --accent-yellow: #f57f17;
+  --accent-blue: #2962ff;
+  --border-subtle: rgba(0, 0, 0, 0.1);
+  --shadow-glow: 0 12px 40px 0 rgba(0, 0, 0, 0.08);
   --font-main: 'Outfit', sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
 }

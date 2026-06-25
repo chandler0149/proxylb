@@ -59,9 +59,17 @@ rustls-pemfile = "2.2.0"
 base64 = "0.22.1"
 rcgen = "0.14.8"
 socket2 = "0.6.4"
-
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+rustc-hash = { version = "2.1.2", optional = true }
+ahash = { version = "0.8.12", optional = true }
 tikv-jemallocator = "0.7"
+
+[features]
+default = ["fast-hash"]
+fast-hash = ["dep:rustc-hash"]
+ahash = ["dep:ahash"]
+
+
 
 
 
