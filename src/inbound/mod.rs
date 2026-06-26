@@ -419,6 +419,7 @@ where
 }
 
 /// Helper function to check if a target address points to a private/loopback address.
+#[allow(dead_code)]
 pub fn is_private_target_sync(target: &TargetAddr) -> bool {
     match target {
         TargetAddr::Ip(addr) => is_private_ip(addr.ip()),
@@ -430,6 +431,7 @@ pub fn is_private_target_sync(target: &TargetAddr) -> bool {
 }
 
 /// Helper function to check if an IpAddr is private or loopback/local.
+#[allow(dead_code)]
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
@@ -448,10 +450,12 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+#[allow(dead_code)]
 fn is_ipv6_unique_local(ipv6: &std::net::Ipv6Addr) -> bool {
     (ipv6.octets()[0] & 0xfe) == 0xfc
 }
 
+#[allow(dead_code)]
 fn is_ipv6_link_local(ipv6: &std::net::Ipv6Addr) -> bool {
     (ipv6.octets()[0] == 0xfe) && ((ipv6.octets()[1] & 0xc0) == 0x80)
 }

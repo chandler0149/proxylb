@@ -4,6 +4,18 @@
 //! and subdomains using AdGuard Home / ABP formatted filter lists. Whitelisting
 //! rules (exceptions) override blocklist rules.
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct FilterUrl {
+    pub url: String,
+    pub tag: String,
+    #[serde(default)]
+    pub rule_count: usize,
+}
+
+#[cfg(feature = "filter")]
+mod imp {
+use super::FilterUrl;
+
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,13 +131,6 @@ pub struct FilterManager {
     pub rebuild_lock: tokio::sync::Mutex<()>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
-pub struct FilterUrl {
-    pub url: String,
-    pub tag: String,
-    #[serde(default)]
-    pub rule_count: usize,
-}
 
 impl FilterManager {
     pub fn new(config: &crate::config::FilterConfig, db_path: Option<&str>) -> Self {
@@ -839,3 +844,85 @@ mod tests {
         println!("Time per lookup: {:?}", elapsed / total_lookups as u32);
     }
 }
+}
+
+#[cfg(feature = "filter")]
+pub use imp::*;
+
+
+#[cfg(not(feature = "filter"))]
+mod stub {
+    #![allow(dead_code)]
+    use super::FilterUrl;
+    use std::sync::atomic::AtomicU64;
+    use arc_swap::ArcSwap;
+    use crate::outbound::TargetAddr;
+
+    pub struct FilterEngine {
+        pub block_rules_count: usize,
+    }
+    impl FilterEngine {
+        pub fn new() -> Self { Self { block_rules_count: 0 } }
+        pub fn is_blocked(&self, _domain: &str) -> bool { false }
+    }
+
+    pub struct FilterManager {
+        pub engine: ArcSwap<FilterEngine>,
+        pub enabled: ArcSwap<bool>,
+        pub block_private: ArcSwap<bool>,
+        pub blocked_requests: AtomicU64,
+        pub backend: Option<String>,
+        pub cached_remote_contents: tokio::sync::RwLock<std::collections::HashMap<String, String>>,
+    }
+
+    impl FilterManager {
+        pub fn new(config: &crate::config::FilterConfig, _db_path: Option<&str>) -> Self {
+            Self {
+                engine: ArcSwap::from_pointee(FilterEngine::new()),
+                enabled: ArcSwap::from_pointee(false),
+                block_private: ArcSwap::from_pointee(false),
+                blocked_requests: AtomicU64::new(0),
+                backend: config.backend.clone(),
+                cached_remote_contents: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            }
+        }
+
+        pub fn is_blocked(&self, _target: &TargetAddr) -> bool { false }
+        pub async fn rebuild_engine(&self) {}
+        pub fn set_enabled(&self, _enabled: bool) {}
+        pub fn set_block_private(&self, _block_private: bool) {}
+        pub async fn add_rule(&self, _rule: &str) -> anyhow::Result<()> { Ok(()) }
+        pub async fn delete_rule(&self, _rule: &str) -> anyhow::Result<()> { Ok(()) }
+        pub fn get_rules(&self) -> Vec<String> { Vec::new() }
+        pub async fn add_url(&self, _url: &str, _tag: &str, _content: String) -> anyhow::Result<()> { Ok(()) }
+        pub async fn delete_url(&self, _url: &str) -> anyhow::Result<()> { Ok(()) }
+        pub fn get_urls(&self) -> Vec<FilterUrl> { Vec::new() }
+    }
+
+    pub async fn start_filter_manager(
+        _manager: std::sync::Arc<FilterManager>,
+        _pool: crate::backend::BackendPool,
+        _config: crate::config::FilterConfig,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) {}
+
+    pub async fn download_url(
+        _pool: &crate::backend::BackendPool,
+        _backend_name: Option<&str>,
+        _url: &str,
+    ) -> anyhow::Result<String> {
+        anyhow::bail!("Filter engine is disabled at compile time");
+    }
+
+    pub fn parse_rule_line(_line: &str) -> Option<&str> { None }
+
+    pub fn build_engine_from_contents(
+        _local_contents: &[&str],
+        _remote_contents: &[&str],
+    ) -> FilterEngine {
+        FilterEngine::new()
+    }
+}
+
+#[cfg(not(feature = "filter"))]
+pub use stub::*;

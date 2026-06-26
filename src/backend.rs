@@ -1113,7 +1113,7 @@ impl BackendPool {
             };
             push_history(&mut status.history, result);
 
-            if was_healthy {
+            if was_healthy && !status.healthy {
                 tracing::warn!(
                     backend = %hp.info_name,
                     error = %error,

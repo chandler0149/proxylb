@@ -72,6 +72,7 @@ pub enum ConfigUrl {
     Struct { url: String, tag: String },
 }
 
+#[allow(dead_code)]
 impl ConfigUrl {
     pub fn into_filter_url(self) -> crate::filter::FilterUrl {
         match self {
