@@ -64,6 +64,7 @@ rustc-hash = { version = "2.1.2", optional = true }
 ahash = { version = "0.8.12", optional = true }
 tikv-jemallocator = "0.7"
 dashmap = "6.2.1"
+rand = "0.10.1"
 
 [features]
 default = ["fast-hash"]

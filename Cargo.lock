@@ -2178,6 +2178,7 @@ dependencies = [
  "memory-stats",
  "mtproto-server",
  "parking_lot",
+ "rand 0.10.1",
  "rcgen",
  "rusqlite",
  "rustc-hash",

@@ -243,10 +243,15 @@ where
 {
     type Output = std::io::Result<(u64, u64)>;
 
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         let this = self.get_mut();
-        let mut a_to_b_poll = transfer_one_direction(cx, &mut this.a_to_b, &mut *this.a, &mut *this.b);
-        let mut b_to_a_poll = transfer_one_direction(cx, &mut this.b_to_a, &mut *this.b, &mut *this.a);
+        let mut a_to_b_poll =
+            transfer_one_direction(cx, &mut this.a_to_b, &mut *this.a, &mut *this.b);
+        let mut b_to_a_poll =
+            transfer_one_direction(cx, &mut this.b_to_a, &mut *this.b, &mut *this.a);
 
         // Half-close handling: if one direction is fully done, shutdown the write half on the receiving end.
         if let std::task::Poll::Ready(Ok(())) = a_to_b_poll {
@@ -281,7 +286,10 @@ where
     }
 }
 
-pub async fn large_copy_bidirectional_fallback<A, B>(client: &mut A, backend: &mut B) -> std::io::Result<(u64, u64)>
+pub async fn large_copy_bidirectional_fallback<A, B>(
+    client: &mut A,
+    backend: &mut B,
+) -> std::io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -357,14 +365,14 @@ fn create_pipe() -> std::io::Result<(RawFd, RawFd)> {
     if res == -1 {
         return Err(std::io::Error::last_os_error());
     }
-    
+
     // Attempt to increase the pipe capacity to 1MB (1048576 bytes) for higher throughput.
     // F_SETPIPE_SZ is 1031 in Linux. Ignore errors if we hit hard limits.
     #[cfg(target_os = "linux")]
     unsafe {
         libc::fcntl(fds[1], libc::F_SETPIPE_SZ, 1048576);
     }
-    
+
     Ok((fds[0], fds[1]))
 }
 
@@ -482,12 +490,7 @@ pub async fn splice_bidirectional_with_pipes(
             let (p1_rd, p1_wr) = create_pipe()?;
             let (pipe1_rd, pipe1_wr) = (OwnedFd(p1_rd), OwnedFd(p1_wr));
             let (p2_rd, p2_wr) = create_pipe()?;
-            (
-                pipe1_rd,
-                pipe1_wr,
-                OwnedFd(p2_rd),
-                OwnedFd(p2_wr),
-            )
+            (pipe1_rd, pipe1_wr, OwnedFd(p2_rd), OwnedFd(p2_wr))
         }
     };
 

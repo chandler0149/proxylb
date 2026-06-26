@@ -182,7 +182,9 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                     }
                 };
 
-                if let Some(config) = tls_config {
+                let handshake_latency = start.elapsed();
+
+                let res = if let Some(config) = tls_config {
                     let connector = TlsConnector::from(config);
                     let domain = ServerName::try_from(target.host.clone()).map_err(|_| {
                         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid DNS name")
@@ -192,18 +194,19 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                 } else {
                     let mut stream = stream;
                     perform_http_get(&mut stream, &target).await
-                }
+                };
+                res.map(|_| handshake_latency)
             };
 
             match tokio::time::timeout(timeout, result).await {
-                Ok(Ok(_)) => {
+                Ok(Ok(handshake_latency)) => {
                     let latency = start.elapsed();
                     tracing::debug!(
                         backend = %info.name,
                         latency_ms = latency.as_millis() as u64,
                         "health check passed"
                     );
-                    pool.mark_healthy(index, latency);
+                    pool.mark_healthy(index, latency, Some(handshake_latency));
                 }
                 Ok(Err(e)) => {
                     tracing::debug!(

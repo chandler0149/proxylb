@@ -46,8 +46,6 @@ pub async fn run_http_inbound(
         let password = password.clone();
         let local_filter_manager = local_filter_manager.clone();
         async move {
-            
-            let client_stats = pool.client_manager.get_or_create(&client_id);
             if let Err(e) = handle_http_connection(
                 stream,
                 client_id.clone(),
@@ -58,7 +56,6 @@ pub async fn run_http_inbound(
                 username,
                 password,
                 route_idx,
-                client_stats,
             )
             .await
             {
@@ -72,7 +69,7 @@ pub async fn run_http_inbound(
 /// Handle a single HTTP connection.
 async fn handle_http_connection<S>(
     stream: S,
-    client_id: crate::backend::ClientId,
+    client_id: crate::stats::ClientId,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
@@ -80,7 +77,6 @@ async fn handle_http_connection<S>(
     username: Option<Arc<String>>,
     password: Option<Arc<String>>,
     route_idx: Option<usize>,
-    client_stats: Arc<crate::backend::ClientStats>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -189,9 +185,10 @@ where
         backend_stream,
         chosen_traffic,
         Some(stats),
-        Some(client_stats),
+        client_id,
         &target,
         "HTTP",
+        &pool,
     )
     .await
 }

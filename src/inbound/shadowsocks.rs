@@ -61,8 +61,6 @@ pub async fn run_shadowsocks_inbound(
         let tls_acceptor = tls_acceptor.clone();
         let local_filter_manager = local_filter_manager.clone();
         async move {
-            
-            let client_stats = pool.client_manager.get_or_create(&client_id);
             if let Err(e) = handle_ss_connection(
                 stream,
                 client_id.clone(),
@@ -74,7 +72,6 @@ pub async fn run_shadowsocks_inbound(
                 local_filter_manager.clone(),
                 tls_acceptor.as_deref().cloned(),
                 route_idx,
-                client_stats,
             )
             .await
             {
@@ -88,7 +85,7 @@ pub async fn run_shadowsocks_inbound(
 /// Handle a single Shadowsocks connection.
 async fn handle_ss_connection<S>(
     stream: S,
-    client_id: crate::backend::ClientId,
+    client_id: crate::stats::ClientId,
     context: SharedContext,
     method: CipherKind,
     key: &[u8],
@@ -97,7 +94,6 @@ async fn handle_ss_connection<S>(
     local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     route_idx: Option<usize>,
-    client_stats: Arc<crate::backend::ClientStats>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -157,9 +153,10 @@ where
         backend_stream,
         chosen_traffic,
         Some(stats),
-        Some(client_stats),
+        client_id,
         &target,
         "Shadowsocks",
+        &pool,
     )
     .await
 }

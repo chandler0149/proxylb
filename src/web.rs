@@ -47,7 +47,9 @@ struct ApiResponse {
     tree: Vec<crate::backend::TreeItem>,
     memory: MemStats,
     inbounds: Vec<crate::backend::InboundStatsView>,
-    clients: Vec<crate::backend::ClientStatsView>,
+    clients: Vec<crate::stats::ClientStatsView>,
+    domains: Vec<crate::stats::DomainStatsView>,
+    blocked_domains: Vec<crate::stats::DomainStatsView>,
     adblock: AdBlockStatusView,
 }
 
@@ -65,8 +67,12 @@ pub fn create_router(pool: BackendPool) -> Router {
         .route("/api/status", get(api_status))
         .route("/api/backends/{name}/enable", post(api_enable_backend))
         .route("/api/backends/{name}/disable", post(api_disable_backend))
-        .route("/api/filter/rules", axum::routing::get(api_get_rules).post(api_add_rule).delete(api_delete_rule))
-        .route("/api/filter/urls", axum::routing::get(api_get_urls).post(api_add_url).delete(api_delete_url))
+        .route(
+            "/api/filter/items",
+            axum::routing::get(api_get_items)
+                .post(api_add_item)
+                .delete(api_delete_item),
+        )
         .route("/api/filter/settings", post(api_set_filter_settings))
         .route("/api/filter/check", axum::routing::get(api_check_rule))
         .layer(cors)
@@ -238,7 +244,7 @@ async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
 
     let engine = pool.filter_manager.engine.load();
     let adblock = AdBlockStatusView {
-        enabled: **pool.filter_manager.enabled.load(),
+        enabled: pool.filter_manager.is_enabled(),
         block_rules_count: engine.block_rules_count,
         allow_rules_count: 0,
         blocked_requests: pool
@@ -247,26 +253,38 @@ async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
             .load(std::sync::atomic::Ordering::Relaxed),
     };
 
+    let domains = pool.domain_manager.get_views();
+    let blocked_domains = pool.filter_manager.blocked_domains_manager.get_views();
+
     Json(ApiResponse {
         backends,
         tree,
         memory,
         inbounds,
         clients,
+        domains,
+        blocked_domains,
         adblock,
     })
 }
 
 #[derive(serde::Deserialize)]
-pub struct RuleRequest {
-    pub rule: String,
+#[serde(tag = "type")]
+pub enum FilterItemRequest {
+    #[serde(rename = "rule")]
+    Rule { rules: Vec<String> },
+    #[serde(rename = "url")]
+    Url {
+        url: String,
+        #[serde(default)]
+        tag: String,
+    },
 }
 
-#[derive(serde::Deserialize)]
-pub struct UrlRequest {
-    pub url: String,
-    #[serde(default)]
-    pub tag: String,
+#[derive(serde::Serialize)]
+pub struct FilterItemsResponse {
+    pub rules: Vec<String>,
+    pub urls: Vec<crate::filter::FilterUrl>,
 }
 
 #[derive(serde::Deserialize)]
@@ -275,65 +293,87 @@ pub struct FilterSettingsRequest {
     pub block_private_addresses: bool,
 }
 
-async fn api_get_rules(State(pool): State<BackendPool>) -> impl IntoResponse {
+async fn api_get_items(State(pool): State<BackendPool>) -> impl IntoResponse {
     let rules = pool.filter_manager.get_rules();
-    Json(rules)
-}
-
-async fn api_add_rule(State(pool): State<BackendPool>, Json(req): Json<RuleRequest>) -> impl IntoResponse {
-    if pool.filter_manager.add_rule(&req.rule).await.is_ok() {
-        axum::http::StatusCode::OK
-    } else {
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    }
-}
-
-async fn api_delete_rule(State(pool): State<BackendPool>, Json(req): Json<RuleRequest>) -> impl IntoResponse {
-    if pool.filter_manager.delete_rule(&req.rule).await.is_ok() {
-        axum::http::StatusCode::OK
-    } else {
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    }
-}
-
-async fn api_get_urls(State(pool): State<BackendPool>) -> impl IntoResponse {
     let mut urls = pool.filter_manager.get_urls();
     let cache = pool.filter_manager.cached_remote_contents.read().await;
     for u in &mut urls {
         if let Some(content) = cache.get(&u.url) {
-            u.rule_count = content.lines().filter_map(crate::filter::parse_rule_line).count();
+            u.rule_count = content
+                .lines()
+                .filter_map(crate::filter::parse_rule_line)
+                .count();
         }
     }
-    Json(urls)
+    Json(FilterItemsResponse { rules, urls })
 }
 
-async fn api_add_url(State(pool): State<BackendPool>, Json(req): Json<UrlRequest>) -> impl IntoResponse {
-    match crate::filter::download_url(&pool, pool.filter_manager.backend.as_deref(), &req.url).await {
-        Ok(content) => {
-            if pool.filter_manager.add_url(&req.url, &req.tag, content).await.is_ok() {
+async fn api_add_item(
+    State(pool): State<BackendPool>,
+    Json(req): Json<FilterItemRequest>,
+) -> impl IntoResponse {
+    match req {
+        FilterItemRequest::Rule { rules } => {
+            if pool.filter_manager.add_rules(&rules).await.is_ok() {
                 axum::http::StatusCode::OK
             } else {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             }
         }
-        Err(e) => {
-            tracing::error!(url = %req.url, error = %e, "failed to download filter list from web UI");
-            axum::http::StatusCode::BAD_REQUEST
+        FilterItemRequest::Url { url, tag } => {
+            match crate::filter::download_url(&pool, pool.filter_manager.backend.as_deref(), &url)
+                .await
+            {
+                Ok(content) => {
+                    if pool
+                        .filter_manager
+                        .add_url(&url, &tag, content)
+                        .await
+                        .is_ok()
+                    {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(url = %url, error = %e, "failed to download filter list from web UI");
+                    axum::http::StatusCode::BAD_REQUEST
+                }
+            }
         }
     }
 }
 
-async fn api_delete_url(State(pool): State<BackendPool>, Json(req): Json<UrlRequest>) -> impl IntoResponse {
-    if pool.filter_manager.delete_url(&req.url).await.is_ok() {
-        axum::http::StatusCode::OK
-    } else {
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+async fn api_delete_item(
+    State(pool): State<BackendPool>,
+    Json(req): Json<FilterItemRequest>,
+) -> impl IntoResponse {
+    match req {
+        FilterItemRequest::Rule { rules } => {
+            if pool.filter_manager.delete_rules(&rules).await.is_ok() {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+        FilterItemRequest::Url { url, tag: _ } => {
+            if pool.filter_manager.delete_url(&url).await.is_ok() {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
     }
 }
 
-async fn api_set_filter_settings(State(pool): State<BackendPool>, Json(req): Json<FilterSettingsRequest>) -> impl IntoResponse {
+async fn api_set_filter_settings(
+    State(pool): State<BackendPool>,
+    Json(req): Json<FilterSettingsRequest>,
+) -> impl IntoResponse {
     pool.filter_manager.set_enabled(req.enabled);
-    pool.filter_manager.set_block_private(req.block_private_addresses);
+    pool.filter_manager
+        .set_block_private(req.block_private_addresses);
     axum::http::StatusCode::OK
 }
 
@@ -347,7 +387,10 @@ pub struct CheckResponse {
     pub blocked: bool,
 }
 
-async fn api_check_rule(State(pool): State<BackendPool>, axum::extract::Query(req): axum::extract::Query<CheckRequest>) -> impl IntoResponse {
+async fn api_check_rule(
+    State(pool): State<BackendPool>,
+    axum::extract::Query(req): axum::extract::Query<CheckRequest>,
+) -> impl IntoResponse {
     let target_addr = if let Ok(ip) = req.target.parse::<std::net::IpAddr>() {
         crate::outbound::TargetAddr::Ip(std::net::SocketAddr::new(ip, 0))
     } else {

@@ -57,8 +57,6 @@ pub async fn run_socks5_inbound(
             let arc_config = arc_config.clone();
             let local_filter_manager = local_filter_manager.clone();
             async move {
-                
-                let client_stats = pool.client_manager.get_or_create(&client_id);
                 if let Err(e) = handle_socks5_connection(
                     stream,
                     pool,
@@ -67,7 +65,7 @@ pub async fn run_socks5_inbound(
                     tls_acceptor.as_deref().cloned(),
                     arc_config,
                     route_idx,
-                    client_stats,
+                    client_id.clone(),
                 )
                 .await
                 {
@@ -89,8 +87,6 @@ pub async fn run_socks5_inbound(
             let arc_config = arc_config.clone();
             let local_filter_manager = local_filter_manager.clone();
             async move {
-                
-                let client_stats = pool.client_manager.get_or_create(&client_id);
                 if let Err(e) = handle_socks5_connection(
                     stream,
                     pool,
@@ -99,7 +95,7 @@ pub async fn run_socks5_inbound(
                     tls_acceptor.as_deref().cloned(),
                     arc_config,
                     route_idx,
-                    client_stats,
+                    client_id.clone(),
                 )
                 .await
                 {
@@ -121,7 +117,7 @@ async fn handle_socks5_connection<S, A>(
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     config: Arc<Config<A>>,
     route_idx: Option<usize>,
-    client_stats: Arc<crate::backend::ClientStats>,
+    client_id: crate::stats::ClientId,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -136,7 +132,15 @@ where
     };
 
     let socks5_socket = Socks5Socket::new(stream, config);
-    handle_socks5_handshake(socks5_socket, pool, stats, local_filter_manager, route_idx, client_stats).await
+    handle_socks5_handshake(
+        socks5_socket,
+        pool,
+        stats,
+        local_filter_manager,
+        route_idx,
+        client_id,
+    )
+    .await
 }
 
 #[allow(deprecated)]
@@ -146,7 +150,7 @@ async fn handle_socks5_handshake<S, A>(
     stats: Arc<crate::backend::InboundStats>,
     local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     route_idx: Option<usize>,
-    client_stats: Arc<crate::backend::ClientStats>,
+    client_id: crate::stats::ClientId,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -213,9 +217,10 @@ where
         backend_stream,
         chosen_traffic,
         Some(stats),
-        Some(client_stats),
+        client_id,
         &target,
         "SOCKS5",
+        &pool,
     )
     .await
 }

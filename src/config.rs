@@ -132,6 +132,8 @@ pub enum GroupStrategy {
     LoadBalance,
     #[serde(rename = "consistent_hashing")]
     ConsistentHashing,
+    #[serde(rename = "weighted_round_robin")]
+    WeightedRoundRobin,
 }
 
 impl Default for GroupStrategy {
@@ -526,7 +528,10 @@ impl Config {
                         if group_names.contains(m.as_str()) {
                             let s = *state.get(m.as_str()).unwrap_or(&0);
                             if s == 1 {
-                                anyhow::bail!("cycle detected in group hierarchy involving '{}'", m);
+                                anyhow::bail!(
+                                    "cycle detected in group hierarchy involving '{}'",
+                                    m
+                                );
                             } else if s == 0 {
                                 dfs(m.as_str(), group_map, group_names, state)?;
                             }
@@ -566,10 +571,7 @@ impl Config {
             };
             if let Some(r) = route {
                 if !group_names.contains(r.as_str()) && !backend_names.contains(r.as_str()) {
-                    anyhow::bail!(
-                        "inbound route '{}' refers to unknown group or backend",
-                        r
-                    );
+                    anyhow::bail!("inbound route '{}' refers to unknown group or backend", r);
                 }
             }
         }

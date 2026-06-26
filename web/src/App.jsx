@@ -73,12 +73,12 @@ function App() {
   const fetchFilterData = async () => {
     try {
       const host = apiHost.replace(/\/$/, '');
-      const [rulesRes, urlsRes] = await Promise.all([
-        fetch(`${host}/api/filter/rules`),
-        fetch(`${host}/api/filter/urls`)
-      ]);
-      if (rulesRes.ok) setFilterRules(await rulesRes.json());
-      if (urlsRes.ok) setFilterUrls(await urlsRes.json());
+      const res = await fetch(`${host}/api/filter/items`);
+      if (res.ok) {
+        const data = await res.json();
+        setFilterRules(data.rules || []);
+        setFilterUrls(data.urls || []);
+      }
     } catch (err) {
       console.error('Failed to fetch filter data', err);
     }
@@ -92,13 +92,16 @@ function App() {
 
   const handleAddRule = async () => {
     if (!newRule.trim()) return;
+    const rulesArray = newRule.split('\n').map(r => r.trim()).filter(r => r);
+    if (rulesArray.length === 0) return;
+
     setIsAddingRule(true);
     try {
       const host = apiHost.replace(/\/$/, '');
-      await fetch(`${host}/api/filter/rules`, {
+      await fetch(`${host}/api/filter/items`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rule: newRule.trim() })
+        body: JSON.stringify({ type: 'rule', rules: rulesArray })
       });
       setNewRule('');
       fetchFilterData();
@@ -110,10 +113,10 @@ function App() {
   const handleDeleteRule = async (rule) => {
     try {
       const host = apiHost.replace(/\/$/, '');
-      await fetch(`${host}/api/filter/rules`, {
+      await fetch(`${host}/api/filter/items`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rule })
+        body: JSON.stringify({ type: 'rule', rules: [rule] })
       });
       fetchFilterData();
       fetchStatus();
@@ -125,10 +128,10 @@ function App() {
     setIsAddingUrl(true);
     try {
       const host = apiHost.replace(/\/$/, '');
-      const res = await fetch(`${host}/api/filter/urls`, {
+      const res = await fetch(`${host}/api/filter/items`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: newUrl.trim(), tag: newUrlTag.trim() })
+        body: JSON.stringify({ type: 'url', url: newUrl.trim(), tag: newUrlTag.trim() })
       });
       if (!res.ok) throw new Error('Failed to add list (maybe invalid or unreachable)');
       setNewUrl('');
@@ -142,10 +145,10 @@ function App() {
   const handleDeleteUrl = async (urlObj) => {
     try {
       const host = apiHost.replace(/\/$/, '');
-      await fetch(`${host}/api/filter/urls`, {
+      await fetch(`${host}/api/filter/items`, {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: urlObj.url })
+        body: JSON.stringify({ type: 'url', url: urlObj.url })
       });
       fetchFilterData();
       fetchStatus();
@@ -279,7 +282,10 @@ function App() {
         <div className="metrics">
           <div className="metric">
             <span className="metric-label">Latency</span>
-            <span className="metric-value">{b.last_latency_ms != null ? `${b.last_latency_ms} ms` : '—'}</span>
+            <span className="metric-value">
+              {b.last_latency_ms != null ? `${b.last_latency_ms} ms` : '—'}
+              {b.handshake_latency_ms != null ? ` (HS: ${b.handshake_latency_ms} ms)` : ''}
+            </span>
           </div>
           <div className="metric">
             <span className="metric-label">Failures</span>
@@ -342,7 +348,7 @@ function App() {
                 <tr>
                   <th>Time</th>
                   <th>Status</th>
-                  <th>Latency</th>
+                  <th>Latency (HS)</th>
                   <th>Error</th>
                 </tr>
               </thead>
@@ -353,7 +359,10 @@ function App() {
                     <td className={h.success ? 'history-success' : 'history-fail'}>
                       {h.success ? '✓ OK' : '✗ FAIL'}
                     </td>
-                    <td>{h.latency_ms != null ? `${h.latency_ms} ms` : '—'}</td>
+                    <td>
+                      {h.latency_ms != null ? `${h.latency_ms} ms` : '—'}
+                      {h.handshake_latency_ms != null ? ` (${h.handshake_latency_ms} ms)` : ''}
+                    </td>
                     <td className="error-text" title={h.error || ''}>
                       {h.error || '—'}
                     </td>
@@ -391,16 +400,16 @@ function App() {
 
       return (
         <div key={`tree-${item.name}-${index}`} className="tree-node-wrapper">
-          <div className="tree-group-card">
-            <div className="tree-group-header">
-              <div className="tree-group-title">
+          <div className="card group-card">
+            <div className="card-header" style={{ alignItems: 'center' }}>
+              <div className="card-name" style={{ fontSize: '1.15rem' }}>
                 <span>📂 Group: {item.name}</span>
               </div>
-              <span className="tree-group-strategy">{item.strategy}</span>
+              <span className="card-group-tag" style={{ background: 'rgba(0, 176, 255, 0.1)', color: 'var(--accent-blue)', border: '1px solid rgba(0, 176, 255, 0.2)', padding: '3px 10px', borderRadius: '12px', fontSize: '0.8rem', textTransform: 'uppercase', fontWeight: 600 }}>{item.strategy}</span>
             </div>
-            <div className="tree-group-children">
-              {sortedMembers.map((m, i) => renderTreeItem(m, i))}
-            </div>
+          </div>
+          <div className="tree-group-children">
+            {sortedMembers.map((m, i) => renderTreeItem(m, i))}
           </div>
         </div>
       );
@@ -613,6 +622,12 @@ function App() {
             >
               Clients (IP Stats)
             </button>
+            <button
+              className={`tab-btn ${activeTab === 'domains' ? 'active' : ''}`}
+              onClick={() => setActiveTab('domains')}
+            >
+              Top Domains
+            </button>
           </div>
         </div>
 
@@ -659,7 +674,6 @@ function App() {
                   <thead>
                     <tr>
                       <th>IP Address</th>
-                      <th>Active Conn</th>
                       <th>Total Conn</th>
                       <th>Upload</th>
                       <th>Download</th>
@@ -672,9 +686,6 @@ function App() {
                       return (
                         <tr key={idx}>
                           <td style={{ fontWeight: 'bold', fontFamily: 'monospace' }}>{c.ip}</td>
-                          <td style={{ color: c.active_connections > 0 ? 'var(--accent-blue)' : 'inherit' }}>
-                            {c.active_connections}
-                          </td>
                           <td>{c.total_connections}</td>
                           <td style={{ color: '#ffa726' }}>{formatBytes(c.tx_bytes)}</td>
                           <td style={{ color: 'var(--accent-green)' }}>{formatBytes(c.rx_bytes)}</td>
@@ -687,6 +698,43 @@ function App() {
               </div>
             ) : (
               <div className="empty-state">No client statistics available</div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'domains' && (
+          <div className="filter-panel" style={{ background: 'var(--card-bg)', borderRadius: '16px', padding: '1.5rem', border: '1px solid var(--border-color)' }}>
+            <h3 style={{ margin: '0 0 1.5rem 0', color: 'var(--text-primary)' }}>Top Parent Domains</h3>
+            {data?.domains && data.domains.length > 0 ? (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="history-table" style={{ width: '100%', textAlign: 'left' }}>
+                  <thead>
+                    <tr>
+                      <th>Domain</th>
+                      <th>Total Conn</th>
+                      <th>Upload</th>
+                      <th>Download</th>
+                      <th>Total Bandwidth</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.domains.map((d, idx) => {
+                      const totalBandwidth = (d.tx_bytes || 0) + (d.rx_bytes || 0);
+                      return (
+                        <tr key={idx}>
+                          <td style={{ fontWeight: 'bold' }}>{d.domain}</td>
+                          <td>{d.total_connections}</td>
+                          <td style={{ color: '#ffa726' }}>{formatBytes(d.tx_bytes)}</td>
+                          <td style={{ color: 'var(--accent-green)' }}>{formatBytes(d.rx_bytes)}</td>
+                          <td style={{ fontWeight: 'bold' }}>{formatBytes(totalBandwidth)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state">No domain statistics available</div>
             )}
           </div>
         )}
@@ -708,20 +756,46 @@ function App() {
               </label>
             </div>
 
+            <div style={{ marginBottom: '2rem' }}>
+              <h4>Top Blocked Domains</h4>
+              {data?.blocked_domains && data.blocked_domains.length > 0 ? (
+                <div style={{ overflowX: 'auto' }}>
+                  <table className="history-table" style={{ width: '100%', textAlign: 'left' }}>
+                    <thead>
+                      <tr>
+                        <th>Domain</th>
+                        <th>Times Blocked</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.blocked_domains.map((d, idx) => (
+                        <tr key={idx}>
+                          <td style={{ fontWeight: 'bold', color: 'var(--text-primary)' }}>{d.domain}</td>
+                          <td style={{ color: '#e57373', fontWeight: 'bold' }}>{d.total_connections}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>No domains blocked yet.</div>
+              )}
+            </div>
+
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem' }}>
               {/* Rules List */}
               <div className="filter-list-section">
                 <h4>Dynamic Rules ({filterRules.length})</h4>
-                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem' }}>
-                  <input 
-                    type="text" 
+                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', alignItems: 'flex-start' }}>
+                  <textarea 
                     value={newRule}
                     onChange={e => setNewRule(e.target.value)}
-                    placeholder="e.g. ad.example.com"
-                    style={{ flex: 1, padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}
+                    placeholder="e.g. ad.example.com (one per line)"
+                    rows={3}
+                    style={{ flex: 1, padding: '0.5rem', borderRadius: '8px', border: '1px solid var(--border-subtle)', background: 'var(--bg-card)', color: 'var(--text-primary)', resize: 'vertical' }}
                   />
-                  <button onClick={handleAddRule} disabled={isAddingRule} className="tab-btn active" style={{ padding: '0.5rem 1rem', opacity: isAddingRule ? 0.7 : 1 }}>
-                    {isAddingRule ? 'Adding...' : 'Add'}
+                  <button onClick={handleAddRule} disabled={isAddingRule} className="tab-btn active" style={{ padding: '0.5rem 1rem', opacity: isAddingRule ? 0.7 : 1, whiteSpace: 'nowrap' }}>
+                    {isAddingRule ? 'Rebuilding...' : 'Add Rules'}
                   </button>
                 </div>
                 <div style={{ maxHeight: '300px', overflowY: 'auto', background: 'rgba(0,0,0,0.2)', borderRadius: '8px', padding: '0.5rem' }}>

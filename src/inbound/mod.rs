@@ -9,6 +9,9 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) static WRR_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 // ─── Unified listener abstraction ────────────────────────────────────────────
 
 /// A bound listener that accepts either TCP or Unix-domain-socket connections.
@@ -20,12 +23,15 @@ pub enum BoundListener {
 impl BoundListener {
     /// Bind to `addr`. A `unix://…` prefix selects a UDS listener; anything
     /// else is treated as a TCP `host:port`.
-    pub async fn bind(addr: &str, prebound_uds: Option<std::os::unix::net::UnixListener>) -> anyhow::Result<Self> {
+    pub async fn bind(
+        addr: &str,
+        prebound_uds: Option<std::os::unix::net::UnixListener>,
+    ) -> anyhow::Result<Self> {
         if let Some(uds) = prebound_uds {
             uds.set_nonblocking(true)?;
             return Ok(Self::Unix(UnixListener::from_std(uds)?));
         }
-        
+
         if let Some(path) = addr.strip_prefix("unix://") {
             if let Some(parent) = std::path::Path::new(path).parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -41,15 +47,15 @@ impl BoundListener {
             } else {
                 socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?
             };
-            
+
             socket.set_reuse_address(true)?;
             #[cfg(not(windows))]
             socket.set_reuse_port(true)?;
-            
+
             socket.set_nonblocking(true)?;
             socket.bind(&addr_parsed.into())?;
             socket.listen(1024)?;
-            
+
             let std_listener: std::net::TcpListener = socket.into();
             Ok(Self::Tcp(TcpListener::from_std(std_listener)?))
         }
@@ -57,16 +63,16 @@ impl BoundListener {
 
     /// Accept one connection and return the stream together with a display
     /// string for the remote address.
-    pub async fn accept(&self) -> std::io::Result<(InboundStream, crate::backend::ClientId)> {
+    pub async fn accept(&self) -> std::io::Result<(InboundStream, crate::stats::ClientId)> {
         match self {
             BoundListener::Tcp(l) => {
                 let (s, addr) = l.accept().await?;
                 let _ = s.set_nodelay(true);
-                Ok((InboundStream::Tcp(s), crate::backend::ClientId::Ip(addr.ip())))
+                Ok((InboundStream::Tcp(s), crate::stats::ClientId::Ip(addr.ip())))
             }
             BoundListener::Unix(l) => {
                 let (s, _addr) = l.accept().await?;
-                Ok((InboundStream::Unix(s), crate::backend::ClientId::Unix))
+                Ok((InboundStream::Unix(s), crate::stats::ClientId::Unix))
             }
         }
     }
@@ -150,7 +156,7 @@ pub async fn run_accept_loop<F, Fut>(
     on_accept: F,
 ) -> anyhow::Result<()>
 where
-    F: Fn(InboundStream, crate::backend::ClientId) -> Fut + Send + Sync + 'static,
+    F: Fn(InboundStream, crate::stats::ClientId) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     loop {
@@ -171,17 +177,26 @@ where
 /// When `route` is `Some`, uses route-specific candidates (bound to a group or backend).
 /// When `route` is `None`, uses the global failover order.
 
-fn extract_parent_domain(target: &TargetAddr) -> String {
-    match target {
-        TargetAddr::Ip(addr) => addr.ip().to_string(),
-        TargetAddr::Domain(host, _) => {
-            let parts: Vec<&str> = host.split('.').collect();
-            if parts.len() >= 2 {
-                format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
-            } else {
-                host.clone()
+/// Extract the parent domain (e.g. "example.com" from "sub.example.com") without allocation.
+/// Returns a `&str` slice into the input — zero heap allocation.
+pub fn extract_parent_domain_str(host: &str) -> &str {
+    let bytes = host.as_bytes();
+    let mut dot_count = 0u8;
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] == b'.' {
+            dot_count += 1;
+            if dot_count == 2 {
+                return &host[i + 1..];
             }
         }
+    }
+    host // single-label or two-label domain — return as-is
+}
+
+pub fn extract_parent_domain(target: &TargetAddr) -> String {
+    match target {
+        TargetAddr::Ip(addr) => addr.ip().to_string(),
+        TargetAddr::Domain(host, _) => extract_parent_domain_str(host).to_string(),
     }
 }
 
@@ -213,20 +228,53 @@ pub async fn route_and_connect(
     let mut backend_stream: Option<crate::outbound::BackendStream> = None;
     let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
 
-        let iterator: Vec<(usize, std::sync::Arc<crate::backend::BackendInfo>)> = if candidates.strategy == crate::config::GroupStrategy::ConsistentHashing && !healthy.is_empty() && !candidates.hash_ring.is_empty() {
+    let iterator: Vec<(usize, std::sync::Arc<crate::backend::BackendInfo>)> = if candidates.strategy
+        == crate::config::GroupStrategy::ConsistentHashing
+        && !healthy.is_empty()
+        && !candidates.hash_ring.is_empty()
+    {
         let parent_domain = extract_parent_domain(target);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&parent_domain, &mut hasher);
         let target_hash = std::hash::Hasher::finish(&hasher);
-        
-        let idx = match candidates.hash_ring.binary_search_by_key(&target_hash, |(h, _)| *h) {
+
+        let idx = match candidates
+            .hash_ring
+            .binary_search_by_key(&target_hash, |(h, _)| *h)
+        {
             Ok(idx) => idx,
-            Err(idx) => if idx == candidates.hash_ring.len() { 0 } else { idx },
+            Err(idx) => {
+                if idx == candidates.hash_ring.len() {
+                    0
+                } else {
+                    idx
+                }
+            }
         };
-        
+
         let array_idx = candidates.hash_ring[idx].1;
-        
-        healthy[array_idx..].iter().chain(healthy[..array_idx].iter()).cloned().collect()
+
+        healthy[array_idx..]
+            .iter()
+            .chain(healthy[..array_idx].iter())
+            .cloned()
+            .collect()
+    } else if candidates.strategy == crate::config::GroupStrategy::WeightedRoundRobin
+        && !healthy.is_empty()
+        && !candidates.wrr_choices.is_empty()
+    {
+        let count = WRR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let idx = count % candidates.wrr_choices.len();
+        let target_backend_idx = candidates.wrr_choices[idx];
+
+        let mut result = Vec::with_capacity(healthy.len());
+        if let Some(pos) = healthy.iter().position(|(i, _)| *i == target_backend_idx) {
+            result.extend(healthy[pos..].iter().cloned());
+            result.extend(healthy[..pos].iter().cloned());
+        } else {
+            result.extend(healthy.iter().cloned());
+        }
+        result
     } else {
         healthy.clone()
     };
@@ -355,9 +403,10 @@ pub async fn relay_and_track<I>(
     mut backend_stream: crate::outbound::BackendStream,
     traffic: Arc<crate::backend::TrafficCounters>,
     inbound_stats: Option<Arc<crate::backend::InboundStats>>,
-    client_stats: Option<Arc<crate::backend::ClientStats>>,
+    client_id: crate::stats::ClientId,
     target: &TargetAddr,
     protocol_name: &str,
+    pool: &crate::backend::BackendPool,
 ) -> Result<(), anyhow::Error>
 where
     I: tokio::io::AsyncRead
@@ -376,10 +425,9 @@ where
         stats.total_connections.fetch_add(1, Ordering::Relaxed);
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
     }
-    if let Some(ref stats) = client_stats {
-        stats.total_connections.fetch_add(1, Ordering::Relaxed);
-        stats.active_connections.fetch_add(1, Ordering::Relaxed);
-    }
+
+    let mut final_up = 0;
+    let mut final_down = 0;
 
     match crate::relay::relay(&mut inbound_stream, &mut backend_stream).await {
         Ok((up, down)) => {
@@ -396,10 +444,8 @@ where
                 stats.tx_bytes.fetch_add(up, Ordering::Relaxed);
                 stats.rx_bytes.fetch_add(down, Ordering::Relaxed);
             }
-            if let Some(ref stats) = client_stats {
-                stats.tx_bytes.fetch_add(up, Ordering::Relaxed);
-                stats.rx_bytes.fetch_add(down, Ordering::Relaxed);
-            }
+            final_up = up;
+            final_down = down;
         }
         Err(e) => {
             tracing::debug!(
@@ -415,9 +461,30 @@ where
     if let Some(ref stats) = inbound_stats {
         stats.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
-    if let Some(ref stats) = client_stats {
-        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
-    }
+
+    // --- Deferred Stats Collection ---
+    // Extract parent domain for tracking
+    let domain = extract_parent_domain(target);
+
+    // Lookup/Create stats in the background (no impact on startup)
+    let domain_stats = pool.domain_manager.get_or_create(&domain);
+    let client_stats = pool.client_manager.get_or_create(&client_id);
+
+    domain_stats
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+    domain_stats.tx_bytes.fetch_add(final_up, Ordering::Relaxed);
+    domain_stats
+        .rx_bytes
+        .fetch_add(final_down, Ordering::Relaxed);
+
+    client_stats
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+    client_stats.tx_bytes.fetch_add(final_up, Ordering::Relaxed);
+    client_stats
+        .rx_bytes
+        .fetch_add(final_down, Ordering::Relaxed);
 
     // Flush the write-halves so peers see a clean EOF before we release the FDs.
     let _ = inbound_stream.shutdown().await;

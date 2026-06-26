@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use std::time::Duration;
-use std::sync::atomic::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use crate::config::{GroupConfig, GroupStrategy};
 use crate::backend::{BackendEntry, BackendInfo};
+use crate::config::{GroupConfig, GroupStrategy};
 
 #[derive(Debug, Clone)]
 pub enum GroupMember {
@@ -61,6 +61,7 @@ pub fn build_hash_ring(healthy: &[(usize, Arc<BackendInfo>)]) -> Vec<(u64, usize
 pub struct CachedCandidates {
     pub strategy: crate::config::GroupStrategy,
     pub hash_ring: Vec<(u64, usize)>,
+    pub wrr_choices: Vec<usize>,
     pub healthy: Vec<(usize, Arc<BackendInfo>)>,
     pub unhealthy: Vec<(usize, Arc<BackendInfo>)>,
 }
@@ -201,7 +202,9 @@ pub fn apply_strategy_sort_nested(
                     .unwrap_or(Duration::MAX)
             });
         }
-        GroupStrategy::Failover | GroupStrategy::ConsistentHashing => {
+        GroupStrategy::Failover
+        | GroupStrategy::ConsistentHashing
+        | GroupStrategy::WeightedRoundRobin => {
             // Keep configured order
         }
         GroupStrategy::LoadBalance => {
@@ -225,7 +228,10 @@ pub fn deduplicate_candidates(
     raw_h: Vec<usize>,
     raw_u: Vec<usize>,
     entries: &[BackendEntry],
-) -> (Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
+) -> (
+    Vec<(usize, Arc<BackendInfo>)>,
+    Vec<(usize, Arc<BackendInfo>)>,
+) {
     let mut h = Vec::new();
     let mut u = Vec::new();
     let mut added_h = std::collections::HashSet::new();
@@ -252,7 +258,10 @@ pub fn calculate_candidates(
     entries: &[BackendEntry],
     groups: &[Group],
     failover_order: &[Target],
-) -> (Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
+) -> (
+    Vec<(usize, Arc<BackendInfo>)>,
+    Vec<(usize, Arc<BackendInfo>)>,
+) {
     let mut raw_h = Vec::new();
     let mut raw_u = Vec::new();
 
@@ -288,7 +297,11 @@ pub fn calculate_route_candidates(
     route: &str,
     entries: &[BackendEntry],
     groups: &[Group],
-) -> (crate::config::GroupStrategy, Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
+) -> (
+    crate::config::GroupStrategy,
+    Vec<(usize, Arc<BackendInfo>)>,
+    Vec<(usize, Arc<BackendInfo>)>,
+) {
     if let Some(group) = groups.iter().find(|g| g.name == route) {
         let (raw_h, raw_u) = collect_group_candidates_recursive(group, entries, groups);
         let (h, u) = deduplicate_candidates(raw_h, raw_u, entries);
@@ -300,13 +313,88 @@ pub fn calculate_route_candidates(
             let status = entry.status.lock();
             if status.enabled {
                 if status.healthy {
-                    return (crate::config::GroupStrategy::Failover, vec![(idx, Arc::clone(&entry.info))], vec![]);
+                    return (
+                        crate::config::GroupStrategy::Failover,
+                        vec![(idx, Arc::clone(&entry.info))],
+                        vec![],
+                    );
                 } else {
-                    return (crate::config::GroupStrategy::Failover, vec![], vec![(idx, Arc::clone(&entry.info))]);
+                    return (
+                        crate::config::GroupStrategy::Failover,
+                        vec![],
+                        vec![(idx, Arc::clone(&entry.info))],
+                    );
                 }
             }
         }
     }
 
     (crate::config::GroupStrategy::Failover, vec![], vec![])
+}
+
+pub fn build_wrr_choices(
+    healthy: &[(usize, Arc<BackendInfo>)],
+    entries: &[BackendEntry],
+) -> Vec<usize> {
+    if healthy.is_empty() {
+        return vec![];
+    }
+
+    let mut costs = Vec::with_capacity(healthy.len());
+    let mut max_cost = 0u64;
+
+    for (idx, _) in healthy {
+        let cost = if let Some(e) = entries.get(*idx) {
+            e.traffic.bytes_down.load(Ordering::Relaxed)
+                + e.traffic.bytes_up.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        costs.push((*idx, cost));
+        if cost > max_cost {
+            max_cost = cost;
+        }
+    }
+
+    // Weight = (max_cost - cost) + baseline
+    let baseline = max_cost / 10 + 1;
+    let mut weights = Vec::with_capacity(costs.len());
+    let mut total_weight = 0u64;
+
+    for (idx, cost) in costs {
+        let weight = (max_cost - cost) + baseline;
+        weights.push((idx, weight));
+        total_weight += weight;
+    }
+
+    let mut wrr_choices = Vec::with_capacity(100);
+    if total_weight == 0 {
+        for (idx, _) in healthy {
+            wrr_choices.push(*idx);
+        }
+        return wrr_choices;
+    }
+
+    for (idx, weight) in &weights {
+        let slots = ((*weight as f64 / total_weight as f64) * 100.0).round() as usize;
+        for _ in 0..slots {
+            if wrr_choices.len() < 100 {
+                wrr_choices.push(*idx);
+            }
+        }
+    }
+
+    while wrr_choices.len() < 100 {
+        if let Some(&(idx, _)) = weights.first() {
+            wrr_choices.push(idx);
+        } else {
+            break;
+        }
+    }
+
+    // Randomize the distribution so it's smooth
+    use rand::seq::SliceRandom;
+    wrr_choices.shuffle(&mut rand::rng());
+
+    wrr_choices
 }

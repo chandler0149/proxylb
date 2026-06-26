@@ -3,15 +3,16 @@
 //! Accepts SOCKS5 and Shadowsocks inbound connections, forwards them through
 //! an ordered list of SOCKS5h backends with health checking and failover.
 
-mod filter;
 mod backend;
-mod scheduler;
 mod config;
+mod filter;
 mod health;
 mod inbound;
 mod outbound;
 mod relay;
 mod route_watcher;
+mod scheduler;
+pub mod stats;
 pub mod tls;
 mod web;
 
@@ -171,8 +172,13 @@ async fn main_async(
         let token = adblock_cancel.clone();
         let adblock_manager = pool.filter_manager.clone();
         ancillary_handles.push(ancillary_handle.spawn(async move {
-            crate::filter::start_filter_manager(adblock_manager, adblock_pool, adblock_config, token)
-                .await;
+            crate::filter::start_filter_manager(
+                adblock_manager,
+                adblock_pool,
+                adblock_config,
+                token,
+            )
+            .await;
         }));
     }
 
@@ -217,7 +223,8 @@ async fn main_async(
     // Pre-bind all UDS listeners so they can be cloned across multiple threads.
     // This allows the Linux kernel to natively load-balance incoming UDS
     // connections across all worker thread epoll instances (thundering herd).
-    let mut uds_listeners: std::collections::HashMap<String, std::os::unix::net::UnixListener> = std::collections::HashMap::new();
+    let mut uds_listeners: std::collections::HashMap<String, std::os::unix::net::UnixListener> =
+        std::collections::HashMap::new();
     for inbound_item in config.all_inbounds() {
         let listen = match &inbound_item {
             crate::config::InboundItemConfig::Socks5 { listen, .. } => listen,
@@ -234,8 +241,12 @@ async fn main_async(
                     let _ = std::fs::remove_file(path);
                 }
                 match std::os::unix::net::UnixListener::bind(path) {
-                    Ok(l) => { uds_listeners.insert(listen.clone(), l); }
-                    Err(e) => { tracing::error!("Failed to pre-bind UDS socket {}: {}", path, e); }
+                    Ok(l) => {
+                        uds_listeners.insert(listen.clone(), l);
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to pre-bind UDS socket {}: {}", path, e);
+                    }
                 }
             }
         }
@@ -248,7 +259,7 @@ async fn main_async(
         let pool = pool.clone();
         let config = config.clone();
         let cancel = inbound_cancel.clone();
-        
+
         let mut local_uds_listeners = std::collections::HashMap::new();
         for (k, v) in &uds_listeners {
             if let Ok(cloned) = v.try_clone() {
@@ -272,7 +283,7 @@ async fn main_async(
 
                 rt.block_on(async move {
                     let mut handles = Vec::new();
-                    
+
                     for inbound_item in config.all_inbounds() {
                         let listen_addr = match &inbound_item {
                             crate::config::InboundItemConfig::Socks5 { listen, .. } => listen,
@@ -281,7 +292,7 @@ async fn main_async(
                             crate::config::InboundItemConfig::Mtproto { listen, .. } => listen,
                         };
                         let prebound_uds = local_uds_listeners.remove(listen_addr);
-                        
+
                         let inbound_pool = pool.clone();
                         let cancel_clone = cancel.clone();
                         match inbound_item {
@@ -294,13 +305,21 @@ async fn main_async(
                                 route,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
-                                    let mgr = std::sync::Arc::new(crate::filter::FilterManager::new(f, None));
+                                    let mgr = std::sync::Arc::new(
+                                        crate::filter::FilterManager::new(f, None),
+                                    );
                                     let cancel_for_filter = cancel_clone.clone();
                                     let pool_for_filter = inbound_pool.clone();
                                     let f_clone = f.clone();
                                     let mgr_clone = mgr.clone();
                                     tokio::spawn(async move {
-                                        crate::filter::start_filter_manager(mgr_clone, pool_for_filter, f_clone, cancel_for_filter).await;
+                                        crate::filter::start_filter_manager(
+                                            mgr_clone,
+                                            pool_for_filter,
+                                            f_clone,
+                                            cancel_for_filter,
+                                        )
+                                        .await;
                                     });
                                     mgr
                                 });
@@ -309,11 +328,23 @@ async fn main_async(
                                     listen.clone(),
                                     "socks5".to_string(),
                                 );
-                                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
+                                let route_idx =
+                                    route.as_ref().and_then(|r| pool.get_route_index(r));
                                 handles.push(tokio::spawn(async move {
                                     if let Err(e) = crate::inbound::socks5::run_socks5_inbound(
-                                        listen, inbound_pool, stats, local_filter_manager, tls_cfg, username, password, route_idx, cancel_clone, prebound_uds
-                                    ).await {
+                                        listen,
+                                        inbound_pool,
+                                        stats,
+                                        local_filter_manager,
+                                        tls_cfg,
+                                        username,
+                                        password,
+                                        route_idx,
+                                        cancel_clone,
+                                        prebound_uds,
+                                    )
+                                    .await
+                                    {
                                         tracing::error!(error = %e, "SOCKS5 inbound failed");
                                     }
                                 }));
@@ -327,13 +358,21 @@ async fn main_async(
                                 route,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
-                                    let mgr = std::sync::Arc::new(crate::filter::FilterManager::new(f, None));
+                                    let mgr = std::sync::Arc::new(
+                                        crate::filter::FilterManager::new(f, None),
+                                    );
                                     let cancel_for_filter = cancel_clone.clone();
                                     let pool_for_filter = inbound_pool.clone();
                                     let f_clone = f.clone();
                                     let mgr_clone = mgr.clone();
                                     tokio::spawn(async move {
-                                        crate::filter::start_filter_manager(mgr_clone, pool_for_filter, f_clone, cancel_for_filter).await;
+                                        crate::filter::start_filter_manager(
+                                            mgr_clone,
+                                            pool_for_filter,
+                                            f_clone,
+                                            cancel_for_filter,
+                                        )
+                                        .await;
                                     });
                                     mgr
                                 });
@@ -342,11 +381,24 @@ async fn main_async(
                                     listen.clone(),
                                     "shadowsocks".to_string(),
                                 );
-                                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
+                                let route_idx =
+                                    route.as_ref().and_then(|r| pool.get_route_index(r));
                                 handles.push(tokio::spawn(async move {
-                                    if let Err(e) = crate::inbound::shadowsocks::run_shadowsocks_inbound(
-                                        listen, password, method, inbound_pool, stats, local_filter_manager, tls_cfg, route_idx, cancel_clone, prebound_uds
-                                    ).await {
+                                    if let Err(e) =
+                                        crate::inbound::shadowsocks::run_shadowsocks_inbound(
+                                            listen,
+                                            password,
+                                            method,
+                                            inbound_pool,
+                                            stats,
+                                            local_filter_manager,
+                                            tls_cfg,
+                                            route_idx,
+                                            cancel_clone,
+                                            prebound_uds,
+                                        )
+                                        .await
+                                    {
                                         tracing::error!(error = %e, "Shadowsocks inbound failed");
                                     }
                                 }));
@@ -360,13 +412,21 @@ async fn main_async(
                                 route,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
-                                    let mgr = std::sync::Arc::new(crate::filter::FilterManager::new(f, None));
+                                    let mgr = std::sync::Arc::new(
+                                        crate::filter::FilterManager::new(f, None),
+                                    );
                                     let cancel_for_filter = cancel_clone.clone();
                                     let pool_for_filter = inbound_pool.clone();
                                     let f_clone = f.clone();
                                     let mgr_clone = mgr.clone();
                                     tokio::spawn(async move {
-                                        crate::filter::start_filter_manager(mgr_clone, pool_for_filter, f_clone, cancel_for_filter).await;
+                                        crate::filter::start_filter_manager(
+                                            mgr_clone,
+                                            pool_for_filter,
+                                            f_clone,
+                                            cancel_for_filter,
+                                        )
+                                        .await;
                                     });
                                     mgr
                                 });
@@ -375,11 +435,23 @@ async fn main_async(
                                     listen.clone(),
                                     "http".to_string(),
                                 );
-                                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
+                                let route_idx =
+                                    route.as_ref().and_then(|r| pool.get_route_index(r));
                                 handles.push(tokio::spawn(async move {
                                     if let Err(e) = crate::inbound::http::run_http_inbound(
-                                        listen, inbound_pool, stats, local_filter_manager, tls_cfg, username, password, route_idx, cancel_clone, prebound_uds
-                                    ).await {
+                                        listen,
+                                        inbound_pool,
+                                        stats,
+                                        local_filter_manager,
+                                        tls_cfg,
+                                        username,
+                                        password,
+                                        route_idx,
+                                        cancel_clone,
+                                        prebound_uds,
+                                    )
+                                    .await
+                                    {
                                         tracing::error!(error = %e, "HTTP inbound failed");
                                     }
                                 }));
@@ -392,13 +464,21 @@ async fn main_async(
                                 route,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
-                                    let mgr = std::sync::Arc::new(crate::filter::FilterManager::new(f, None));
+                                    let mgr = std::sync::Arc::new(
+                                        crate::filter::FilterManager::new(f, None),
+                                    );
                                     let cancel_for_filter = cancel_clone.clone();
                                     let pool_for_filter = inbound_pool.clone();
                                     let f_clone = f.clone();
                                     let mgr_clone = mgr.clone();
                                     tokio::spawn(async move {
-                                        crate::filter::start_filter_manager(mgr_clone, pool_for_filter, f_clone, cancel_for_filter).await;
+                                        crate::filter::start_filter_manager(
+                                            mgr_clone,
+                                            pool_for_filter,
+                                            f_clone,
+                                            cancel_for_filter,
+                                        )
+                                        .await;
                                     });
                                     mgr
                                 });
@@ -407,11 +487,22 @@ async fn main_async(
                                     listen.clone(),
                                     "mtproto".to_string(),
                                 );
-                                let route_idx = route.as_ref().and_then(|r| pool.get_route_index(r));
+                                let route_idx =
+                                    route.as_ref().and_then(|r| pool.get_route_index(r));
                                 handles.push(tokio::spawn(async move {
                                     if let Err(e) = crate::inbound::mtproto::run_mtproto_inbound(
-                                        listen, inbound_pool, stats, local_filter_manager, secret, tls_cfg, route_idx, cancel_clone, prebound_uds
-                                    ).await {
+                                        listen,
+                                        inbound_pool,
+                                        stats,
+                                        local_filter_manager,
+                                        secret,
+                                        tls_cfg,
+                                        route_idx,
+                                        cancel_clone,
+                                        prebound_uds,
+                                    )
+                                    .await
+                                    {
                                         tracing::error!(error = %e, "MTProto inbound failed");
                                     }
                                 }));
@@ -420,19 +511,24 @@ async fn main_async(
                     }
 
                     // Wait forever unless cancelled
-                    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-                    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+                    let mut sigterm =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .unwrap();
+                    let mut sigint =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                            .unwrap();
                     tokio::select! {
                         _ = sigterm.recv() => {}
                         _ = sigint.recv() => {}
                         _ = cancel.cancelled() => {}
                     }
-                    
+
                     for h in handles {
                         let _ = h.await;
                     }
                 });
-            }).unwrap();
+            })
+            .unwrap();
         worker_threads.push(thread);
     }
 
@@ -474,7 +570,8 @@ async fn main_async(
         for handle in worker_threads {
             let _ = handle.join();
         }
-    }).await?;
+    })
+    .await?;
 
     adblock_cancel.cancel();
     health_cancel.cancel();
@@ -508,9 +605,7 @@ async fn perform_hot_reload(
     warn_if_inbounds_changed(initial_inbounds, &new_config.all_inbounds());
 
     // Update filter enabled state.
-    pool.filter_manager
-        .enabled
-        .store(std::sync::Arc::new(new_config.filter.enabled));
+    pool.filter_manager.set_enabled(new_config.filter.enabled);
 
     // Cancel old filter task and spawn a new one if enabled.
     adblock_cancel.cancel();

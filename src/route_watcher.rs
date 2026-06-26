@@ -27,13 +27,14 @@ pub fn start_route_watcher(
 
             let mut epoch = 0u64;
             let mut buf = [0u8; 4096];
+            let mut last_send = std::time::Instant::now() - std::time::Duration::from_secs(1);
             loop {
                 let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
                 if n <= 0 {
                     libc::close(fd);
                     break;
                 }
-                
+
                 let mut changed = false;
                 let mut offset = 0;
                 while offset + std::mem::size_of::<libc::nlmsghdr>() <= n as usize {
@@ -43,13 +44,16 @@ pub fn start_route_watcher(
                     }
                     let mtype = nlh.nlmsg_type;
                     if mtype == libc::RTM_NEWROUTE || mtype == libc::RTM_DELROUTE {
+                        tracing::info!("OS route change detected (type: {})", mtype);
                         changed = true;
                         break;
                     }
                     offset += (nlh.nlmsg_len as usize + 3) & !3; // ALIGN
                 }
 
-                if changed {
+                // Debounce: coalesce bursts of route events within 200ms.
+                if changed && last_send.elapsed() >= std::time::Duration::from_millis(200) {
+                    last_send = std::time::Instant::now();
                     epoch += 1;
                     if tx.send(epoch).is_err() {
                         libc::close(fd);
@@ -75,24 +79,43 @@ pub fn start_route_watcher(
 
         let mut epoch = 0u64;
         let mut buf = [0u8; 4096];
+        let mut last_send = std::time::Instant::now() - std::time::Duration::from_secs(1);
         loop {
             let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0);
             if n <= 0 {
                 libc::close(fd);
                 break;
             }
-            
+
             let mut changed = false;
             if n as usize >= std::mem::size_of::<libc::rt_msghdr>() {
                 // Read unaligned to avoid panics, as the stack `buf` may not be properly aligned
                 let rtm = std::ptr::read_unaligned(buf.as_ptr() as *const libc::rt_msghdr);
                 let mtype = rtm.rtm_type as i32;
                 if mtype == libc::RTM_ADD || mtype == libc::RTM_DELETE {
-                    changed = true;
+                    let flags = rtm.rtm_flags;
+                    // Ignore ARP/NDP cache entries, cloned routes (e.g. for TCP), cloning template
+                    // routes, multicast and broadcast routes.
+                    // These happen constantly during normal operation and do not affect our proxy routing.
+                    let ignore_mask = libc::RTF_LLINFO
+                        | libc::RTF_WASCLONED
+                        | libc::RTF_CLONING
+                        | libc::RTF_MULTICAST
+                        | libc::RTF_BROADCAST;
+                    if (flags & ignore_mask) == 0 {
+                        tracing::info!(
+                            "OS route change detected (type: {}, flags: {:#x})",
+                            mtype,
+                            flags
+                        );
+                        changed = true;
+                    }
                 }
             }
 
-            if changed {
+            // Debounce: coalesce bursts of route events within 200ms.
+            if changed && last_send.elapsed() >= std::time::Duration::from_millis(200) {
+                last_send = std::time::Instant::now();
                 epoch += 1;
                 if tx.send(epoch).is_err() {
                     libc::close(fd);

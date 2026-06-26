@@ -18,10 +18,10 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{BackendConfig, GroupConfig};
-use crate::scheduler::*;
 use crate::outbound::BackendStream;
-use tokio_rustls::TlsConnector;
+use crate::scheduler::*;
 use std::collections::HashMap;
+use tokio_rustls::TlsConnector;
 
 /// Lock-free per-backend traffic counters.
 ///
@@ -260,6 +260,7 @@ pub struct HealthCheckResult {
     pub timestamp: DateTime<Utc>,
     pub success: bool,
     pub latency_ms: Option<u64>,
+    pub handshake_latency_ms: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -270,6 +271,7 @@ pub struct BackendStatus {
     pub enabled: bool,
     pub last_check: Option<Instant>,
     pub last_latency: Option<Duration>,
+    pub last_handshake_latency: Option<Duration>,
     pub consecutive_failures: u32,
     pub history: VecDeque<HealthCheckResult>,
 }
@@ -282,6 +284,7 @@ impl Default for BackendStatus {
             enabled: true,
             last_check: None,
             last_latency: None,
+            last_handshake_latency: None,
             consecutive_failures: 0,
             history: VecDeque::with_capacity(MAX_HISTORY),
         }
@@ -311,6 +314,7 @@ pub struct BackendStatusView {
     pub healthy: bool,
     pub enabled: bool,
     pub last_latency_ms: Option<u64>,
+    pub handshake_latency_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub history: Vec<HealthCheckResult>,
     // Traffic stats
@@ -351,7 +355,6 @@ pub struct PooledConn {
     pub traffic: Arc<TrafficCounters>,
 }
 
-
 #[derive(Debug)]
 pub struct InboundStats {
     pub name: String,
@@ -380,8 +383,6 @@ struct BackendPoolInner {
     failover_order: Vec<Target>,
 }
 
-
-
 #[derive(Clone)]
 pub struct BackendHotPath {
     pub pool_rx: flume::Receiver<BackendStream>,
@@ -393,69 +394,6 @@ pub struct BackendHotPath {
 }
 
 /// Thread-safe backend pool.
-#[derive(Debug, Default)]
-pub struct ClientStats {
-    pub total_connections: AtomicU64,
-    pub active_connections: AtomicI64,
-    pub tx_bytes: AtomicU64,
-    pub rx_bytes: AtomicU64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ClientStatsView {
-    pub ip: String,
-    pub total_connections: u64,
-    pub active_connections: i64,
-    pub tx_bytes: u64,
-    pub rx_bytes: u64,
-}
-
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub enum ClientId {
-    Ip(std::net::IpAddr),
-    Unix,
-}
-
-impl std::fmt::Display for ClientId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientId::Ip(ip) => write!(f, "{}", ip),
-            ClientId::Unix => write!(f, "unix"),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct ClientStatsManager {
-    map: Arc<dashmap::DashMap<ClientId, Arc<ClientStats>>>,
-}
-
-impl ClientStatsManager {
-    pub fn new() -> Self {
-        Self {
-            map: Arc::new(dashmap::DashMap::new()),
-        }
-    }
-
-    pub fn get_or_create(&self, id: &ClientId) -> Arc<ClientStats> {
-        self.map.entry(id.clone()).or_insert_with(|| Arc::new(ClientStats::default())).clone()
-    }
-
-    pub fn get_views(&self) -> Vec<ClientStatsView> {
-        let mut views: Vec<_> = self.map.iter().map(|entry| {
-            let stats = entry.value();
-            ClientStatsView {
-                ip: entry.key().to_string(),
-                total_connections: stats.total_connections.load(Ordering::Relaxed),
-                active_connections: stats.active_connections.load(Ordering::Relaxed),
-                tx_bytes: stats.tx_bytes.load(Ordering::Relaxed),
-                rx_bytes: stats.rx_bytes.load(Ordering::Relaxed),
-            }
-        }).collect();
-        views.sort_unstable_by_key(|v| std::cmp::Reverse(v.active_connections));
-        views
-    }
-}
 
 #[derive(Clone)]
 pub struct BackendPool {
@@ -468,9 +406,9 @@ pub struct BackendPool {
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
     pub filter_manager: Arc<crate::filter::FilterManager>,
     pub ancillary_handle: tokio::runtime::Handle,
-    pub client_manager: ClientStatsManager,
+    pub client_manager: crate::stats::ClientStatsManager,
+    pub domain_manager: crate::stats::DomainStatsManager,
 }
-
 
 impl BackendPool {
     /// Create a new backend pool from config.
@@ -495,10 +433,11 @@ impl BackendPool {
             let mut status = BackendStatus::default();
             status.enabled = initial_enabled;
 
+            let traffic = Arc::new(TrafficCounters::default());
             let entry = BackendEntry {
                 info: Arc::new(info.clone()),
                 status: Arc::new(parking_lot::Mutex::new(status)),
-                traffic: Arc::new(TrafficCounters::default()),
+                traffic: traffic.clone(),
                 pool_rx: rx.clone(),
                 cancel: cancel.clone(),
                 enabled_tx,
@@ -525,6 +464,7 @@ impl BackendPool {
         let cached = Arc::new(ArcSwap::from_pointee(CachedCandidates {
             strategy: crate::config::GroupStrategy::Failover,
             hash_ring: Vec::new(),
+            wrr_choices: Vec::new(),
             healthy: cached_healthy.clone(),
             unhealthy: cached_unhealthy.clone(),
         }));
@@ -549,7 +489,16 @@ impl BackendPool {
             route_map.insert(route, i);
         }
         let route_map = Arc::new(route_map);
-        let route_caches = Arc::new(ArcSwap::from_pointee(vec![Arc::new(CachedCandidates { strategy: crate::config::GroupStrategy::Failover, hash_ring: Vec::new(), healthy: vec![], unhealthy: vec![] }); route_map.len()]));
+        let route_caches = Arc::new(ArcSwap::from_pointee(vec![
+            Arc::new(CachedCandidates {
+                strategy: crate::config::GroupStrategy::Failover,
+                hash_ring: Vec::new(),
+                wrr_choices: Vec::new(),
+                healthy: vec![],
+                unhealthy: vec![]
+            });
+            route_map.len()
+        ]));
 
         Ok(Self {
             inner: Arc::new(RwLock::new(BackendPoolInner {
@@ -563,9 +512,13 @@ impl BackendPool {
             hot_paths,
             inbound_stats: Arc::new(parking_lot::Mutex::new(Vec::new())),
             rt_chg_signal,
-            filter_manager: Arc::new(crate::filter::FilterManager::new(&filter_config, Some("proxylb.db"))),
+            filter_manager: Arc::new(crate::filter::FilterManager::new(
+                &filter_config,
+                Some("proxylb.db"),
+            )),
             ancillary_handle,
-            client_manager: ClientStatsManager::new(),
+            client_manager: crate::stats::ClientStatsManager::new(),
+            domain_manager: crate::stats::DomainStatsManager::new(),
         })
     }
 
@@ -695,10 +648,11 @@ impl BackendPool {
                 let mut status = BackendStatus::default();
                 status.enabled = initial_enabled;
 
+                let traffic = Arc::new(TrafficCounters::default());
                 let entry = BackendEntry {
                     info: Arc::new(new_info.clone()),
                     status: Arc::new(parking_lot::Mutex::new(status)),
-                    traffic: Arc::new(TrafficCounters::default()),
+                    traffic: traffic.clone(),
                     pool_rx: rx.clone(),
                     cancel: cancel.clone(),
                     enabled_tx,
@@ -731,6 +685,7 @@ impl BackendPool {
         self.cached.store(Arc::new(CachedCandidates {
             strategy: crate::config::GroupStrategy::Failover,
             hash_ring: Vec::new(),
+            wrr_choices: Vec::new(),
             healthy: cached_healthy.clone(),
             unhealthy: cached_unhealthy.clone(),
         }));
@@ -796,7 +751,12 @@ impl BackendPool {
     }
 
     #[allow(dead_code)]
-    pub async fn get_candidates(&self) -> (Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
+    pub async fn get_candidates(
+        &self,
+    ) -> (
+        Vec<(usize, Arc<BackendInfo>)>,
+        Vec<(usize, Arc<BackendInfo>)>,
+    ) {
         let guard = self.cached.load();
         (guard.healthy.clone(), guard.unhealthy.clone())
     }
@@ -808,10 +768,7 @@ impl BackendPool {
 
     /// Get a lock-free guard to cached candidates for a specific route index.
     /// Falls back to global candidates if no route index is provided.
-    pub fn get_route_candidates(
-        &self,
-        route_idx: Option<usize>,
-    ) -> Arc<CachedCandidates> {
+    pub fn get_route_candidates(&self, route_idx: Option<usize>) -> Arc<CachedCandidates> {
         if let Some(idx) = route_idx {
             let caches = self.route_caches.load();
             if let Some(cached) = caches.get(idx) {
@@ -824,7 +781,12 @@ impl BackendPool {
     /// Mark a backend as healthy with measured latency.
     ///
     /// Lock-free: accesses status via the `hot_paths` ArcSwap, avoiding the async RwLock.
-    pub fn mark_healthy(&self, index: usize, latency: Duration) {
+    pub fn mark_healthy(
+        &self,
+        index: usize,
+        latency: Duration,
+        handshake_latency: Option<Duration>,
+    ) {
         let hot_paths = self.hot_paths.load();
         if let Some(hp) = hot_paths.get(index) {
             let mut status = hp.status.lock();
@@ -832,12 +794,16 @@ impl BackendPool {
             status.healthy = true;
             status.last_check = Some(Instant::now());
             status.last_latency = Some(latency);
+            if handshake_latency.is_some() {
+                status.last_handshake_latency = handshake_latency;
+            }
             status.consecutive_failures = 0;
 
             let result = HealthCheckResult {
                 timestamp: Utc::now(),
                 success: true,
                 latency_ms: Some(latency.as_millis() as u64),
+                handshake_latency_ms: handshake_latency.map(|d| d.as_millis() as u64),
                 error: None,
             };
             push_history(&mut status.history, result);
@@ -874,6 +840,7 @@ impl BackendPool {
                 timestamp: Utc::now(),
                 success: false,
                 latency_ms: None,
+                handshake_latency_ms: None,
                 error: Some(error.to_string()),
             };
             push_history(&mut status.history, result);
@@ -937,22 +904,31 @@ impl BackendPool {
         self.cached.store(Arc::new(CachedCandidates {
             strategy: crate::config::GroupStrategy::Failover,
             hash_ring: Vec::new(),
+            wrr_choices: Vec::new(),
             healthy: ch,
             unhealthy: cu,
         }));
 
         let old_route_caches = self.route_caches.load();
         let mut new_route_caches = vec![
-            Arc::new(CachedCandidates { strategy: crate::config::GroupStrategy::Failover, hash_ring: Vec::new(), healthy: vec![], unhealthy: vec![] });
+            Arc::new(CachedCandidates {
+                strategy: crate::config::GroupStrategy::Failover,
+                hash_ring: Vec::new(),
+                wrr_choices: Vec::new(),
+                healthy: vec![],
+                unhealthy: vec![]
+            });
             self.route_map.len()
         ];
         for (name, &idx) in self.route_map.iter() {
-            let (strategy, gh, gu) = calculate_route_candidates(name, &guard.entries, &guard.groups);
-            
+            let (strategy, gh, gu) =
+                calculate_route_candidates(name, &guard.entries, &guard.groups);
+
             let hash_ring = if strategy == crate::config::GroupStrategy::ConsistentHashing {
                 let old_cache = old_route_caches.get(idx);
                 let same_healthy = old_cache.map_or(false, |old| {
-                    old.healthy.len() == gh.len() && old.healthy.iter().zip(gh.iter()).all(|(a, b)| a.0 == b.0)
+                    old.healthy.len() == gh.len()
+                        && old.healthy.iter().zip(gh.iter()).all(|(a, b)| a.0 == b.0)
                 });
                 if same_healthy {
                     old_cache.unwrap().hash_ring.clone()
@@ -966,6 +942,7 @@ impl BackendPool {
             new_route_caches[idx] = Arc::new(CachedCandidates {
                 strategy,
                 hash_ring,
+                wrr_choices: crate::scheduler::build_wrr_choices(&gh, &guard.entries),
                 healthy: gh,
                 unhealthy: gu,
             });
@@ -983,11 +960,15 @@ impl BackendPool {
                 .groups
                 .iter()
                 .find(|g| {
-                    g.members.iter().any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
+                    g.members
+                        .iter()
+                        .any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
                 })
                 .map(|g| g.name.clone());
 
             let status = e.status.lock();
+            let handshake_latency_ms = status.last_handshake_latency.map(|d| d.as_millis() as u64);
+
             views.push(BackendStatusView {
                 name: e.info.name.clone(),
                 address: e.info.endpoint.display(),
@@ -1003,6 +984,7 @@ impl BackendPool {
                 pool_hits: e.traffic.pool_hits.load(Ordering::Relaxed),
                 pool_misses: e.traffic.pool_misses.load(Ordering::Relaxed),
                 pool_stale: e.traffic.pool_stale.load(Ordering::Relaxed),
+                handshake_latency_ms,
                 group: group_name,
             });
         }
@@ -1020,11 +1002,15 @@ impl BackendPool {
                 .groups
                 .iter()
                 .find(|g| {
-                    g.members.iter().any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
+                    g.members
+                        .iter()
+                        .any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
                 })
                 .map(|g| g.name.clone());
 
             let status = e.status.lock();
+            let handshake_latency_ms = status.last_handshake_latency.map(|d| d.as_millis() as u64);
+
             views.push(BackendStatusView {
                 name: e.info.name.clone(),
                 address: e.info.endpoint.display(),
@@ -1040,6 +1026,7 @@ impl BackendPool {
                 pool_hits: e.traffic.pool_hits.load(Ordering::Relaxed),
                 pool_misses: e.traffic.pool_misses.load(Ordering::Relaxed),
                 pool_stale: e.traffic.pool_stale.load(Ordering::Relaxed),
+                handshake_latency_ms,
                 group: group_name,
             });
         }
@@ -1076,6 +1063,9 @@ impl BackendPool {
                             crate::config::GroupStrategy::UrlTest => "urltest",
                             crate::config::GroupStrategy::LoadBalance => "loadbalance",
                             crate::config::GroupStrategy::ConsistentHashing => "consistent_hashing",
+                            crate::config::GroupStrategy::WeightedRoundRobin => {
+                                "weighted_round_robin"
+                            }
                         }
                         .to_string();
 
