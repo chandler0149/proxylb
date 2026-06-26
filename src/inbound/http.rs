@@ -38,7 +38,7 @@ pub async fn run_http_inbound(
     let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, "HTTP inbound listener started");
 
-    crate::inbound::run_accept_loop(listener, cancel, "HTTP", move |stream, addr| {
+    crate::inbound::run_accept_loop(listener, cancel, "HTTP", move |stream, client_id| {
         let pool = pool.clone();
         let stats = Arc::clone(&stats);
         let tls_acceptor = tls_acceptor.clone();
@@ -46,9 +46,11 @@ pub async fn run_http_inbound(
         let password = password.clone();
         let local_filter_manager = local_filter_manager.clone();
         async move {
+            
+            let client_stats = pool.client_manager.get_or_create(&client_id);
             if let Err(e) = handle_http_connection(
                 stream,
-                addr.clone(),
+                client_id.clone(),
                 pool,
                 stats,
                 local_filter_manager.clone(),
@@ -56,10 +58,11 @@ pub async fn run_http_inbound(
                 username,
                 password,
                 route_idx,
+                client_stats,
             )
             .await
             {
-                tracing::debug!(client = %addr, error = %e, "HTTP connection failed");
+                tracing::debug!(client = %client_id, error = %e, "HTTP connection failed");
             }
         }
     })
@@ -69,7 +72,7 @@ pub async fn run_http_inbound(
 /// Handle a single HTTP connection.
 async fn handle_http_connection<S>(
     stream: S,
-    client_addr: String,
+    client_id: crate::backend::ClientId,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
     local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
@@ -77,6 +80,7 @@ async fn handle_http_connection<S>(
     username: Option<Arc<String>>,
     password: Option<Arc<String>>,
     route_idx: Option<usize>,
+    client_stats: Arc<crate::backend::ClientStats>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -92,7 +96,7 @@ where
     let (buf, pos) = match read_headers(&mut client_stream).await {
         Ok(res) => res,
         Err(e) => {
-            tracing::debug!(client = %client_addr, error = %e, "failed to read HTTP headers");
+            tracing::debug!(client = %client_id, error = %e, "failed to read HTTP headers");
             return Ok(());
         }
     };
@@ -101,7 +105,7 @@ where
     let (method, target, headers) = match parse_http_request_with_headers(&buf[..pos]) {
         Some(res) => res,
         None => {
-            tracing::debug!(client = %client_addr, "invalid HTTP proxy request or unsupported headers");
+            tracing::debug!(client = %client_id, "invalid HTTP proxy request or unsupported headers");
             let _ = client_stream
                 .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
                 .await;
@@ -128,7 +132,7 @@ where
         }
 
         if !auth_ok {
-            tracing::debug!(client = %client_addr, "HTTP Proxy Authentication failed");
+            tracing::debug!(client = %client_id, "HTTP Proxy Authentication failed");
             let _ = client_stream.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"ProxyLB\"\r\nConnection: close\r\n\r\n").await;
             return Ok(());
         }
@@ -150,7 +154,7 @@ where
         return Ok(());
     }
 
-    tracing::debug!(client = %client_addr, method = %method, target = %target, "HTTP CONNECT request" );
+    tracing::debug!(client = %client_id, method = %method, target = %target, "HTTP CONNECT request" );
 
     // Try backends in order with fallback.
     let (mut backend_stream, chosen_traffic) =
@@ -158,7 +162,7 @@ where
             Ok((s, t)) => (s, t),
             Err(e) => {
                 tracing::warn!(
-                    client = %client_addr,
+                    client = %client_id,
                     target = %target,
                     error = %e,
                     "all backends failed"
@@ -185,6 +189,7 @@ where
         backend_stream,
         chosen_traffic,
         Some(stats),
+        Some(client_stats),
         &target,
         "HTTP",
     )

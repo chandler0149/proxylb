@@ -53,7 +53,7 @@ pub async fn run_shadowsocks_inbound(
     let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, method = %method_str, "Shadowsocks inbound listener started");
 
-    crate::inbound::run_accept_loop(listener, cancel, "Shadowsocks", move |stream, addr| {
+    crate::inbound::run_accept_loop(listener, cancel, "Shadowsocks", move |stream, client_id| {
         let pool = pool.clone();
         let context = context.clone();
         let key = Arc::clone(&key);
@@ -61,9 +61,11 @@ pub async fn run_shadowsocks_inbound(
         let tls_acceptor = tls_acceptor.clone();
         let local_filter_manager = local_filter_manager.clone();
         async move {
+            
+            let client_stats = pool.client_manager.get_or_create(&client_id);
             if let Err(e) = handle_ss_connection(
                 stream,
-                addr.clone(),
+                client_id.clone(),
                 context,
                 method,
                 &key,
@@ -72,10 +74,11 @@ pub async fn run_shadowsocks_inbound(
                 local_filter_manager.clone(),
                 tls_acceptor.as_deref().cloned(),
                 route_idx,
+                client_stats,
             )
             .await
             {
-                tracing::debug!(client = %addr, error = %e, "Shadowsocks connection failed");
+                tracing::debug!(client = %client_id, error = %e, "Shadowsocks connection failed");
             }
         }
     })
@@ -85,7 +88,7 @@ pub async fn run_shadowsocks_inbound(
 /// Handle a single Shadowsocks connection.
 async fn handle_ss_connection<S>(
     stream: S,
-    client_addr: String,
+    client_id: crate::backend::ClientId,
     context: SharedContext,
     method: CipherKind,
     key: &[u8],
@@ -94,6 +97,7 @@ async fn handle_ss_connection<S>(
     local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     route_idx: Option<usize>,
+    client_stats: Arc<crate::backend::ClientStats>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + AsRawStreamRef + 'static,
@@ -117,7 +121,7 @@ where
     let target = convert_ss_address(&address);
 
     tracing::debug!(
-        client = %client_addr,
+        client = %client_id,
         target = %target,
         "Shadowsocks CONNECT request"
     );
@@ -139,7 +143,7 @@ where
             Ok((s, t)) => (s, t),
             Err(e) => {
                 tracing::warn!(
-                    client = %client_addr,
+                    client = %client_id,
                     target = %target,
                     error = %e,
                     "all backends failed"
@@ -153,6 +157,7 @@ where
         backend_stream,
         chosen_traffic,
         Some(stats),
+        Some(client_stats),
         &target,
         "Shadowsocks",
     )

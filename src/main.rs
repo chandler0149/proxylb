@@ -5,6 +5,7 @@
 
 mod filter;
 mod backend;
+mod scheduler;
 mod config;
 mod health;
 mod inbound;

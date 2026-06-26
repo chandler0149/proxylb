@@ -57,16 +57,16 @@ impl BoundListener {
 
     /// Accept one connection and return the stream together with a display
     /// string for the remote address.
-    pub async fn accept(&self) -> std::io::Result<(InboundStream, String)> {
+    pub async fn accept(&self) -> std::io::Result<(InboundStream, crate::backend::ClientId)> {
         match self {
             BoundListener::Tcp(l) => {
                 let (s, addr) = l.accept().await?;
                 let _ = s.set_nodelay(true);
-                Ok((InboundStream::Tcp(s), addr.to_string()))
+                Ok((InboundStream::Tcp(s), crate::backend::ClientId::Ip(addr.ip())))
             }
             BoundListener::Unix(l) => {
-                let (s, addr) = l.accept().await?;
-                Ok((InboundStream::Unix(s), format!("unix:{:?}", addr)))
+                let (s, _addr) = l.accept().await?;
+                Ok((InboundStream::Unix(s), crate::backend::ClientId::Unix))
             }
         }
     }
@@ -150,7 +150,7 @@ pub async fn run_accept_loop<F, Fut>(
     on_accept: F,
 ) -> anyhow::Result<()>
 where
-    F: Fn(InboundStream, String) -> Fut,
+    F: Fn(InboundStream, crate::backend::ClientId) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     loop {
@@ -158,7 +158,7 @@ where
             biased;
             _ = cancel.cancelled() => break,
             res = listener.accept() => match res {
-                Ok((stream, addr)) => { tokio::spawn(on_accept(stream, addr)); }
+                Ok((stream, client_id)) => { tokio::spawn(on_accept(stream, client_id)); }
                 Err(e) => { tracing::warn!(error = %e, "{protocol} accept error"); }
             }
         }
@@ -355,6 +355,7 @@ pub async fn relay_and_track<I>(
     mut backend_stream: crate::outbound::BackendStream,
     traffic: Arc<crate::backend::TrafficCounters>,
     inbound_stats: Option<Arc<crate::backend::InboundStats>>,
+    client_stats: Option<Arc<crate::backend::ClientStats>>,
     target: &TargetAddr,
     protocol_name: &str,
 ) -> Result<(), anyhow::Error>
@@ -375,6 +376,10 @@ where
         stats.total_connections.fetch_add(1, Ordering::Relaxed);
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
     }
+    if let Some(ref stats) = client_stats {
+        stats.total_connections.fetch_add(1, Ordering::Relaxed);
+        stats.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
 
     match crate::relay::relay(&mut inbound_stream, &mut backend_stream).await {
         Ok((up, down)) => {
@@ -388,6 +393,10 @@ where
             traffic.bytes_up.fetch_add(up, Ordering::Relaxed);
             traffic.bytes_down.fetch_add(down, Ordering::Relaxed);
             if let Some(ref stats) = inbound_stats {
+                stats.tx_bytes.fetch_add(up, Ordering::Relaxed);
+                stats.rx_bytes.fetch_add(down, Ordering::Relaxed);
+            }
+            if let Some(ref stats) = client_stats {
                 stats.tx_bytes.fetch_add(up, Ordering::Relaxed);
                 stats.rx_bytes.fetch_add(down, Ordering::Relaxed);
             }
@@ -406,6 +415,9 @@ where
     if let Some(ref stats) = inbound_stats {
         stats.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
+    if let Some(ref stats) = client_stats {
+        stats.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
 
     // Flush the write-halves so peers see a clean EOF before we release the FDs.
     let _ = inbound_stream.shutdown().await;
@@ -420,10 +432,10 @@ where
 
 /// Helper function to check if a target address points to a private/loopback address.
 #[allow(dead_code)]
-pub fn is_private_target_sync(target: &TargetAddr) -> bool {
+pub fn is_private_target_sync(target: &crate::outbound::TargetAddr) -> bool {
     match target {
-        TargetAddr::Ip(addr) => is_private_ip(addr.ip()),
-        TargetAddr::Domain(host, _port) => {
+        crate::outbound::TargetAddr::Ip(addr) => is_private_ip(addr.ip()),
+        crate::outbound::TargetAddr::Domain(host, _port) => {
             let host_lower = host.to_lowercase();
             host_lower == "localhost" || host_lower.ends_with(".local")
         }

@@ -2170,6 +2170,7 @@ dependencies = [
  "chrono",
  "clap",
  "core_affinity",
+ "dashmap",
  "fast-socks5",
  "flume",
  "httparse",

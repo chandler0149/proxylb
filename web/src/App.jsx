@@ -286,6 +286,12 @@ function App() {
             <span className="metric-value" style={{ color: b.consecutive_failures > 0 ? 'var(--accent-red)' : 'var(--accent-green)' }}>
               {b.consecutive_failures}
             </span>
+            <button
+              className={`tab-btn ${activeTab === 'clients' ? 'active' : ''}`}
+              onClick={() => setActiveTab('clients')}
+            >
+              Client IPs
+            </button>
           </div>
         </div>
 
@@ -601,6 +607,12 @@ function App() {
             >
               Filter Engine
             </button>
+            <button
+              className={`tab-btn ${activeTab === 'clients' ? 'active' : ''}`}
+              onClick={() => setActiveTab('clients')}
+            >
+              Clients (IP Stats)
+            </button>
           </div>
         </div>
 
@@ -634,6 +646,47 @@ function App() {
                 .map((item) => renderBackendCard(item.status))
             ) : (
               <div className="empty-state">No standalone backends configured</div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'clients' && (
+          <div className="filter-panel" style={{ background: 'var(--card-bg)', borderRadius: '16px', padding: '1.5rem', border: '1px solid var(--border-color)' }}>
+            <h3 style={{ margin: '0 0 1.5rem 0', color: 'var(--text-primary)' }}>Client Traffic Statistics</h3>
+            {data?.clients && data.clients.length > 0 ? (
+              <div style={{ overflowX: 'auto' }}>
+                <table className="history-table" style={{ width: '100%', textAlign: 'left' }}>
+                  <thead>
+                    <tr>
+                      <th>IP Address</th>
+                      <th>Active Conn</th>
+                      <th>Total Conn</th>
+                      <th>Upload</th>
+                      <th>Download</th>
+                      <th>Total Bandwidth</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.clients.map((c, idx) => {
+                      const totalBandwidth = (c.tx_bytes || 0) + (c.rx_bytes || 0);
+                      return (
+                        <tr key={idx}>
+                          <td style={{ fontWeight: 'bold', fontFamily: 'monospace' }}>{c.ip}</td>
+                          <td style={{ color: c.active_connections > 0 ? 'var(--accent-blue)' : 'inherit' }}>
+                            {c.active_connections}
+                          </td>
+                          <td>{c.total_connections}</td>
+                          <td style={{ color: '#ffa726' }}>{formatBytes(c.tx_bytes)}</td>
+                          <td style={{ color: 'var(--accent-green)' }}>{formatBytes(c.rx_bytes)}</td>
+                          <td style={{ fontWeight: 'bold' }}>{formatBytes(totalBandwidth)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state">No client statistics available</div>
             )}
           </div>
         )}

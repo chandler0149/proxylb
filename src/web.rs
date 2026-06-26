@@ -47,6 +47,7 @@ struct ApiResponse {
     tree: Vec<crate::backend::TreeItem>,
     memory: MemStats,
     inbounds: Vec<crate::backend::InboundStatsView>,
+    clients: Vec<crate::backend::ClientStatsView>,
     adblock: AdBlockStatusView,
 }
 
@@ -233,6 +234,7 @@ async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
     let tree = pool.status_tree().await;
     let memory = get_memory_usage();
     let inbounds = pool.get_inbound_stats();
+    let clients = pool.client_manager.get_views();
 
     let engine = pool.filter_manager.engine.load();
     let adblock = AdBlockStatusView {
@@ -250,6 +252,7 @@ async fn api_status(State(pool): State<BackendPool>) -> Json<ApiResponse> {
         tree,
         memory,
         inbounds,
+        clients,
         adblock,
     })
 }

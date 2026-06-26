@@ -37,13 +37,15 @@ pub async fn run_mtproto_inbound(
     let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, "MTProto inbound listener started");
 
-    crate::inbound::run_accept_loop(listener, cancel, "MTProto", move |stream, addr| {
+    crate::inbound::run_accept_loop(listener, cancel, "MTProto", move |stream, client_id| {
         let pool = pool.clone();
         let stats = Arc::clone(&stats);
         let secret = secret.clone();
         let local_filter_manager = local_filter_manager.clone();
 
         async move {
+            
+            let client_stats = pool.client_manager.get_or_create(&client_id);
             if let Err(e) = handle_mtproto_connection(
                 stream,
                 pool,
@@ -52,10 +54,11 @@ pub async fn run_mtproto_inbound(
                 secret,
                 SecureRandom::new(),
                 route_idx,
+                client_stats,
             )
             .await
             {
-                tracing::debug!(client = %addr, error = %e, "MTProto connection failed");
+                tracing::debug!(client = %client_id, error = %e, "MTProto connection failed");
             }
         }
     })
@@ -141,6 +144,7 @@ async fn handle_mtproto_connection<S>(
     secret: [u8; MTPROTO_SECRET_BYTES],
     rng: SecureRandom,
     route_idx: Option<usize>,
+    client_stats: Arc<crate::backend::ClientStats>,
 ) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + crate::relay::AsRawStreamRef + 'static,
@@ -228,6 +232,7 @@ where
             backend_stream,
             chosen_traffic,
             Some(stats),
+            Some(client_stats.clone()),
             &target_addr,
             "MTProto",
         ).await
@@ -261,6 +266,7 @@ where
             backend_stream,
             chosen_traffic,
             Some(stats),
+            Some(client_stats),
             &target_addr,
             "MTProto",
         ).await
