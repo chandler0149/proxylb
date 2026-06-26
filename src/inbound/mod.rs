@@ -170,6 +170,21 @@ where
 ///
 /// When `route` is `Some`, uses route-specific candidates (bound to a group or backend).
 /// When `route` is `None`, uses the global failover order.
+
+fn extract_parent_domain(target: &TargetAddr) -> String {
+    match target {
+        TargetAddr::Ip(addr) => addr.ip().to_string(),
+        TargetAddr::Domain(host, _) => {
+            let parts: Vec<&str> = host.split('.').collect();
+            if parts.len() >= 2 {
+                format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
+            } else {
+                host.clone()
+            }
+        }
+    }
+}
+
 pub async fn route_and_connect(
     pool: &crate::backend::BackendPool,
     target: &TargetAddr,
@@ -198,8 +213,26 @@ pub async fn route_and_connect(
     let mut backend_stream: Option<crate::outbound::BackendStream> = None;
     let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
 
+        let iterator: Vec<(usize, std::sync::Arc<crate::backend::BackendInfo>)> = if candidates.strategy == crate::config::GroupStrategy::ConsistentHashing && !healthy.is_empty() && !candidates.hash_ring.is_empty() {
+        let parent_domain = extract_parent_domain(target);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&parent_domain, &mut hasher);
+        let target_hash = std::hash::Hasher::finish(&hasher);
+        
+        let idx = match candidates.hash_ring.binary_search_by_key(&target_hash, |(h, _)| *h) {
+            Ok(idx) => idx,
+            Err(idx) => if idx == candidates.hash_ring.len() { 0 } else { idx },
+        };
+        
+        let array_idx = candidates.hash_ring[idx].1;
+        
+        healthy[array_idx..].iter().chain(healthy[..array_idx].iter()).cloned().collect()
+    } else {
+        healthy.clone()
+    };
+
     // First pass: try healthy backends.
-    for (index, info) in healthy {
+    for (index, info) in &iterator {
         // Lock-free cache lookup: yields both the pooled stream (if any) and the traffic Arc.
         let pc = pool.get_pooled_connection(*index);
         let (pool_stream, traffic) = match pc {

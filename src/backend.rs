@@ -88,6 +88,7 @@ pub struct BackendInfo {
     pub server_name: Option<String>,
     pub enabled: Option<bool>,
     pub force_healthy: bool,
+    pub max_fails: u32,
 }
 
 impl std::fmt::Debug for BackendInfo {
@@ -232,6 +233,7 @@ impl BackendInfo {
             server_name,
             enabled: cfg.enabled,
             force_healthy: cfg.force_healthy,
+            max_fails: cfg.max_fails,
         })
     }
 
@@ -414,7 +416,24 @@ struct BackendPoolInner {
     failover_order: Vec<Target>,
 }
 
+
+fn build_hash_ring(healthy: &[(usize, Arc<BackendInfo>)]) -> Vec<(u64, usize)> {
+    let mut ring = Vec::new();
+    for (i, (_, info)) in healthy.iter().enumerate() {
+        for v in 0..160 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&info.name, &mut hasher);
+            std::hash::Hash::hash(&v, &mut hasher);
+            ring.push((std::hash::Hasher::finish(&hasher), i));
+        }
+    }
+    ring.sort_unstable_by_key(|(h, _)| *h);
+    ring
+}
+
 pub struct CachedCandidates {
+    pub strategy: crate::config::GroupStrategy,
+    pub hash_ring: Vec<(u64, usize)>,
     pub healthy: Vec<(usize, Arc<BackendInfo>)>,
     pub unhealthy: Vec<(usize, Arc<BackendInfo>)>,
 }
@@ -426,6 +445,7 @@ pub struct BackendHotPath {
     pub status: Arc<parking_lot::Mutex<BackendStatus>>,
     pub info_name: Arc<str>,
     pub force_healthy: bool,
+    pub max_fails: u32,
 }
 
 /// Thread-safe backend pool.
@@ -578,7 +598,7 @@ fn apply_strategy_sort_nested(
                     .unwrap_or(Duration::MAX)
             });
         }
-        GroupStrategy::Failover => {
+        GroupStrategy::Failover | GroupStrategy::ConsistentHashing => {
             // Keep configured order
         }
         GroupStrategy::LoadBalance => {
@@ -665,10 +685,11 @@ fn calculate_route_candidates(
     route: &str,
     entries: &[BackendEntry],
     groups: &[Group],
-) -> (Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
+) -> (crate::config::GroupStrategy, Vec<(usize, Arc<BackendInfo>)>, Vec<(usize, Arc<BackendInfo>)>) {
     if let Some(group) = groups.iter().find(|g| g.name == route) {
         let (raw_h, raw_u) = collect_group_candidates_recursive(group, entries, groups);
-        return deduplicate_candidates(raw_h, raw_u, entries);
+        let (h, u) = deduplicate_candidates(raw_h, raw_u, entries);
+        return (group.strategy, h, u);
     }
 
     if let Some(idx) = entries.iter().position(|e| e.info.name == route) {
@@ -676,15 +697,15 @@ fn calculate_route_candidates(
             let status = entry.status.lock();
             if status.enabled {
                 if status.healthy {
-                    return (vec![(idx, Arc::clone(&entry.info))], vec![]);
+                    return (crate::config::GroupStrategy::Failover, vec![(idx, Arc::clone(&entry.info))], vec![]);
                 } else {
-                    return (vec![], vec![(idx, Arc::clone(&entry.info))]);
+                    return (crate::config::GroupStrategy::Failover, vec![], vec![(idx, Arc::clone(&entry.info))]);
                 }
             }
         }
     }
 
-    (vec![], vec![])
+    (crate::config::GroupStrategy::Failover, vec![], vec![])
 }
 
 impl BackendPool {
@@ -738,6 +759,8 @@ impl BackendPool {
             calculate_candidates(&entries, &groups, &failover_order);
 
         let cached = Arc::new(ArcSwap::from_pointee(CachedCandidates {
+            strategy: crate::config::GroupStrategy::Failover,
+            hash_ring: Vec::new(),
             healthy: cached_healthy.clone(),
             unhealthy: cached_unhealthy.clone(),
         }));
@@ -750,6 +773,7 @@ impl BackendPool {
                 status: Arc::clone(&e.status),
                 info_name: Arc::from(e.info.name.as_str()),
                 force_healthy: e.info.force_healthy,
+                max_fails: e.info.max_fails,
             })
             .collect::<Vec<_>>();
         let hot_paths = Arc::new(ArcSwap::from_pointee(hot_paths));
@@ -761,7 +785,7 @@ impl BackendPool {
             route_map.insert(route, i);
         }
         let route_map = Arc::new(route_map);
-        let route_caches = Arc::new(ArcSwap::from_pointee(vec![Arc::new(CachedCandidates { healthy: vec![], unhealthy: vec![] }); route_map.len()]));
+        let route_caches = Arc::new(ArcSwap::from_pointee(vec![Arc::new(CachedCandidates { strategy: crate::config::GroupStrategy::Failover, hash_ring: Vec::new(), healthy: vec![], unhealthy: vec![] }); route_map.len()]));
 
         Ok(Self {
             inner: Arc::new(RwLock::new(BackendPoolInner {
@@ -940,6 +964,8 @@ impl BackendPool {
             calculate_candidates(&new_entries, &groups, &failover_order);
 
         self.cached.store(Arc::new(CachedCandidates {
+            strategy: crate::config::GroupStrategy::Failover,
+            hash_ring: Vec::new(),
             healthy: cached_healthy.clone(),
             unhealthy: cached_unhealthy.clone(),
         }));
@@ -952,6 +978,7 @@ impl BackendPool {
                 status: Arc::clone(&e.status),
                 info_name: Arc::from(e.info.name.as_str()),
                 force_healthy: e.info.force_healthy,
+                max_fails: e.info.max_fails,
             })
             .collect::<Vec<_>>();
         self.hot_paths.store(Arc::new(hot_paths_vec));
@@ -1071,9 +1098,12 @@ impl BackendPool {
             }
             let mut status = hp.status.lock();
             let was_healthy = status.healthy;
-            status.healthy = false;
+            // status.healthy will be set to false only if max_fails is reached
             status.last_check = Some(Instant::now());
             status.consecutive_failures += 1;
+            if status.consecutive_failures >= hp.max_fails {
+                status.healthy = false;
+            }
 
             let result = HealthCheckResult {
                 timestamp: Utc::now(),
@@ -1140,17 +1170,37 @@ impl BackendPool {
         let guard = self.inner.read().await;
         let (ch, cu) = calculate_candidates(&guard.entries, &guard.groups, &guard.failover_order);
         self.cached.store(Arc::new(CachedCandidates {
+            strategy: crate::config::GroupStrategy::Failover,
+            hash_ring: Vec::new(),
             healthy: ch,
             unhealthy: cu,
         }));
 
+        let old_route_caches = self.route_caches.load();
         let mut new_route_caches = vec![
-            Arc::new(CachedCandidates { healthy: vec![], unhealthy: vec![] });
+            Arc::new(CachedCandidates { strategy: crate::config::GroupStrategy::Failover, hash_ring: Vec::new(), healthy: vec![], unhealthy: vec![] });
             self.route_map.len()
         ];
         for (name, &idx) in self.route_map.iter() {
-            let (gh, gu) = calculate_route_candidates(name, &guard.entries, &guard.groups);
+            let (strategy, gh, gu) = calculate_route_candidates(name, &guard.entries, &guard.groups);
+            
+            let hash_ring = if strategy == crate::config::GroupStrategy::ConsistentHashing {
+                let old_cache = old_route_caches.get(idx);
+                let same_healthy = old_cache.map_or(false, |old| {
+                    old.healthy.len() == gh.len() && old.healthy.iter().zip(gh.iter()).all(|(a, b)| a.0 == b.0)
+                });
+                if same_healthy {
+                    old_cache.unwrap().hash_ring.clone()
+                } else {
+                    build_hash_ring(&gh)
+                }
+            } else {
+                Vec::new()
+            };
+
             new_route_caches[idx] = Arc::new(CachedCandidates {
+                strategy,
+                hash_ring,
                 healthy: gh,
                 unhealthy: gu,
             });
@@ -1260,6 +1310,7 @@ impl BackendPool {
                             crate::config::GroupStrategy::Failover => "failover",
                             crate::config::GroupStrategy::UrlTest => "urltest",
                             crate::config::GroupStrategy::LoadBalance => "loadbalance",
+                            crate::config::GroupStrategy::ConsistentHashing => "consistent_hashing",
                         }
                         .to_string();
 

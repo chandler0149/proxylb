@@ -129,6 +129,8 @@ pub enum GroupStrategy {
     UrlTest,
     Failover,
     LoadBalance,
+    #[serde(rename = "consistent_hashing")]
+    ConsistentHashing,
 }
 
 impl Default for GroupStrategy {
@@ -284,6 +286,13 @@ pub struct BackendConfig {
     /// If true, do not perform health check and consider healthy forever (default: false).
     #[serde(default)]
     pub force_healthy: bool,
+    /// Number of consecutive failures before marking the backend as unhealthy (default: 1).
+    #[serde(default = "default_max_fails")]
+    pub max_fails: u32,
+}
+
+fn default_max_fails() -> u32 {
+    1
 }
 
 fn default_pool_size() -> usize {
