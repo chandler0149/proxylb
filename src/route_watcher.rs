@@ -101,13 +101,10 @@ pub fn start_route_watcher(
                         | libc::RTF_WASCLONED
                         | libc::RTF_CLONING
                         | libc::RTF_MULTICAST
-                        | libc::RTF_BROADCAST;
+                        | libc::RTF_BROADCAST
+                        | libc::RTF_LOCAL
+                        | 0x2000000; // RTF_CONDEMNED
                     if (flags & ignore_mask) == 0 {
-                        tracing::info!(
-                            "OS route change detected (type: {}, flags: {:#x})",
-                            mtype,
-                            flags
-                        );
                         changed = true;
                     }
                 }
@@ -115,6 +112,7 @@ pub fn start_route_watcher(
 
             // Debounce: coalesce bursts of route events within 200ms.
             if changed && last_send.elapsed() >= std::time::Duration::from_millis(200) {
+                tracing::info!("OS route change detected (triggered health check)");
                 last_send = std::time::Instant::now();
                 epoch += 1;
                 if tx.send(epoch).is_err() {

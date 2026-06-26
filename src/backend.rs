@@ -1149,12 +1149,14 @@ fn drain_pool(rx: &flume::Receiver<BackendStream>) {
 /// Exits cleanly when `cancel` is cancelled (backend removed during hot reload).
 #[inline]
 async fn allocate_backend_resource(info: &BackendInfo) -> std::io::Result<BackendStream> {
+    let start = std::time::Instant::now();
     let connect = crate::outbound::connect_endpoint(info, Duration::from_secs(10)).await;
-    let stream = match connect {
+    let mut stream = match connect {
         Err(e) => return Err(e),
         Ok(stream) if info.is_shadowsocks() => stream,
         Ok(stream) => crate::outbound::socks5h_authenticate(stream, info).await?,
     };
+    stream.base_latency = start.elapsed();
 
     #[cfg(target_os = "linux")]
     let mut stream = stream;
