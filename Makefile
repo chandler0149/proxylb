@@ -7,29 +7,33 @@ PGO_DIR := $(CURDIR)/pgo-data
 AMD64_TARGET := x86_64-unknown-linux-gnu
 ARM64_TARGET := aarch64-unknown-linux-gnu
 
-.PHONY: all arm64 amd64 clean help bench bench_clean pgo pgo_clean
+.PHONY: all arm64 amd64 clean help bench bench_clean pgo pgo_clean web
 
 ## Default target: build for the native architecture (assumed arm64 based on your command)
 all: arm64 amd64
 
 FEATURES := --features filter
 
-release:
+web:
+	@echo "Building web UI..."
+	@cd web && npm install && npm run build
+
+release: web
 	$(CARGO) build --release $(FEATURES)
 
-arm64:
+arm64: web
 	@echo "Building for ARM64..."
-	$(CARGO) build --target=$(ARM64_TARGET) --release
+	$(CARGO) build --target=$(ARM64_TARGET) --release $(FEATURES)
 
-box:
+box: web
 	@echo "Building for ARM64 (box)..."
-	RUSTFLAGS="-C target-cpu=cortex-a53" $(CARGO) build --release
+	RUSTFLAGS="-C target-cpu=cortex-a53" $(CARGO) build --release $(FEATURES)
 	
-amd64:
+amd64: web
 	@echo "Building for AMD64..."
 	$(CARGO) build --target=$(AMD64_TARGET) --release
 
-ali:
+ali: web
 	@echo "Building for AMD64..."
 	RUSTFLAGS="-C target-cpu=x86-64-v4" $(CARGO) build --target=$(AMD64_TARGET) --release
 

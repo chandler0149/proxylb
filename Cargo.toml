@@ -21,6 +21,8 @@ mtproto-server = { path = "./submodules/telemt/mtproto-server" }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 httparse = "1.10.1"
+rust-embed = "8.11.0"
+mime_guess = "2.0.5"
 
 
 # Serialization / config

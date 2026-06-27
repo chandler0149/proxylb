@@ -11,6 +11,13 @@ use axum::{
 use memory_stats::memory_stats;
 use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
+use axum::http::{header, StatusCode, Uri};
+use rust_embed::RustEmbed;
+use mime_guess::from_path;
+
+#[derive(RustEmbed)]
+#[folder = "web/dist/"]
+struct Assets;
 
 use crate::backend::BackendPool;
 
@@ -63,7 +70,7 @@ pub fn create_router(pool: BackendPool) -> Router {
         .allow_private_network(true);
 
     Router::new()
-        .route("/", get(api_info))
+        .route("/api", get(api_info))
         .route("/api/status", get(api_status))
         .route("/api/backends/{name}/enable", post(api_enable_backend))
         .route("/api/backends/{name}/disable", post(api_disable_backend))
@@ -76,10 +83,34 @@ pub fn create_router(pool: BackendPool) -> Router {
         .route("/api/filter/settings", post(api_set_filter_settings))
         .route("/api/filter/check", axum::routing::get(api_check_rule))
         .layer(cors)
+        .fallback(get(static_handler))
         .with_state(pool)
 }
 
-/// GET /
+async fn static_handler(uri: Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/').to_string();
+
+    if path.is_empty() {
+        return axum::response::Redirect::temporary("/index.html").into_response();
+    }
+
+    match Assets::get(path.as_str()) {
+        Some(content) => {
+            let mime = from_path(path).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+        }
+        None => {
+            if let Some(index) = Assets::get("index.html") {
+                let mime = from_path("index.html").first_or_octet_stream();
+                ([(header::CONTENT_TYPE, mime.as_ref())], index.data).into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "404 Not Found").into_response()
+            }
+        }
+    }
+}
+
+/// GET /api
 async fn api_info() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "ok",

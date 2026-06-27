@@ -280,7 +280,6 @@ pub async fn route_and_connect(
 
     // Use route-specific candidates if a route is bound, otherwise global.
     let candidates = pool.get_route_candidates(route_idx);
-    let healthy = &candidates.healthy;
     let unhealthy = &candidates.unhealthy;
 
     let mut backend_stream: Option<crate::outbound::BackendStream> = None;
