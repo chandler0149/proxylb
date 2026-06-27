@@ -40,13 +40,29 @@ struct Args {
     /// Log level (e.g. "info", "debug", "trace", "proxylb=debug").
     #[arg(short, long, default_value = "info")]
     log_level: String,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug, PartialEq)]
+enum Command {
+    /// Run the proxy (default)
+    Run,
+    /// Check the configuration format and routing groups for errors
+    Check,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Load config first to read CPU affinity settings.
+    // Load config first to read CPU affinity settings and validate.
     let config = config::Config::load(&args.config)?;
+
+    if args.command == Some(Command::Check) {
+        println!("Configuration is valid.");
+        return Ok(());
+    }
 
     // Store zero-copy flag.
     #[cfg(target_os = "linux")]
