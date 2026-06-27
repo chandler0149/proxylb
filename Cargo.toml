@@ -58,7 +58,7 @@ core_affinity = "0.8.3"
 rustls-pemfile = "2.2.0"
 base64 = "0.22.1"
 rcgen = "0.14.8"
-socket2 = "0.6.4"
+socket2 = { version = "0.6.4", features = ["all"] }
 rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
 rustc-hash = { version = "2.1.2", optional = true }
 ahash = { version = "0.8.12", optional = true }
