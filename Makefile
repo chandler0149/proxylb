@@ -65,21 +65,21 @@ pgo: pgo_clean
 	@killall -9 benchmark_cps 2>/dev/null || true
 	@rm -f /tmp/mock_socks5.sock /tmp/proxylb_bench.sock
 	@echo "Starting mock backend..."
-	@./target/release/dummy_uds_backend /tmp/mock_socks5.sock > /dev/null 2>&1 &
+	@taskset -c 6 ./target/release/dummy_uds_backend /tmp/mock_socks5.sock > /dev/null 2>&1 &
 	@sleep 1
 	@echo "Starting instrumented ProxyLB..."
-	@rm /tmp/bench.log
+	@/usr/bin/rm -rf /tmp/bench.log
 	@LLVM_PROFILE_FILE="$(PGO_DIR)/proxylb_%m_%p.profraw" \
 		./target/release/proxylb -c ./bench/bench_config.yaml --log-level info > /tmp/bench.log 2>&1 &
 	@sleep 5
 	@echo "Running benchmark workload (profile collection)..."
 	@if [ "$(BENCH_UDS)" = "1" ]; then \
-		./target/release/benchmark_cps \
+		taskset -c 5 ./target/release/benchmark_cps \
 			--proxy-uds /tmp/proxylb_bench.sock \
 			--target-host 127.0.0.1 --target-port 10800 \
 			--concurrency 300 --duration 10 --random-domains; \
 	else \
-		./target/release/benchmark_cps \
+		taskset -c 5 ./target/release/benchmark_cps \
 			--proxy-host 127.0.0.1 --proxy-port 1080 \
 			--target-host 127.0.0.1 --target-port 10800 \
 			--concurrency 300 --duration 10 --random-domains; \
@@ -110,11 +110,38 @@ pgo: pgo_clean
 	@echo "══════════════════════════════════════════════════════════════"
 	@echo " PGO build complete! Binary: target/release/proxylb"
 	@echo "══════════════════════════════════════════════════════════════"
+	@make bench_clean
+	@echo "Starting Rust SOCKS5 mock backend..."
+	@taskset -c 6 ./target/release/dummy_uds_backend /tmp/mock_socks5.sock > /dev/null 2>&1 &
+	@sleep 1
+	@echo "Starting ProxyLB in release mode..."
+	@./target/release/proxylb -c ./bench/bench_config.yaml --log-level info > /tmp/bench.log 2>&1 &
+	@sleep 5
+	@echo "Running Rust SOCKS5 CPS benchmark..."
+	@if [ "$(BENCH_UDS)" = "1" ]; then \
+	taskset -c 5	./target/release/benchmark_cps \
+			--proxy-uds /tmp/proxylb_bench.sock \
+			--target-host 127.0.0.1 --target-port 10800 \
+			--concurrency 300 --duration 10 --random-domains; \
+	else \
+	taskset -5 ./target/release/benchmark_cps \
+			--proxy-host 127.0.0.1 --proxy-port 1080 \
+			--target-host 127.0.0.1 --target-port 10800 \
+			--concurrency 300 --duration 10 --random-domains; \
+	fi
+	@echo "Cleaning up processes..."
+	@killall -9 proxylb 2>/dev/null || true
+	@killall -9 dummy_uds_backend 2>/dev/null || true
+	@killall -9 benchmark_cps 2>/dev/null || true
+	@rm -f /tmp/mock_socks5.sock /tmp/proxylb_bench.sock
+	@echo "Benchmark complete."
+
+
 # 	make bench_clean
 # 	make bench BENCH_UDS=1
 
 ## Clean PGO profile data
-pgo_clean:
+pgo_clean: clean
 	@rm -rf $(PGO_DIR)
 	@mkdir -p $(PGO_DIR)
 
@@ -131,19 +158,19 @@ bench_run:
 	@killall -9 benchmark_cps 2>/dev/null || true
 	@rm -f /tmp/mock_socks5.sock /tmp/proxylb_bench.sock
 	@echo "Starting Rust SOCKS5 mock backend..."
-	@./target/release/dummy_uds_backend /tmp/mock_socks5.sock > /dev/null 2>&1 &
+	@taskset -c 6 ./target/release/dummy_uds_backend /tmp/mock_socks5.sock > /dev/null 2>&1 &
 	@sleep 1
 	@echo "Starting ProxyLB in release mode..."
 	@./target/release/proxylb -c ./bench/bench_config.yaml --log-level info > bench.log 2>&1 &
 	@sleep 5
 	@echo "Running Rust SOCKS5 CPS benchmark..."
 	@if [ "$(BENCH_UDS)" = "1" ]; then \
-		./target/release/benchmark_cps \
+		taskset -c 5 ./target/release/benchmark_cps \
 			--proxy-uds /tmp/proxylb_bench.sock \
 			--target-host 127.0.0.1 --target-port 10800 \
 			--concurrency 300 --duration 10 --random-domains; \
 	else \
-		./target/release/benchmark_cps \
+		taskset -c 5 ./target/release/benchmark_cps \
 			--proxy-host 127.0.0.1 --proxy-port 1080 \
 			--target-host 127.0.0.1 --target-port 10800 \
 			--concurrency 300 --duration 10 --random-domains; \

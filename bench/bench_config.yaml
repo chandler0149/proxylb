@@ -31,9 +31,9 @@ health_check:
 
 
 
-# cpu_affinity:
-#   worker_cores: [1]
-#   ancillary_cores: [2]
+cpu_affinity:
+  worker_cores: [2]
+  ancillary_cores: [1]
 
-# advanced:
-#   zero_copy: true
+advanced:
+  zero_copy: true
