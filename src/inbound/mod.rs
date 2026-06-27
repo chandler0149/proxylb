@@ -200,36 +200,14 @@ pub fn extract_parent_domain(target: &TargetAddr) -> String {
     }
 }
 
-pub async fn route_and_connect(
-    pool: &crate::backend::BackendPool,
+pub fn get_candidate_iterator(
+    candidates: &std::sync::Arc<crate::scheduler::CachedCandidates>,
     target: &TargetAddr,
-    route_idx: Option<usize>,
-) -> Result<
-    (
-        crate::outbound::BackendStream,
-        Arc<crate::backend::TrafficCounters>,
-    ),
-    anyhow::Error,
-> {
-    use crate::outbound::{
-        BackendStream, direct_connect, socks5h_connect, socks5h_connect_target, ss_connect_fresh,
-        ss_connect_pooled,
-    };
+) -> Vec<(usize, std::sync::Arc<crate::backend::BackendInfo>)> {
     use std::sync::atomic::Ordering;
-    use std::time::Duration;
-
-    let backend_timeout = Duration::from_secs(10);
-
-    // Use route-specific candidates if a route is bound, otherwise global.
-    let candidates = pool.get_route_candidates(route_idx);
     let healthy = &candidates.healthy;
-    let unhealthy = &candidates.unhealthy;
 
-    let mut backend_stream: Option<crate::outbound::BackendStream> = None;
-    let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
-
-    let iterator: Vec<(usize, std::sync::Arc<crate::backend::BackendInfo>)> = if candidates.strategy
-        == crate::config::GroupStrategy::ConsistentHashing
+    if candidates.strategy == crate::config::GroupStrategy::ConsistentHashing
         && !healthy.is_empty()
         && !candidates.hash_ring.is_empty()
     {
@@ -277,7 +255,38 @@ pub async fn route_and_connect(
         result
     } else {
         healthy.clone()
+    }
+}
+
+pub async fn route_and_connect(
+    pool: &crate::backend::BackendPool,
+    target: &TargetAddr,
+    route_idx: Option<usize>,
+) -> Result<
+    (
+        crate::outbound::BackendStream,
+        Arc<crate::backend::TrafficCounters>,
+    ),
+    anyhow::Error,
+> {
+    use crate::outbound::{
+        BackendStream, direct_connect, socks5h_connect, socks5h_connect_target, ss_connect_fresh,
+        ss_connect_pooled,
     };
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let backend_timeout = Duration::from_secs(10);
+
+    // Use route-specific candidates if a route is bound, otherwise global.
+    let candidates = pool.get_route_candidates(route_idx);
+    let healthy = &candidates.healthy;
+    let unhealthy = &candidates.unhealthy;
+
+    let mut backend_stream: Option<crate::outbound::BackendStream> = None;
+    let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
+
+    let iterator = get_candidate_iterator(&candidates, target);
 
     // First pass: try healthy backends.
     for (index, info) in &iterator {
@@ -389,8 +398,81 @@ pub async fn route_and_connect(
     if let (Some(stream), Some(traffic)) = (backend_stream, chosen_traffic) {
         Ok((stream, traffic))
     } else {
-        Err(anyhow::anyhow!("all backends failed to connect"))
+        anyhow::bail!("all backends failed for {}", target)
     }
+}
+
+pub async fn route_and_connect_udp(
+    pool: &crate::backend::BackendPool,
+    target: &TargetAddr,
+    route_idx: Option<usize>,
+) -> Result<
+    (
+        crate::udp::UdpBackendSession,
+        std::sync::Arc<crate::backend::TrafficCounters>,
+    ),
+    anyhow::Error,
+> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let backend_timeout = Duration::from_secs(10);
+    let candidates = pool.get_route_candidates(route_idx);
+    let iterator = get_candidate_iterator(&candidates, target);
+
+    for (index, info) in &iterator {
+        if !info.udp_enabled {
+            continue;
+        }
+
+        let traffic = pool.get_traffic_counters(*index).unwrap_or_default();
+
+        if info.is_direct() {
+            if let Some(ref tc) = pool.get_traffic_counters(*index) {
+                tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Ok(socket) = crate::udp::create_tuned_udp_socket() {
+                return Ok((crate::udp::UdpBackendSession::Direct { socket }, traffic));
+            }
+        } else if info.is_shadowsocks() {
+            let ss_cfg = info.ss_config.as_ref().unwrap();
+            let ss_ctx = info.ss_context.as_ref().unwrap().clone();
+            if let Ok(socket) = ::shadowsocks::relay::udprelay::ProxySocket::connect(ss_ctx, ss_cfg.as_ref()).await {
+                let server_addr = match ss_cfg.addr() {
+                    ::shadowsocks::config::ServerAddr::SocketAddr(sa) => *sa,
+                    ::shadowsocks::config::ServerAddr::DomainName(domain, port) => {
+                        if let Ok(mut addrs) = tokio::net::lookup_host((domain.as_str(), *port)).await {
+                            if let Some(addr) = addrs.next() {
+                                addr
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+                return Ok((crate::udp::UdpBackendSession::Shadowsocks { socket, server_addr }, traffic));
+            }
+        } else {
+            // SOCKS5
+            if let Ok(tcp_stream) = crate::outbound::connect_endpoint(info, backend_timeout).await {
+                if let Ok(tcp_stream) = crate::outbound::socks5::socks5h_authenticate(tcp_stream, info).await {
+                    if let Ok((tcp_stream, backend_relay_addr)) = crate::outbound::socks5::socks5h_udp_associate(tcp_stream).await {
+                        if let Ok(socket) = crate::udp::create_tuned_udp_socket() {
+                            return Ok((crate::udp::UdpBackendSession::Socks5 {
+                                socket,
+                                backend_relay_addr,
+                                _tcp: tokio::sync::Mutex::new(crate::outbound::BackendStream::boxed(Box::pin(tcp_stream))),
+                            }, traffic));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("all UDP backends failed for {}", target)
 }
 
 /// High-performance bidirectional relay with unified traffic counter tracking and clean stream shutdown.

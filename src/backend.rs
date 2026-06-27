@@ -90,6 +90,7 @@ pub struct BackendInfo {
     pub enabled: Option<bool>,
     pub force_healthy: bool,
     pub max_fails: u32,
+    pub udp_enabled: bool,
 }
 
 impl std::fmt::Debug for BackendInfo {
@@ -235,6 +236,7 @@ impl BackendInfo {
             enabled: cfg.enabled,
             force_healthy: cfg.force_healthy,
             max_fails: cfg.max_fails,
+            udp_enabled: cfg.network.as_deref() == Some("tcp_udp"),
         })
     }
 

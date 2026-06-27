@@ -15,7 +15,7 @@ use shadowsocks::relay::tcprelay::proxy_stream::client::ProxyClientStream;
 use super::{BackendStream, TargetAddr};
 
 /// Convert our [`TargetAddr`] to the shadowsocks [`SsAddress`] type.
-fn to_ss_address(target: &TargetAddr) -> SsAddress {
+pub fn to_ss_address(target: &TargetAddr) -> SsAddress {
     match target {
         TargetAddr::Domain(host, port) => SsAddress::DomainNameAddress(host.clone(), *port),
         TargetAddr::Ip(addr) => SsAddress::SocketAddress(*addr),

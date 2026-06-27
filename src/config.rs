@@ -178,6 +178,8 @@ pub enum InboundItemConfig {
         filter: Option<FilterConfig>,
         #[serde(default)]
         route: Option<String>,
+        #[serde(default)]
+        network: Option<String>,
     },
     Shadowsocks {
         listen: String,
@@ -189,6 +191,8 @@ pub enum InboundItemConfig {
         filter: Option<FilterConfig>,
         #[serde(default)]
         route: Option<String>,
+        #[serde(default)]
+        network: Option<String>,
     },
     Http {
         listen: String,
@@ -223,6 +227,8 @@ pub struct Socks5InboundConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub filter: Option<FilterConfig>,
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 /// Shadowsocks inbound listener.
@@ -234,6 +240,8 @@ pub struct ShadowsocksInboundConfig {
     pub method: String,
     #[serde(default)]
     pub filter: Option<FilterConfig>,
+    #[serde(default)]
+    pub network: Option<String>,
 }
 
 /// HTTP inbound listener.
@@ -289,6 +297,8 @@ pub struct BackendConfig {
     /// If true, do not perform health check and consider healthy forever (default: false).
     #[serde(default)]
     pub force_healthy: bool,
+    #[serde(default)]
+    pub network: Option<String>,
     /// Number of consecutive failures before marking the backend as unhealthy (default: 1).
     #[serde(default = "default_max_fails")]
     pub max_fails: u32,
@@ -385,6 +395,7 @@ impl Config {
                 tls: None,
                 filter: None,
                 route: None,
+                network: s5.network.clone(),
             });
         }
         if let Some(ref ss) = self.inbound.shadowsocks {
@@ -395,6 +406,7 @@ impl Config {
                 tls: None,
                 filter: None,
                 route: None,
+                network: ss.network.clone(),
             });
         }
         if let Some(ref http) = self.inbound.http {

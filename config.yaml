@@ -2,8 +2,6 @@
 # ---------------------
 # A high-performance proxy load balancer with multi-protocol inbound support.
 
-inbound: {}
-
 # Global filter settings
 filter:
   enabled: true
@@ -33,6 +31,7 @@ inbounds:
     username: "inbound-user"
     password: "inbound-password"
     route: "proxy-group"          # ◀ Bound to "proxy-group" (nested: region-us + region-eu)
+    network: "tcp_udp"            # ◀ Enable UDP associate for SOCKS5
     filter:
       enabled: false
 
@@ -42,6 +41,7 @@ inbounds:
     password: "another-password"
     method: "chacha20-ietf-poly1305"
     route: "telegram-group"       # ◀ Bound to "telegram-group" (failover: region-us → direct)
+    network: "tcp_udp"            # ◀ Enable UDP proxying for Shadowsocks
 
   - type: mtproto
     listen: "0.0.0.0:8443"
@@ -82,6 +82,7 @@ backends:
     name: "us-east-1"
     username: "user1"
     password: "pass1"
+    network: "tcp_udp"
 
   - type: socks5
     address: "127.0.0.1:10801"
@@ -130,6 +131,7 @@ backends:
     username: "chacha20-ietf-poly1305"
     password: "my-shadowsocks-password"
     pool_size: 10
+    network: "tcp_udp"
 
   - type: socks5
     address: "tls-socks5-server.example.com:10802"

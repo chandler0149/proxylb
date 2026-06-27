@@ -15,6 +15,7 @@ mod scheduler;
 pub mod stats;
 pub mod tls;
 mod web;
+pub mod udp;
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -319,6 +320,7 @@ async fn main_async(
                                 username,
                                 password,
                                 route,
+                                network,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
                                     let mgr = std::sync::Arc::new(
@@ -358,6 +360,7 @@ async fn main_async(
                                         route_idx,
                                         cancel_clone,
                                         prebound_uds,
+                                        network.as_deref() == Some("tcp_udp"),
                                     )
                                     .await
                                     {
@@ -372,6 +375,7 @@ async fn main_async(
                                 filter,
                                 tls: tls_cfg,
                                 route,
+                                network,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
                                     let mgr = std::sync::Arc::new(
@@ -412,6 +416,7 @@ async fn main_async(
                                             route_idx,
                                             cancel_clone,
                                             prebound_uds,
+                                            network.as_deref() == Some("tcp_udp"),
                                         )
                                         .await
                                     {

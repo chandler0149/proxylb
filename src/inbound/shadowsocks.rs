@@ -32,6 +32,7 @@ pub async fn run_shadowsocks_inbound(
     route_idx: Option<usize>,
     cancel: CancellationToken,
     prebound_uds: Option<std::os::unix::net::UnixListener>,
+    udp_enabled: bool,
 ) -> anyhow::Result<()> {
     let method: CipherKind = method_str
         .parse()
@@ -52,6 +53,17 @@ pub async fn run_shadowsocks_inbound(
 
     let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, method = %method_str, "Shadowsocks inbound listener started");
+
+    if udp_enabled {
+        let listen_addr_clone = listen_addr.clone();
+        let password_clone = password.clone();
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_shadowsocks_udp(listen_addr_clone, password_clone, method, pool_clone, route_idx).await {
+                tracing::error!("Shadowsocks UDP error: {}", e);
+            }
+        });
+    }
 
     crate::inbound::run_accept_loop(listener, cancel, "Shadowsocks", move |stream, client_id| {
         let pool = pool.clone();
@@ -80,6 +92,81 @@ pub async fn run_shadowsocks_inbound(
         }
     })
     .await
+}
+
+async fn run_shadowsocks_udp(
+    listen_addr: String,
+    password: String,
+    method: CipherKind,
+    pool: BackendPool,
+    route_idx: Option<usize>,
+) -> anyhow::Result<()> {
+    let listen_socket: SocketAddr = listen_addr.parse().map_err(|_| anyhow::anyhow!("Shadowsocks UDP listener must be an IP address: {}", listen_addr))?;
+    let ss_config = SsServerConfig::new(listen_socket, &password, method)?;
+    let context = shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Server);
+    
+    let udp_listener = Arc::new(shadowsocks::relay::udprelay::ProxySocket::bind(context, &ss_config).await?);
+    tracing::info!(listen = %listen_addr, "Shadowsocks UDP inbound listener started");
+
+    use dashmap::DashMap;
+    // Map from (ClientAddr, TargetAddr) -> UdpBackendSession
+    let backend_map: Arc<DashMap<(SocketAddr, TargetAddr), Arc<crate::udp::UdpBackendSession>>> = Arc::new(DashMap::new());
+
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let (len, client_addr, target_addr, _) = match udp_listener.recv_from(&mut buf).await {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::debug!("Shadowsocks UDP recv error: {}", e);
+                continue;
+            }
+        };
+
+        let target = match target_addr {
+            shadowsocks::relay::socks5::Address::SocketAddress(sa) => TargetAddr::Ip(sa),
+            shadowsocks::relay::socks5::Address::DomainNameAddress(host, port) => TargetAddr::Domain(host, port),
+        };
+
+        let key = (client_addr, target.clone());
+        let session = if let Some(session) = backend_map.get(&key) {
+            session.clone()
+        } else {
+            match crate::inbound::route_and_connect_udp(&pool, &target, route_idx).await {
+                Ok((session, _traffic)) => {
+                    let session = Arc::new(session);
+                    backend_map.insert(key.clone(), session.clone());
+
+                    let session_clone = session.clone();
+                    let inbound_clone = udp_listener.clone();
+                    let target_clone = target.clone();
+                    
+                    tokio::spawn(async move {
+                        let mut back_buf = vec![0u8; 65536];
+                        loop {
+                            match session_clone.recv_from(&mut back_buf).await {
+                                Ok((n, _)) => {
+                                    let ss_addr = match &target_clone {
+                                        TargetAddr::Ip(sa) => shadowsocks::relay::socks5::Address::SocketAddress(*sa),
+                                        TargetAddr::Domain(host, port) => shadowsocks::relay::socks5::Address::DomainNameAddress(host.clone(), *port),
+                                    };
+                                    let _ = inbound_clone.send_to(client_addr, &ss_addr, &back_buf[..n]).await;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+
+                    session
+                }
+                Err(e) => {
+                    tracing::error!("Shadowsocks UDP route failed for {}: {}", target, e);
+                    continue;
+                }
+            }
+        };
+
+        let _ = session.send_to(&buf[..len], &target).await;
+    }
 }
 
 /// Handle a single Shadowsocks connection.
