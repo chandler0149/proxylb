@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { LineChart, Line, ResponsiveContainer, YAxis, Tooltip } from 'recharts';
 import './App.css';
 
 function App() {
@@ -20,6 +21,12 @@ function App() {
   const [checkTarget, setCheckTarget] = useState('');
   const [checkResult, setCheckResult] = useState(null); // { blocked: bool } or null or 'loading'
 
+  const previousInboundsRef = useRef({});
+  const previousBackendsRef = useRef({});
+  const lastFetchTimeRef = useRef(Date.now());
+  const [inboundSpeeds, setInboundSpeeds] = useState({});
+  const [backendSpeeds, setBackendSpeeds] = useState({});
+
   // Sync API host to localStorage
   const handleApiHostChange = (e) => {
     const val = e.target.value;
@@ -36,6 +43,75 @@ function App() {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
       const json = await response.json();
+      
+      const now = Date.now();
+      const timeDiffSec = (now - lastFetchTimeRef.current) / 1000;
+      
+      if (json.inbounds && timeDiffSec > 0) {
+        setInboundSpeeds(prevSpeeds => {
+          const nextSpeeds = { ...prevSpeeds };
+          const timeLabel = new Date(now).toLocaleTimeString([], { hour12: false, minute: '2-digit', second: '2-digit' });
+          json.inbounds.forEach(inbound => {
+            const prev = previousInboundsRef.current[inbound.listen];
+            let txSpeed = 0;
+            let rxSpeed = 0;
+            if (prev) {
+              const txDiff = Math.max(0, inbound.tx_bytes - prev.tx_bytes);
+              const rxDiff = Math.max(0, inbound.rx_bytes - prev.rx_bytes);
+              txSpeed = Number((txDiff / timeDiffSec).toFixed(2));
+              rxSpeed = Number((rxDiff / timeDiffSec).toFixed(2));
+            }
+            
+            if (!nextSpeeds[inbound.listen]) {
+              nextSpeeds[inbound.listen] = Array(10).fill({ time: '', tx_speed: 0, rx_speed: 0 });
+            }
+            const history = [...nextSpeeds[inbound.listen]];
+            history.shift(); // remove oldest
+            history.push({ time: timeLabel, tx_speed: txSpeed, rx_speed: rxSpeed });
+            nextSpeeds[inbound.listen] = history;
+            
+            previousInboundsRef.current[inbound.listen] = {
+              tx_bytes: inbound.tx_bytes,
+              rx_bytes: inbound.rx_bytes
+            };
+          });
+          return nextSpeeds;
+        });
+      }
+
+      if (json.backends && timeDiffSec > 0) {
+        setBackendSpeeds(prevSpeeds => {
+          const nextSpeeds = { ...prevSpeeds };
+          const timeLabel = new Date(now).toLocaleTimeString([], { hour12: false, minute: '2-digit', second: '2-digit' });
+          json.backends.forEach(b => {
+            const prev = previousBackendsRef.current[b.name];
+            let txSpeed = 0;
+            let rxSpeed = 0;
+            if (prev) {
+              const txDiff = Math.max(0, b.bytes_up - prev.bytes_up);
+              const rxDiff = Math.max(0, b.bytes_down - prev.bytes_down);
+              txSpeed = Number((txDiff / timeDiffSec).toFixed(2));
+              rxSpeed = Number((rxDiff / timeDiffSec).toFixed(2));
+            }
+            
+            if (!nextSpeeds[b.name]) {
+              nextSpeeds[b.name] = Array(10).fill({ time: '', tx_speed: 0, rx_speed: 0 });
+            }
+            const history = [...nextSpeeds[b.name]];
+            history.shift();
+            history.push({ time: timeLabel, tx_speed: txSpeed, rx_speed: rxSpeed });
+            nextSpeeds[b.name] = history;
+            
+            previousBackendsRef.current[b.name] = {
+              bytes_up: b.bytes_up,
+              bytes_down: b.bytes_down
+            };
+          });
+          return nextSpeeds;
+        });
+      }
+      lastFetchTimeRef.current = now;
+      
       setData(json);
       setError(null);
     } catch (err) {
@@ -46,10 +122,10 @@ function App() {
     }
   };
 
-  // Poll API every 5 seconds
+  // Poll API every 1 second
   useEffect(() => {
     fetchStatus();
-    const interval = setInterval(fetchStatus, 5000);
+    const interval = setInterval(fetchStatus, 1000);
     return () => clearInterval(interval);
   }, [apiHost]);
 
@@ -188,11 +264,11 @@ function App() {
 
   // Utility to format bytes
   const formatBytes = (n) => {
-    if (n === 0 || !n) return '0 B';
+    if (!n || n <= 0) return '0.00 B';
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.min(Math.floor(Math.log2(n) / 10), units.length - 1);
+    const i = Math.max(0, Math.min(Math.floor(Math.log2(n) / 10), units.length - 1));
     const val = n / Math.pow(1024, i);
-    return (i === 0 ? val : val.toFixed(2)) + ' ' + units[i];
+    return val.toFixed(2) + ' ' + units[i];
   };
 
   // Utility to format time
@@ -304,11 +380,17 @@ function App() {
         <div className="traffic-row">
           <div className="traffic-item">
             <span className="traffic-label">Upload</span>
-            <span className="traffic-value upload">{formatBytes(b.bytes_up)}</span>
+            <span className="traffic-value upload" style={{ display: 'flex', flexDirection: 'column' }}>
+              {formatBytes(b.bytes_up)}
+              <span style={{ fontSize: '0.75rem', opacity: 0.8 }}>↑ {formatBytes(backendSpeeds[b.name]?.[9]?.tx_speed || 0)}/s</span>
+            </span>
           </div>
           <div className="traffic-item">
             <span className="traffic-label">Download</span>
-            <span className="traffic-value download">{formatBytes(b.bytes_down)}</span>
+            <span className="traffic-value download" style={{ display: 'flex', flexDirection: 'column' }}>
+              {formatBytes(b.bytes_down)}
+              <span style={{ fontSize: '0.75rem', opacity: 0.8 }}>↓ {formatBytes(backendSpeeds[b.name]?.[9]?.rx_speed || 0)}/s</span>
+            </span>
           </div>
           <div className="traffic-item">
             <span className="traffic-label">Active</span>
@@ -318,6 +400,21 @@ function App() {
             <span className="traffic-label">Total Conn</span>
             <span className="traffic-value">{b.total_connections}</span>
           </div>
+        </div>
+
+        <div style={{ height: '60px', marginTop: '10px' }}>
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={backendSpeeds[b.name] || Array(10).fill({ tx_speed: 0, rx_speed: 0 })}>
+              <Line type="monotone" dataKey="tx_speed" stroke="#ffa726" strokeWidth={2} dot={false} isAnimationActive={false} />
+              <Line type="monotone" dataKey="rx_speed" stroke="var(--accent-green)" strokeWidth={2} dot={false} isAnimationActive={false} />
+              <YAxis hide domain={['auto', 'auto']} />
+              <Tooltip
+                contentStyle={{ backgroundColor: 'rgba(0,0,0,0.8)', border: 'none', borderRadius: '4px', fontSize: '0.75rem', color: '#fff' }}
+                formatter={(value) => `${formatBytes(value)}/s`}
+                labelFormatter={() => ''}
+              />
+            </LineChart>
+          </ResponsiveContainer>
         </div>
 
         <div className="pool-row">
@@ -573,12 +670,32 @@ function App() {
                     </div>
                     <div className="inbound-stat-item" style={{ borderTop: '1px solid rgba(255,255,255,0.03)', paddingTop: '8px' }}>
                       <span className="inbound-stat-label">Uploaded</span>
-                      <span className="inbound-stat-value" style={{ color: '#ffa726' }}>{formatBytes(inbound.tx_bytes)}</span>
+                      <span className="inbound-stat-value" style={{ color: '#ffa726', display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                        {formatBytes(inbound.tx_bytes)}
+                        <span style={{ fontSize: '0.75rem', opacity: 0.8 }}>↑ {formatBytes(inboundSpeeds[inbound.listen]?.[9]?.tx_speed || 0)}/s</span>
+                      </span>
                     </div>
                     <div className="inbound-stat-item" style={{ borderTop: '1px solid rgba(255,255,255,0.03)', paddingTop: '8px' }}>
                       <span className="inbound-stat-label">Downloaded</span>
-                      <span className="inbound-stat-value" style={{ color: 'var(--accent-green)' }}>{formatBytes(inbound.rx_bytes)}</span>
+                      <span className="inbound-stat-value" style={{ color: 'var(--accent-green)', display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                        {formatBytes(inbound.rx_bytes)}
+                        <span style={{ fontSize: '0.75rem', opacity: 0.8 }}>↓ {formatBytes(inboundSpeeds[inbound.listen]?.[9]?.rx_speed || 0)}/s</span>
+                      </span>
                     </div>
+                  </div>
+                  <div style={{ height: '60px', marginTop: '10px' }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={inboundSpeeds[inbound.listen] || Array(10).fill({ tx_speed: 0, rx_speed: 0 })}>
+                        <Line type="monotone" dataKey="tx_speed" stroke="#ffa726" strokeWidth={2} dot={false} isAnimationActive={false} />
+                        <Line type="monotone" dataKey="rx_speed" stroke="var(--accent-green)" strokeWidth={2} dot={false} isAnimationActive={false} />
+                        <YAxis hide domain={['auto', 'auto']} />
+                        <Tooltip
+                          contentStyle={{ backgroundColor: 'rgba(0,0,0,0.8)', border: 'none', borderRadius: '4px', fontSize: '0.75rem', color: '#fff' }}
+                          formatter={(value) => `${formatBytes(value)}/s`}
+                          labelFormatter={() => ''}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
                   </div>
                 </div>
               );

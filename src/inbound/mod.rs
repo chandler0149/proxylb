@@ -507,10 +507,21 @@ where
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
     }
 
-    let mut final_up = 0;
-    let mut final_down = 0;
+    let domain = extract_parent_domain(target);
+    let domain_stats = pool.domain_manager.get_or_create(&domain);
+    let client_stats = pool.client_manager.get_or_create(&client_id);
 
-    match crate::relay::relay(&mut inbound_stream, &mut backend_stream).await {
+    domain_stats.total_connections.fetch_add(1, Ordering::Relaxed);
+    client_stats.total_connections.fetch_add(1, Ordering::Relaxed);
+
+    let mut up_counters = vec![&traffic.bytes_up, &domain_stats.tx_bytes, &client_stats.tx_bytes];
+    let mut down_counters = vec![&traffic.bytes_down, &domain_stats.rx_bytes, &client_stats.rx_bytes];
+    if let Some(ref stats) = inbound_stats {
+        up_counters.push(&stats.tx_bytes);
+        down_counters.push(&stats.rx_bytes);
+    }
+
+    match crate::relay::relay(&mut inbound_stream, &mut backend_stream, up_counters, down_counters).await {
         Ok((up, down)) => {
             tracing::debug!(
                 target = %target,
@@ -519,14 +530,7 @@ where
                 "{} relay complete",
                 protocol_name
             );
-            traffic.bytes_up.fetch_add(up, Ordering::Relaxed);
-            traffic.bytes_down.fetch_add(down, Ordering::Relaxed);
-            if let Some(ref stats) = inbound_stats {
-                stats.tx_bytes.fetch_add(up, Ordering::Relaxed);
-                stats.rx_bytes.fetch_add(down, Ordering::Relaxed);
-            }
-            final_up = up;
-            final_down = down;
+            // Counters were already incrementally updated in real-time by the relay.
         }
         Err(e) => {
             tracing::debug!(
@@ -542,30 +546,6 @@ where
     if let Some(ref stats) = inbound_stats {
         stats.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
-
-    // --- Deferred Stats Collection ---
-    // Extract parent domain for tracking
-    let domain = extract_parent_domain(target);
-
-    // Lookup/Create stats in the background (no impact on startup)
-    let domain_stats = pool.domain_manager.get_or_create(&domain);
-    let client_stats = pool.client_manager.get_or_create(&client_id);
-
-    domain_stats
-        .total_connections
-        .fetch_add(1, Ordering::Relaxed);
-    domain_stats.tx_bytes.fetch_add(final_up, Ordering::Relaxed);
-    domain_stats
-        .rx_bytes
-        .fetch_add(final_down, Ordering::Relaxed);
-
-    client_stats
-        .total_connections
-        .fetch_add(1, Ordering::Relaxed);
-    client_stats.tx_bytes.fetch_add(final_up, Ordering::Relaxed);
-    client_stats
-        .rx_bytes
-        .fetch_add(final_down, Ordering::Relaxed);
 
     // Flush the write-halves so peers see a clean EOF before we release the FDs.
     let _ = inbound_stream.shutdown().await;
