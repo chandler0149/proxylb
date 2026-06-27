@@ -4,4 +4,4 @@
 nginx
 
 # Exec ProxyLB (replaces this process with ProxyLB, preserving signals)
-exec proxylb -c config.yaml
+exec proxylb -c config.yaml run
