@@ -16,6 +16,10 @@ all: arm64 amd64
 FEATURES := --features filter
 
 web:
+	@if ! command -v npm >/dev/null 2>&1; then \
+		echo "ERROR: npm is not installed. Please install Node.js to build the web UI."; \
+		exit 1; \
+	fi
 	@echo "Building web UI..."
 	@cd web && npm install && npm run build
 
