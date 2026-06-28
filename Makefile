@@ -28,7 +28,7 @@ arm64: web
 
 box: web
 	@echo "Building for ARM64 (box)..."
-	RUSTFLAGS="-C target-cpu=cortex-a53" $(CARGO) build --release $(FEATURES)
+	RUSTFLAGS="-C target-cpu=cortex-a53" $(CARGO) build --release
 	
 amd64: web
 	@echo "Building for AMD64..."

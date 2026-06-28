@@ -12,7 +12,7 @@ WORKDIR /usr/src/app
 COPY . .
 # Copy the compiled web UI so rust-embed can bundle it into the binary
 COPY --from=frontend-builder /usr/src/app/web/dist ./web/dist
-RUN make box
+RUN cargo build --release --features filter
 
 # Stage 3: Runtime image
 FROM debian:trixie-slim
