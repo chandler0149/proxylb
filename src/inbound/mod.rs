@@ -9,6 +9,9 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
 use tokio_util::sync::CancellationToken;
 
+pub(crate) static WRR_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 // ─── Unified listener abstraction ────────────────────────────────────────────
 
 /// A bound listener that accepts either TCP or Unix-domain-socket connections.
@@ -20,12 +23,15 @@ pub enum BoundListener {
 impl BoundListener {
     /// Bind to `addr`. A `unix://…` prefix selects a UDS listener; anything
     /// else is treated as a TCP `host:port`.
-    pub async fn bind(addr: &str, prebound_uds: Option<std::os::unix::net::UnixListener>) -> anyhow::Result<Self> {
+    pub async fn bind(
+        addr: &str,
+        prebound_uds: Option<std::os::unix::net::UnixListener>,
+    ) -> anyhow::Result<Self> {
         if let Some(uds) = prebound_uds {
             uds.set_nonblocking(true)?;
             return Ok(Self::Unix(UnixListener::from_std(uds)?));
         }
-        
+
         if let Some(path) = addr.strip_prefix("unix://") {
             if let Some(parent) = std::path::Path::new(path).parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -41,15 +47,15 @@ impl BoundListener {
             } else {
                 socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?
             };
-            
+
             socket.set_reuse_address(true)?;
             #[cfg(not(windows))]
             socket.set_reuse_port(true)?;
-            
+
             socket.set_nonblocking(true)?;
             socket.bind(&addr_parsed.into())?;
             socket.listen(1024)?;
-            
+
             let std_listener: std::net::TcpListener = socket.into();
             Ok(Self::Tcp(TcpListener::from_std(std_listener)?))
         }
@@ -57,16 +63,16 @@ impl BoundListener {
 
     /// Accept one connection and return the stream together with a display
     /// string for the remote address.
-    pub async fn accept(&self) -> std::io::Result<(InboundStream, String)> {
+    pub async fn accept(&self) -> std::io::Result<(InboundStream, crate::stats::ClientId)> {
         match self {
             BoundListener::Tcp(l) => {
                 let (s, addr) = l.accept().await?;
                 let _ = s.set_nodelay(true);
-                Ok((InboundStream::Tcp(s), addr.to_string()))
+                Ok((InboundStream::Tcp(s), crate::stats::ClientId::Ip(addr.ip())))
             }
             BoundListener::Unix(l) => {
-                let (s, addr) = l.accept().await?;
-                Ok((InboundStream::Unix(s), format!("unix:{:?}", addr)))
+                let (s, _addr) = l.accept().await?;
+                Ok((InboundStream::Unix(s), crate::stats::ClientId::Unix))
             }
         }
     }
@@ -150,7 +156,7 @@ pub async fn run_accept_loop<F, Fut>(
     on_accept: F,
 ) -> anyhow::Result<()>
 where
-    F: Fn(InboundStream, String) -> Fut,
+    F: Fn(InboundStream, crate::stats::ClientId) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
     loop {
@@ -158,7 +164,7 @@ where
             biased;
             _ = cancel.cancelled() => break,
             res = listener.accept() => match res {
-                Ok((stream, addr)) => { tokio::spawn(on_accept(stream, addr)); }
+                Ok((stream, client_id)) => { tokio::spawn(on_accept(stream, client_id)); }
                 Err(e) => { tracing::warn!(error = %e, "{protocol} accept error"); }
             }
         }
@@ -166,33 +172,92 @@ where
     Ok(())
 }
 
-/// Branch prediction hint: indicates that `b` is highly likely to be true.
-#[inline(always)]
-pub fn likely(b: bool) -> bool {
-    if !b {
-        cold_path();
-    }
-    b
-}
-
-/// Branch prediction hint: indicates that `b` is highly unlikely to be true.
-#[inline(always)]
-pub fn unlikely(b: bool) -> bool {
-    if b {
-        cold_path();
-    }
-    b
-}
-
-/// Helper function representing a cold path.
-#[cold]
-#[inline(never)]
-pub fn cold_path() {}
-
 /// Consolidates high-performance routing and load-balanced/failover backend connection establishment.
 ///
 /// When `route` is `Some`, uses route-specific candidates (bound to a group or backend).
 /// When `route` is `None`, uses the global failover order.
+
+/// Extract the parent domain (e.g. "example.com" from "sub.example.com") without allocation.
+/// Returns a `&str` slice into the input — zero heap allocation.
+pub fn extract_parent_domain_str(host: &str) -> &str {
+    let bytes = host.as_bytes();
+    let mut dot_count = 0u8;
+    for i in (0..bytes.len()).rev() {
+        if bytes[i] == b'.' {
+            dot_count += 1;
+            if dot_count == 2 {
+                return &host[i + 1..];
+            }
+        }
+    }
+    host // single-label or two-label domain — return as-is
+}
+
+pub fn extract_parent_domain(target: &TargetAddr) -> String {
+    match target {
+        TargetAddr::Ip(addr) => addr.ip().to_string(),
+        TargetAddr::Domain(host, _) => extract_parent_domain_str(host).to_string(),
+    }
+}
+
+pub fn get_candidate_iterator(
+    candidates: &std::sync::Arc<crate::scheduler::CachedCandidates>,
+    target: &TargetAddr,
+) -> Vec<(usize, std::sync::Arc<crate::backend::BackendInfo>)> {
+    use std::sync::atomic::Ordering;
+    let healthy = &candidates.healthy;
+
+    if candidates.strategy == crate::config::GroupStrategy::ConsistentHashing
+        && !healthy.is_empty()
+        && !candidates.hash_ring.is_empty()
+    {
+        let parent_domain = extract_parent_domain(target);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&parent_domain, &mut hasher);
+        let target_hash = std::hash::Hasher::finish(&hasher);
+
+        let idx = match candidates
+            .hash_ring
+            .binary_search_by_key(&target_hash, |(h, _)| *h)
+        {
+            Ok(idx) => idx,
+            Err(idx) => {
+                if idx == candidates.hash_ring.len() {
+                    0
+                } else {
+                    idx
+                }
+            }
+        };
+
+        let array_idx = candidates.hash_ring[idx].1;
+
+        healthy[array_idx..]
+            .iter()
+            .chain(healthy[..array_idx].iter())
+            .cloned()
+            .collect()
+    } else if candidates.strategy == crate::config::GroupStrategy::WeightedRoundRobin
+        && !healthy.is_empty()
+        && !candidates.wrr_choices.is_empty()
+    {
+        let count = WRR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let idx = count % candidates.wrr_choices.len();
+        let target_backend_idx = candidates.wrr_choices[idx];
+
+        let mut result = Vec::with_capacity(healthy.len());
+        if let Some(pos) = healthy.iter().position(|(i, _)| *i == target_backend_idx) {
+            result.extend(healthy[pos..].iter().cloned());
+            result.extend(healthy[..pos].iter().cloned());
+        } else {
+            result.extend(healthy.iter().cloned());
+        }
+        result
+    } else {
+        healthy.clone()
+    }
+}
+
 pub async fn route_and_connect(
     pool: &crate::backend::BackendPool,
     target: &TargetAddr,
@@ -215,14 +280,15 @@ pub async fn route_and_connect(
 
     // Use route-specific candidates if a route is bound, otherwise global.
     let candidates = pool.get_route_candidates(route_idx);
-    let healthy = &candidates.healthy;
     let unhealthy = &candidates.unhealthy;
 
     let mut backend_stream: Option<crate::outbound::BackendStream> = None;
     let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
 
+    let iterator = get_candidate_iterator(&candidates, target);
+
     // First pass: try healthy backends.
-    for (index, info) in healthy {
+    for (index, info) in &iterator {
         // Lock-free cache lookup: yields both the pooled stream (if any) and the traffic Arc.
         let pc = pool.get_pooled_connection(*index);
         let (pool_stream, traffic) = match pc {
@@ -331,8 +397,100 @@ pub async fn route_and_connect(
     if let (Some(stream), Some(traffic)) = (backend_stream, chosen_traffic) {
         Ok((stream, traffic))
     } else {
-        Err(anyhow::anyhow!("all backends failed to connect"))
+        anyhow::bail!("all backends failed for {}", target)
     }
+}
+
+pub async fn route_and_connect_udp(
+    pool: &crate::backend::BackendPool,
+    target: &TargetAddr,
+    route_idx: Option<usize>,
+) -> Result<
+    (
+        crate::udp::UdpBackendSession,
+        std::sync::Arc<crate::backend::TrafficCounters>,
+    ),
+    anyhow::Error,
+> {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let backend_timeout = Duration::from_secs(10);
+    let candidates = pool.get_route_candidates(route_idx);
+    let iterator = get_candidate_iterator(&candidates, target);
+
+    for (index, info) in &iterator {
+        if !info.udp_enabled {
+            continue;
+        }
+
+        let traffic = pool.get_traffic_counters(*index).unwrap_or_default();
+
+        if info.is_direct() {
+            if let Some(ref tc) = pool.get_traffic_counters(*index) {
+                tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Ok(socket) = crate::udp::create_tuned_udp_socket() {
+                return Ok((crate::udp::UdpBackendSession::Direct { socket }, traffic));
+            }
+        } else if info.is_shadowsocks() {
+            let ss_cfg = info.ss_config.as_ref().unwrap();
+            let ss_ctx = info.ss_context.as_ref().unwrap().clone();
+            if let Ok(socket) =
+                ::shadowsocks::relay::udprelay::ProxySocket::connect(ss_ctx, ss_cfg.as_ref()).await
+            {
+                let server_addr = match ss_cfg.addr() {
+                    ::shadowsocks::config::ServerAddr::SocketAddr(sa) => *sa,
+                    ::shadowsocks::config::ServerAddr::DomainName(domain, port) => {
+                        if let Ok(mut addrs) =
+                            tokio::net::lookup_host((domain.as_str(), *port)).await
+                        {
+                            if let Some(addr) = addrs.next() {
+                                addr
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+                return Ok((
+                    crate::udp::UdpBackendSession::Shadowsocks {
+                        socket,
+                        server_addr,
+                    },
+                    traffic,
+                ));
+            }
+        } else {
+            // SOCKS5
+            if let Ok(tcp_stream) = crate::outbound::connect_endpoint(info, backend_timeout).await {
+                if let Ok(tcp_stream) =
+                    crate::outbound::socks5::socks5h_authenticate(tcp_stream, info).await
+                {
+                    if let Ok((tcp_stream, backend_relay_addr)) =
+                        crate::outbound::socks5::socks5h_udp_associate(tcp_stream).await
+                    {
+                        if let Ok(socket) = crate::udp::create_tuned_udp_socket() {
+                            return Ok((
+                                crate::udp::UdpBackendSession::Socks5 {
+                                    socket,
+                                    backend_relay_addr,
+                                    _tcp: tokio::sync::Mutex::new(
+                                        crate::outbound::BackendStream::boxed(Box::pin(tcp_stream)),
+                                    ),
+                                },
+                                traffic,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("all UDP backends failed for {}", target)
 }
 
 /// High-performance bidirectional relay with unified traffic counter tracking and clean stream shutdown.
@@ -345,8 +503,10 @@ pub async fn relay_and_track<I>(
     mut backend_stream: crate::outbound::BackendStream,
     traffic: Arc<crate::backend::TrafficCounters>,
     inbound_stats: Option<Arc<crate::backend::InboundStats>>,
+    client_id: crate::stats::ClientId,
     target: &TargetAddr,
     protocol_name: &str,
+    pool: &crate::backend::BackendPool,
 ) -> Result<(), anyhow::Error>
 where
     I: tokio::io::AsyncRead
@@ -366,7 +526,40 @@ where
         stats.active_connections.fetch_add(1, Ordering::Relaxed);
     }
 
-    match crate::relay::relay(&mut inbound_stream, &mut backend_stream).await {
+    let domain = extract_parent_domain(target);
+    let domain_stats = pool.domain_manager.get_or_create(&domain);
+    let client_stats = pool.client_manager.get_or_create(&client_id);
+
+    domain_stats
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+    client_stats
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+
+    let mut up_counters = vec![
+        &traffic.bytes_up,
+        &domain_stats.tx_bytes,
+        &client_stats.tx_bytes,
+    ];
+    let mut down_counters = vec![
+        &traffic.bytes_down,
+        &domain_stats.rx_bytes,
+        &client_stats.rx_bytes,
+    ];
+    if let Some(ref stats) = inbound_stats {
+        up_counters.push(&stats.tx_bytes);
+        down_counters.push(&stats.rx_bytes);
+    }
+
+    match crate::relay::relay(
+        &mut inbound_stream,
+        &mut backend_stream,
+        up_counters,
+        down_counters,
+    )
+    .await
+    {
         Ok((up, down)) => {
             tracing::debug!(
                 target = %target,
@@ -375,12 +568,7 @@ where
                 "{} relay complete",
                 protocol_name
             );
-            traffic.bytes_up.fetch_add(up, Ordering::Relaxed);
-            traffic.bytes_down.fetch_add(down, Ordering::Relaxed);
-            if let Some(ref stats) = inbound_stats {
-                stats.tx_bytes.fetch_add(up, Ordering::Relaxed);
-                stats.rx_bytes.fetch_add(down, Ordering::Relaxed);
-            }
+            // Counters were already incrementally updated in real-time by the relay.
         }
         Err(e) => {
             tracing::debug!(
@@ -409,10 +597,11 @@ where
 }
 
 /// Helper function to check if a target address points to a private/loopback address.
-pub async fn is_private_target(target: &TargetAddr) -> bool {
+#[allow(dead_code)]
+pub fn is_private_target_sync(target: &crate::outbound::TargetAddr) -> bool {
     match target {
-        TargetAddr::Ip(addr) => is_private_ip(addr.ip()),
-        TargetAddr::Domain(host, _port) => {
+        crate::outbound::TargetAddr::Ip(addr) => is_private_ip(addr.ip()),
+        crate::outbound::TargetAddr::Domain(host, _port) => {
             let host_lower = host.to_lowercase();
             host_lower == "localhost" || host_lower.ends_with(".local")
         }
@@ -420,6 +609,7 @@ pub async fn is_private_target(target: &TargetAddr) -> bool {
 }
 
 /// Helper function to check if an IpAddr is private or loopback/local.
+#[allow(dead_code)]
 fn is_private_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
@@ -438,10 +628,12 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+#[allow(dead_code)]
 fn is_ipv6_unique_local(ipv6: &std::net::Ipv6Addr) -> bool {
     (ipv6.octets()[0] & 0xfe) == 0xfc
 }
 
+#[allow(dead_code)]
 fn is_ipv6_link_local(ipv6: &std::net::Ipv6Addr) -> bool {
     (ipv6.octets()[0] == 0xfe) && ((ipv6.octets()[1] & 0xc0) == 0x80)
 }
@@ -469,18 +661,18 @@ mod tests {
         assert!(!is_private_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 
-    #[tokio::test]
-    async fn test_is_private_target() {
+    #[test]
+    fn test_is_private_target() {
         let t1 = TargetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80));
-        assert!(is_private_target(&t1).await);
+        assert!(is_private_target_sync(&t1));
 
         let t2 = TargetAddr::Domain("localhost".to_string(), 80);
-        assert!(is_private_target(&t2).await);
+        assert!(is_private_target_sync(&t2));
 
         let t3 = TargetAddr::Domain("some-service.local".to_string(), 80);
-        assert!(is_private_target(&t3).await);
+        assert!(is_private_target_sync(&t3));
 
         let t4 = TargetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80));
-        assert!(!is_private_target(&t4).await);
+        assert!(!is_private_target_sync(&t4));
     }
 }

@@ -6,17 +6,17 @@ use super::BoundListener;
 use crate::backend::BackendPool;
 use crate::outbound::TargetAddr;
 
-use mtproto_server::protocol::constants::{self, *};
+use mtproto_server::crypto::{AesCtr, SecureRandom};
 use mtproto_server::handshake::*;
-use mtproto_server::stream::{FakeTlsReader, FakeTlsWriter, CryptoReader, CryptoWriter};
+use mtproto_server::protocol::constants::{self, *};
 use mtproto_server::protocol::tls;
-use mtproto_server::crypto::{SecureRandom, AesCtr};
+use mtproto_server::stream::{CryptoReader, CryptoWriter, FakeTlsReader, FakeTlsWriter};
 
 pub async fn run_mtproto_inbound(
     listen_addr: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     secret_hex: String,
     _tls_cfg: Option<crate::config::TlsServerConfig>,
     route_idx: Option<usize>,
@@ -37,24 +37,26 @@ pub async fn run_mtproto_inbound(
     let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, "MTProto inbound listener started");
 
-    crate::inbound::run_accept_loop(listener, cancel, "MTProto", move |stream, addr| {
+    crate::inbound::run_accept_loop(listener, cancel, "MTProto", move |stream, client_id| {
         let pool = pool.clone();
         let stats = Arc::clone(&stats);
         let secret = secret.clone();
+        let local_filter_manager = local_filter_manager.clone();
 
         async move {
             if let Err(e) = handle_mtproto_connection(
                 stream,
+                client_id.clone(),
                 pool,
                 stats,
-                filter_enabled,
+                local_filter_manager.clone(),
                 secret,
                 SecureRandom::new(),
                 route_idx,
             )
             .await
             {
-                tracing::debug!(client = %addr, error = %e, "MTProto connection failed");
+                tracing::debug!(client = %client_id, error = %e, "MTProto connection failed");
             }
         }
     })
@@ -134,20 +136,26 @@ impl<S: crate::relay::AsRawStreamRef> crate::relay::AsRawStreamRef for PeekStrea
 
 async fn handle_mtproto_connection<S>(
     mut stream: S,
+    client_id: crate::stats::ClientId,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     secret: [u8; MTPROTO_SECRET_BYTES],
     rng: SecureRandom,
     route_idx: Option<usize>,
 ) -> anyhow::Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + crate::relay::AsRawStreamRef + 'static,
+    S: tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + Unpin
+        + Send
+        + crate::relay::AsRawStreamRef
+        + 'static,
 {
     // Apply TLS if configured.
     // Wait, MTProto handles its own FakeTLS, but if standard TLS is configured...
     // Usually MTProto is used directly. We'll support both.
-    
+
     let mut peek_buf = [0u8; 1024];
     let mut peek_len = 0;
     while peek_len < 64 {
@@ -166,13 +174,15 @@ where
     if is_tls {
         let tls_len = ((peek_buf[3] as usize) << 8) | (peek_buf[4] as usize);
         total_hello_len = 5 + tls_len;
-        
+
         if total_hello_len > peek_buf.len() {
             anyhow::bail!("TLS ClientHello too large: {}", total_hello_len);
         }
 
         while peek_len < total_hello_len {
-            let n = stream.read(&mut peek_buf[peek_len..total_hello_len]).await?;
+            let n = stream
+                .read(&mut peek_buf[peek_len..total_hello_len])
+                .await?;
             if n == 0 {
                 anyhow::bail!("EOF before full ClientHello");
             }
@@ -180,7 +190,9 @@ where
         }
 
         if let Some(parsed) = parse_tls_auth_material(&peek_buf[..peek_len], true, 300) {
-            if let Some(validation) = validate_tls_secret_candidate(&parsed, &peek_buf[..peek_len], &secret) {
+            if let Some(validation) =
+                validate_tls_secret_candidate(&parsed, &peek_buf[..peek_len], &secret)
+            {
                 matched_tls_validation = Some(validation);
             }
         }
@@ -208,14 +220,24 @@ where
         let (read_half, write_half) = tokio::io::split(peek_stream);
         let mut fake_tls_reader = FakeTlsReader::new(read_half);
         let fake_tls_writer = FakeTlsWriter::new(write_half);
-        
-        let handshake_bytes = fake_tls_reader.read_exact(HANDSHAKE_LEN).await.map_err(|e| anyhow::anyhow!("FakeTLS read exact failed: {:?}", e))?;
+
+        let handshake_bytes = fake_tls_reader
+            .read_exact(HANDSHAKE_LEN)
+            .await
+            .map_err(|e| anyhow::anyhow!("FakeTLS read exact failed: {:?}", e))?;
         let mut handshake = [0u8; HANDSHAKE_LEN];
         handshake.copy_from_slice(&handshake_bytes);
 
         let (backend_stream, chosen_traffic, target_addr, validation) = connect_and_proxy(
-            &handshake, secret, pool, stats.clone(), filter_enabled, true, route_idx
-        ).await?;
+            &handshake,
+            secret,
+            pool.clone(),
+            stats.clone(),
+            local_filter_manager.clone(),
+            true,
+            route_idx,
+        )
+        .await?;
 
         let client_combined = CombinedStream::new(
             CryptoReader::new(fake_tls_reader, validation.decryptor),
@@ -227,16 +249,23 @@ where
             backend_stream,
             chosen_traffic,
             Some(stats),
+            client_id,
             &target_addr,
             "MTProto",
-        ).await
+            &pool,
+        )
+        .await
     } else {
         // Plain MTProto handshake
         if peek_len < HANDSHAKE_LEN {
             let mut remaining = HANDSHAKE_LEN - peek_len;
             while remaining > 0 {
-                let n = stream.read(&mut peek_buf[peek_len..peek_len+remaining]).await?;
-                if n == 0 { anyhow::bail!("EOF reading handshake"); }
+                let n = stream
+                    .read(&mut peek_buf[peek_len..peek_len + remaining])
+                    .await?;
+                if n == 0 {
+                    anyhow::bail!("EOF reading handshake");
+                }
                 peek_len += n;
                 remaining -= n;
             }
@@ -245,8 +274,15 @@ where
         handshake.copy_from_slice(&peek_buf[..HANDSHAKE_LEN]);
 
         let (backend_stream, chosen_traffic, target_addr, validation) = connect_and_proxy(
-            &handshake, secret, pool, stats.clone(), filter_enabled, false, route_idx
-        ).await?;
+            &handshake,
+            secret,
+            pool.clone(),
+            stats.clone(),
+            local_filter_manager.clone(),
+            false,
+            route_idx,
+        )
+        .await?;
 
         let peek_stream = PeekStream::new(stream, peek_buf[HANDSHAKE_LEN..peek_len].to_vec());
         let (read_half, write_half) = tokio::io::split(peek_stream);
@@ -260,9 +296,12 @@ where
             backend_stream,
             chosen_traffic,
             Some(stats),
+            client_id,
             &target_addr,
             "MTProto",
-        ).await
+            &pool,
+        )
+        .await
     }
 }
 
@@ -271,7 +310,7 @@ async fn connect_and_proxy(
     secret: [u8; MTPROTO_SECRET_BYTES],
     pool: BackendPool,
     _stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     _is_tls: bool,
     route_idx: Option<usize>,
 ) -> anyhow::Result<(
@@ -286,14 +325,14 @@ async fn connect_and_proxy(
     let mut enc_iv_arr = [0u8; IV_LEN];
 
     const SKIP_LEN: usize = 8;
-    
+
     dec_prekey.copy_from_slice(&handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN]);
     dec_iv_arr.copy_from_slice(&handshake[SKIP_LEN + PREKEY_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN]);
     let dec_iv = u128::from_be_bytes(dec_iv_arr);
 
     let dec_prekey_iv = &handshake[SKIP_LEN..SKIP_LEN + PREKEY_LEN + IV_LEN];
     let enc_prekey_iv: Vec<u8> = dec_prekey_iv.iter().rev().copied().collect();
-    
+
     enc_prekey.copy_from_slice(&enc_prekey_iv[..PREKEY_LEN]);
     enc_iv_arr.copy_from_slice(&enc_prekey_iv[PREKEY_LEN..PREKEY_LEN + IV_LEN]);
     let enc_iv = u128::from_be_bytes(enc_iv_arr);
@@ -305,32 +344,34 @@ async fn connect_and_proxy(
         &enc_prekey,
         enc_iv,
         &secret,
-    ).ok_or_else(|| anyhow::anyhow!("Invalid MTProto handshake"))?;
+    )
+    .ok_or_else(|| anyhow::anyhow!("Invalid MTProto handshake"))?;
 
     let dc_idx = validation.dc_idx.abs();
-    
+
     // Map DC index to IP using canonical Telegram datacenter addresses.
-    let dc_array_idx = (dc_idx as usize).saturating_sub(1).min(constants::TG_DATACENTERS_V4.len() - 1);
+    let dc_array_idx = (dc_idx as usize)
+        .saturating_sub(1)
+        .min(constants::TG_DATACENTERS_V4.len() - 1);
     let ip = constants::TG_DATACENTERS_V4[dc_array_idx];
 
-    let target_addr = TargetAddr::Ip(std::net::SocketAddr::new(
-        ip,
-        443,
-    ));
+    let target_addr = TargetAddr::Ip(std::net::SocketAddr::new(ip, 443));
 
     tracing::debug!(dc = %dc_idx, target = %target_addr, "MTProto connection matched");
 
-    let is_private = crate::inbound::is_private_target(&target_addr).await;
-    if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
-        anyhow::bail!("Connection rejected: private target");
+    let is_blocked = if let Some(ref m) = local_filter_manager {
+        m.is_blocked(&target_addr)
+    } else {
+        pool.filter_manager.is_blocked(&target_addr)
+    };
+
+    if is_blocked {
+        anyhow::bail!("MTProto connection blocked by filter");
     }
 
-    if pool.adblock_manager.is_blocked(&target_addr) {
-        anyhow::bail!("Connection blocked by adblock");
-    }
+    let (mut backend_stream, chosen_traffic) =
+        crate::inbound::route_and_connect(&pool, &target_addr, route_idx).await?;
 
-    let (mut backend_stream, chosen_traffic) = crate::inbound::route_and_connect(&pool, &target_addr, route_idx).await?;
-    
     let (nonce, tg_encryptor, tg_decryptor) = generate_and_encrypt_tg_nonce(
         validation.proto_tag,
         validation.dc_idx,
@@ -343,7 +384,8 @@ async fn connect_and_proxy(
     let tg_reader = CryptoReader::new(read_half, tg_decryptor);
     let tg_writer = CryptoWriter::new(write_half, tg_encryptor, 65536);
 
-    let wrapped_backend = crate::outbound::BackendStream::boxed(Box::pin(CombinedStream::new(tg_reader, tg_writer)));
+    let wrapped_backend =
+        crate::outbound::BackendStream::boxed(Box::pin(CombinedStream::new(tg_reader, tg_writer)));
 
     Ok((wrapped_backend, chosen_traffic, target_addr, validation))
 }
@@ -353,8 +395,8 @@ fn generate_and_encrypt_tg_nonce(
     dc_idx: i16,
     rng: &mut mtproto_server::crypto::SecureRandom,
 ) -> (Vec<u8>, AesCtr, AesCtr) {
-    use mtproto_server::protocol::constants::{SKIP_LEN, PROTO_TAG_POS, DC_IDX_POS};
-    
+    use mtproto_server::protocol::constants::{DC_IDX_POS, PROTO_TAG_POS, SKIP_LEN};
+
     let mut nonce = [0u8; HANDSHAKE_LEN];
     loop {
         let bytes = rng.bytes(HANDSHAKE_LEN);

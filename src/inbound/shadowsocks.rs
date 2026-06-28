@@ -27,11 +27,12 @@ pub async fn run_shadowsocks_inbound(
     method_str: String,
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_cfg: Option<crate::config::TlsServerConfig>,
     route_idx: Option<usize>,
     cancel: CancellationToken,
     prebound_uds: Option<std::os::unix::net::UnixListener>,
+    udp_enabled: bool,
 ) -> anyhow::Result<()> {
     let method: CipherKind = method_str
         .parse()
@@ -53,44 +54,158 @@ pub async fn run_shadowsocks_inbound(
     let listener = BoundListener::bind(&listen_addr, prebound_uds).await?;
     tracing::info!(listen = %listen_addr, method = %method_str, "Shadowsocks inbound listener started");
 
-    crate::inbound::run_accept_loop(listener, cancel, "Shadowsocks", move |stream, addr| {
+    if udp_enabled {
+        let listen_addr_clone = listen_addr.clone();
+        let password_clone = password.clone();
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_shadowsocks_udp(
+                listen_addr_clone,
+                password_clone,
+                method,
+                pool_clone,
+                route_idx,
+            )
+            .await
+            {
+                tracing::error!("Shadowsocks UDP error: {}", e);
+            }
+        });
+    }
+
+    crate::inbound::run_accept_loop(listener, cancel, "Shadowsocks", move |stream, client_id| {
         let pool = pool.clone();
         let context = context.clone();
         let key = Arc::clone(&key);
         let stats = Arc::clone(&stats);
         let tls_acceptor = tls_acceptor.clone();
+        let local_filter_manager = local_filter_manager.clone();
         async move {
             if let Err(e) = handle_ss_connection(
                 stream,
-                addr.clone(),
+                client_id.clone(),
                 context,
                 method,
                 &key,
                 pool,
                 stats,
-                filter_enabled,
+                local_filter_manager.clone(),
                 tls_acceptor.as_deref().cloned(),
                 route_idx,
             )
             .await
             {
-                tracing::debug!(client = %addr, error = %e, "Shadowsocks connection failed");
+                tracing::debug!(client = %client_id, error = %e, "Shadowsocks connection failed");
             }
         }
     })
     .await
 }
 
+async fn run_shadowsocks_udp(
+    listen_addr: String,
+    password: String,
+    method: CipherKind,
+    pool: BackendPool,
+    route_idx: Option<usize>,
+) -> anyhow::Result<()> {
+    let listen_socket: SocketAddr = listen_addr.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "Shadowsocks UDP listener must be an IP address: {}",
+            listen_addr
+        )
+    })?;
+    let ss_config = SsServerConfig::new(listen_socket, &password, method)?;
+    let context =
+        shadowsocks::context::Context::new_shared(shadowsocks::config::ServerType::Server);
+
+    let udp_listener =
+        Arc::new(shadowsocks::relay::udprelay::ProxySocket::bind(context, &ss_config).await?);
+    tracing::info!(listen = %listen_addr, "Shadowsocks UDP inbound listener started");
+
+    use dashmap::DashMap;
+    // Map from (ClientAddr, TargetAddr) -> UdpBackendSession
+    let backend_map: Arc<DashMap<(SocketAddr, TargetAddr), Arc<crate::udp::UdpBackendSession>>> =
+        Arc::new(DashMap::new());
+
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let (len, client_addr, target_addr, _) = match udp_listener.recv_from(&mut buf).await {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::debug!("Shadowsocks UDP recv error: {}", e);
+                continue;
+            }
+        };
+
+        let target = match target_addr {
+            shadowsocks::relay::socks5::Address::SocketAddress(sa) => TargetAddr::Ip(sa),
+            shadowsocks::relay::socks5::Address::DomainNameAddress(host, port) => {
+                TargetAddr::Domain(host, port)
+            }
+        };
+
+        let key = (client_addr, target.clone());
+        let session = if let Some(session) = backend_map.get(&key) {
+            session.clone()
+        } else {
+            match crate::inbound::route_and_connect_udp(&pool, &target, route_idx).await {
+                Ok((session, _traffic)) => {
+                    let session = Arc::new(session);
+                    backend_map.insert(key.clone(), session.clone());
+
+                    let session_clone = session.clone();
+                    let inbound_clone = udp_listener.clone();
+                    let target_clone = target.clone();
+
+                    tokio::spawn(async move {
+                        let mut back_buf = vec![0u8; 65536];
+                        loop {
+                            match session_clone.recv_from(&mut back_buf).await {
+                                Ok((n, _)) => {
+                                    let ss_addr = match &target_clone {
+                                        TargetAddr::Ip(sa) => {
+                                            shadowsocks::relay::socks5::Address::SocketAddress(*sa)
+                                        }
+                                        TargetAddr::Domain(host, port) => {
+                                            shadowsocks::relay::socks5::Address::DomainNameAddress(
+                                                host.clone(),
+                                                *port,
+                                            )
+                                        }
+                                    };
+                                    let _ = inbound_clone
+                                        .send_to(client_addr, &ss_addr, &back_buf[..n])
+                                        .await;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+
+                    session
+                }
+                Err(e) => {
+                    tracing::error!("Shadowsocks UDP route failed for {}: {}", target, e);
+                    continue;
+                }
+            }
+        };
+
+        let _ = session.send_to(&buf[..len], &target).await;
+    }
+}
+
 /// Handle a single Shadowsocks connection.
 async fn handle_ss_connection<S>(
     stream: S,
-    client_addr: String,
+    client_id: crate::stats::ClientId,
     context: SharedContext,
     method: CipherKind,
     key: &[u8],
     pool: BackendPool,
     stats: Arc<crate::backend::InboundStats>,
-    filter_enabled: bool,
+    local_filter_manager: Option<Arc<crate::filter::FilterManager>>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     route_idx: Option<usize>,
 ) -> anyhow::Result<()>
@@ -116,22 +231,20 @@ where
     let target = convert_ss_address(&address);
 
     tracing::debug!(
-        client = %client_addr,
+        client = %client_id,
         target = %target,
         "Shadowsocks CONNECT request"
     );
 
-    let is_private = crate::inbound::is_private_target(&target).await;
-    if crate::inbound::likely(filter_enabled) && crate::inbound::unlikely(is_private) {
-        tracing::warn!(target = %target, "Shadowsocks connection rejected: private target");
-        return Err(anyhow::anyhow!(
-            "private address target is rejected by filter"
-        ));
-    }
+    let is_blocked = if let Some(ref m) = local_filter_manager {
+        m.is_blocked(&target)
+    } else {
+        pool.filter_manager.is_blocked(&target)
+    };
 
-    if pool.adblock_manager.is_blocked(&target) {
-        tracing::warn!(target = %target, "Shadowsocks connection blocked by adblock");
-        return Err(anyhow::anyhow!("connection blocked by AdBlock rules"));
+    if is_blocked {
+        tracing::debug!(target = %target, "Shadowsocks connection blocked by filter");
+        return Err(anyhow::anyhow!("connection blocked by filter rules"));
     }
 
     // Try backends in order with fallback.
@@ -140,7 +253,7 @@ where
             Ok((s, t)) => (s, t),
             Err(e) => {
                 tracing::warn!(
-                    client = %client_addr,
+                    client = %client_id,
                     target = %target,
                     error = %e,
                     "all backends failed"
@@ -154,8 +267,10 @@ where
         backend_stream,
         chosen_traffic,
         Some(stats),
+        client_id,
         &target,
         "Shadowsocks",
+        &pool,
     )
     .await
 }

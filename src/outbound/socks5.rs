@@ -164,6 +164,15 @@ where
 
 /// Build a SOCKS5 CONNECT request packet into a pre-allocated stack buffer.
 fn build_connect_request_buf(target: &TargetAddr, buf: &mut [u8]) -> io::Result<usize> {
+    buf[0] = SOCKS5_VERSION;
+    buf[1] = CMD_CONNECT;
+    buf[2] = 0x00; // RSV
+
+    let addr_len = write_target_addr_to_buf(target, &mut buf[3..])?;
+    Ok(3 + addr_len)
+}
+
+pub fn write_target_addr_to_buf(target: &TargetAddr, buf: &mut [u8]) -> io::Result<usize> {
     match target {
         TargetAddr::Domain(host, port) => {
             let host_bytes = host.as_bytes();
@@ -173,37 +182,129 @@ fn build_connect_request_buf(target: &TargetAddr, buf: &mut [u8]) -> io::Result<
                     "domain name too long for SOCKS5",
                 ));
             }
-            buf[0] = SOCKS5_VERSION;
-            buf[1] = CMD_CONNECT;
-            buf[2] = 0x00; // RSV
-            buf[3] = ATYP_DOMAIN;
-            buf[4] = host_bytes.len() as u8;
-            buf[5..5 + host_bytes.len()].copy_from_slice(host_bytes);
-            let port_idx = 5 + host_bytes.len();
+            if buf.len() < 1 + 1 + host_bytes.len() + 2 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "buffer too small"));
+            }
+            buf[0] = ATYP_DOMAIN;
+            buf[1] = host_bytes.len() as u8;
+            buf[2..2 + host_bytes.len()].copy_from_slice(host_bytes);
+            let port_idx = 2 + host_bytes.len();
             buf[port_idx] = (port >> 8) as u8;
             buf[port_idx + 1] = *port as u8;
             Ok(port_idx + 2)
         }
-        TargetAddr::Ip(addr) => {
-            buf[0] = SOCKS5_VERSION;
-            buf[1] = CMD_CONNECT;
-            buf[2] = 0x00; // RSV
-            match addr {
-                SocketAddr::V4(v4) => {
-                    buf[3] = ATYP_IPV4;
-                    buf[4..8].copy_from_slice(&v4.ip().octets());
-                    buf[8] = (v4.port() >> 8) as u8;
-                    buf[9] = v4.port() as u8;
-                    Ok(10)
+        TargetAddr::Ip(addr) => match addr {
+            SocketAddr::V4(v4) => {
+                if buf.len() < 1 + 4 + 2 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "buffer too small"));
                 }
-                SocketAddr::V6(v6) => {
-                    buf[3] = ATYP_IPV6;
-                    buf[4..20].copy_from_slice(&v6.ip().octets());
-                    buf[20] = (v6.port() >> 8) as u8;
-                    buf[21] = v6.port() as u8;
-                    Ok(22)
+                buf[0] = ATYP_IPV4;
+                buf[1..5].copy_from_slice(&v4.ip().octets());
+                buf[5] = (v4.port() >> 8) as u8;
+                buf[6] = v4.port() as u8;
+                Ok(7)
+            }
+            SocketAddr::V6(v6) => {
+                if buf.len() < 1 + 16 + 2 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "buffer too small"));
                 }
+                buf[0] = ATYP_IPV6;
+                buf[1..17].copy_from_slice(&v6.ip().octets());
+                buf[17] = (v6.port() >> 8) as u8;
+                buf[18] = v6.port() as u8;
+                Ok(19)
+            }
+        },
+    }
+}
+
+/// Phase 2: Issue a SOCKS5 UDP ASSOCIATE request on an already-authenticated stream.
+pub async fn socks5h_udp_associate<S>(mut stream: S) -> io::Result<(S, SocketAddr)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut req = [0u8; 10];
+    req[0] = SOCKS5_VERSION;
+    req[1] = 0x03; // UDP ASSOCIATE
+    req[2] = 0x00; // RSV
+    req[3] = ATYP_IPV4;
+    req[4..8].copy_from_slice(&[0, 0, 0, 0]);
+    req[8..10].copy_from_slice(&[0, 0]);
+    stream.write_all(&req).await?;
+
+    let mut resp_header = [0u8; 4];
+    stream.read_exact(&mut resp_header).await?;
+
+    if resp_header[0] != SOCKS5_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid SOCKS5 UDP ASSOCIATE response version",
+        ));
+    }
+    if resp_header[1] != 0x00 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!(
+                "SOCKS5 UDP ASSOCIATE failed with reply code: {:#x}",
+                resp_header[1]
+            ),
+        ));
+    }
+
+    let addr = match resp_header[3] {
+        ATYP_IPV4 => {
+            let mut ip = [0u8; 4];
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut ip).await?;
+            stream.read_exact(&mut port).await?;
+            SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(ip)),
+                u16::from_be_bytes(port),
+            )
+        }
+        ATYP_IPV6 => {
+            let mut ip = [0u8; 16];
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut ip).await?;
+            stream.read_exact(&mut port).await?;
+            SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(ip)),
+                u16::from_be_bytes(port),
+            )
+        }
+        ATYP_DOMAIN => {
+            let mut len_buf = [0u8; 1];
+            stream.read_exact(&mut len_buf).await?;
+            let len = len_buf[0] as usize;
+            let mut host = vec![0u8; len];
+            stream.read_exact(&mut host).await?;
+            let mut port = [0u8; 2];
+            stream.read_exact(&mut port).await?;
+            let host_str = String::from_utf8_lossy(&host).to_string();
+            let port_u16 = u16::from_be_bytes(port);
+            if let Ok(mut addrs) = tokio::net::lookup_host((host_str.as_str(), port_u16)).await {
+                if let Some(addr) = addrs.next() {
+                    addr
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "dns resolution failed for SOCKS5 UDP relay address",
+                    ));
+                }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "dns resolution failed for SOCKS5 UDP relay address",
+                ));
             }
         }
-    }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown ATYP in UDP ASSOCIATE response",
+            ));
+        }
+    };
+
+    Ok((stream, addr))
 }

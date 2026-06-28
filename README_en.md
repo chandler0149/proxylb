@@ -11,9 +11,9 @@ High-performance proxy load balancer written in Rust. Supports SOCKS5, Shadowsoc
 ## 🛠️ Features
 
 ### Protocols & Transport
-- **Inbound:** SOCKS5 (TCP/UDS, auth, TLS), Shadowsocks (AEAD ciphers), HTTP (`CONNECT` tunnel, `GET` proxy, Basic Auth, TLS), and MTProto (FakeTLS for Telegram).
-- **Outbound:** Direct, SOCKS5h (TCP/UDS), and Shadowsocks.
-- **Transport Layer:** TCP and Unix Domain Sockets (UDS) for both inbound and outbound.
+- **Inbound:** SOCKS5 (TCP/UDS/UDP, auth, TLS), Shadowsocks (TCP/UDP, AEAD ciphers), HTTP (`CONNECT` tunnel, `GET` proxy, Basic Auth, TLS), and MTProto (FakeTLS for Telegram).
+- **Outbound:** Direct, SOCKS5h (TCP/UDS/UDP), and Shadowsocks (TCP/UDP).
+- **Transport Layer:** TCP, UDP, and Unix Domain Sockets (UDS) for both inbound and outbound.
 
 ### Routing & Load Balancing
 - **Hierarchical Routing:** Bind specific inbounds to nested backend groups.
@@ -21,13 +21,15 @@ High-performance proxy load balancer written in Rust. Supports SOCKS5, Shadowsoc
   - `failover` — Uses the first healthy backend.
   - `urltest` — Routes to the backend with the lowest latency.
   - `loadbalance` — Routes to the backend with the fewest active connections.
+  - `hash` — Consistent hashing for sticky backend routing.
 - **Global Fallback:** Any inbound without an explicit route uses the global `failover_order`.
 
 ### Operations
+- **Subcommand CLI:** Use standard CLI subcommands (e.g., `proxylb run -c config.yaml`).
 - **Zero-Downtime Reload:** Send `SIGHUP` to reload configurations without dropping active sessions.
 - **Network Awareness:** Automatically reprobes when link or gateway changes are detected.
-- **Web Dashboard & API:** Real-time metrics for traffic, backend latency, and active connections.
-- **Built-in AdBlock:** Periodically fetches and updates AdGuard/Hosts blocklists.
+- **Embedded Web Dashboard:** A zero-dependency React Web UI compiled directly into the binary, featuring real-time bandwidth time-series charts, client tracking, and backend latency metrics. See [REST API Documentation](./restapi.md).
+- **Built-in AdBlock:** Periodically fetches and updates AdGuard/Hosts blocklists (disabled by default for zero-overhead routing).
 
 ---
 
@@ -40,6 +42,7 @@ ProxyLB is built for maximum throughput and low latency:
 - **Lock-Free Hot-Path:** Uses atomics and `ArcSwap` to prevent thread contention. Zero policy calculation on the hot-path.
 - **Dedicated CPU Runtimes:** Forwarding threads and background tasks are pinned to specific CPU cores.
 - **jemalloc:** Uses the `jemalloc` memory allocator optimized for concurrency.
+- **Profile-Guided Optimization (PGO):** Integrated PGO pipeline in Makefile (`make pgo`) to generate workload-specific optimized binaries.
 
 ### Benchmarks
 
@@ -175,7 +178,7 @@ advanced:
 cargo build --release
 
 # Run
-./target/release/proxylb -c config.yaml
+./target/release/proxylb run -c config.yaml
 
 # Hot reload (no dropped connections)
 kill -SIGHUP $(pgrep proxylb)

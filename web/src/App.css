@@ -1,16 +1,16 @@
 :root {
-  --bg-primary: #060613;
-  --bg-secondary: #0c0c24;
-  --bg-card: rgba(22, 22, 59, 0.45);
-  --bg-card-hover: rgba(33, 33, 85, 0.6);
-  --text-primary: #f0f0f8;
-  --text-secondary: #9da4cf;
-  --accent-green: #00e676;
-  --accent-red: #ff3d71;
-  --accent-yellow: #ffc107;
-  --accent-blue: #00b0ff;
-  --border-subtle: rgba(255, 255, 255, 0.08);
-  --shadow-glow: 0 12px 40px 0 rgba(0, 0, 0, 0.5);
+  --bg-primary: #f8f9fa;
+  --bg-secondary: #e9ecef;
+  --bg-card: rgba(255, 255, 255, 0.85);
+  --bg-card-hover: rgba(255, 255, 255, 1);
+  --text-primary: #212529;
+  --text-secondary: #495057;
+  --accent-green: #00c853;
+  --accent-red: #d50000;
+  --accent-yellow: #f57f17;
+  --accent-blue: #2962ff;
+  --border-subtle: rgba(0, 0, 0, 0.1);
+  --shadow-glow: 0 12px 40px 0 rgba(0, 0, 0, 0.08);
   --font-main: 'Outfit', sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
 }
@@ -26,7 +26,7 @@ body {
   background: radial-gradient(circle at 50% 0%, var(--bg-secondary) 0%, var(--bg-primary) 100%);
   color: var(--text-primary);
   min-height: 100vh;
-  padding: 2.5rem 2rem;
+  padding: 1rem 1.5rem;
   overflow-x: hidden;
 }
 
@@ -140,8 +140,8 @@ body {
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid var(--border-subtle);
-  border-radius: 16px;
-  padding: 1.5rem;
+  border-radius: 12px;
+  padding: 1rem;
   box-shadow: var(--shadow-glow);
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   display: flex;
@@ -394,7 +394,7 @@ body {
 .tree-root {
   display: flex;
   flex-direction: column;
-  gap: 2.5rem;
+  gap: 1.5rem;
   position: relative;
   padding-left: 1.8rem;
   margin-top: 1rem;
@@ -425,6 +425,10 @@ body {
   background: var(--border-subtle);
 }
 
+.tree-node-wrapper > .card {
+  max-width: 420px;
+}
+
 .tree-root > .tree-node-wrapper:first-child::before {
   background: var(--accent-blue);
 }
@@ -434,13 +438,13 @@ body {
   background: var(--bg-card);
   backdrop-filter: blur(16px);
   border: 1px solid var(--border-subtle);
-  border-radius: 16px;
-  padding: 1.5rem;
+  border-radius: 12px;
+  padding: 1rem;
   box-shadow: var(--shadow-glow);
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   display: flex;
   flex-direction: column;
-  gap: 1.2rem;
+  gap: 0.8rem;
 }
 
 .card:hover {
@@ -584,10 +588,10 @@ input:checked + .slider:before {
 
 .metrics {
   display: flex;
-  gap: 1.5rem;
-  padding: 0.8rem 1rem;
+  gap: 1rem;
+  padding: 0.5rem 0.8rem;
   background: rgba(255, 255, 255, 0.02);
-  border-radius: 12px;
+  border-radius: 8px;
   border: 1px solid rgba(255, 255, 255, 0.04);
 }
 
@@ -615,7 +619,7 @@ input:checked + .slider:before {
 .traffic-row {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 0.8rem;
+  gap: 0.5rem;
 }
 
 .traffic-item {
@@ -623,8 +627,8 @@ input:checked + .slider:before {
   flex-direction: column;
   background: rgba(255, 255, 255, 0.015);
   border: 1px solid rgba(255, 255, 255, 0.03);
-  border-radius: 10px;
-  padding: 0.6rem 0.8rem;
+  border-radius: 8px;
+  padding: 0.4rem 0.6rem;
 }
 
 .traffic-label {
@@ -650,10 +654,10 @@ input:checked + .slider:before {
 /* Pool row */
 .pool-row {
   display: flex;
-  gap: 0.8rem;
-  padding: 0.8rem;
+  gap: 0.5rem;
+  padding: 0.5rem;
   background: rgba(163, 112, 247, 0.05);
-  border-radius: 12px;
+  border-radius: 8px;
   border: 1px solid rgba(163, 112, 247, 0.15);
 }
 
@@ -748,8 +752,8 @@ input:checked + .slider:before {
 .tree-group-card {
   background: var(--bg-card);
   border: 1px solid var(--border-subtle);
-  border-radius: 16px;
-  padding: 1.5rem;
+  border-radius: 12px;
+  padding: 1rem;
   box-shadow: var(--shadow-glow);
   backdrop-filter: blur(12px);
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);

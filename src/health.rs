@@ -123,6 +123,7 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
 
             let result = async {
                 let pc = pool.get_pooled_connection(index);
+                let mut base_latency = std::time::Duration::ZERO;
 
                 let stream: BackendStream = if info.is_direct() {
                     // ── Direct backend health check ────────────────────────────────
@@ -138,6 +139,7 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                             ref traffic,
                         }) => {
                             traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
+                            base_latency = pooled.base_latency;
                             ss_connect_pooled(pooled, ss_cfg, ss_ctx, &target.addr)
                         }
                         Some(PooledConn {
@@ -159,6 +161,7 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                             stream: Some(pooled),
                             ref traffic,
                         }) => {
+                            base_latency = pooled.base_latency;
                             match socks5h_connect_target(pooled, &target.addr).await {
                                 Ok(s) => {
                                     traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
@@ -166,6 +169,7 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                                 }
                                 Err(_) => {
                                     // Pooled connection was stale — retry fresh.
+                                    base_latency = std::time::Duration::ZERO;
                                     traffic.pool_stale.fetch_add(1, Ordering::Relaxed);
                                     socks5h_connect(&info, &target.addr, timeout).await?
                                 }
@@ -182,7 +186,9 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                     }
                 };
 
-                if let Some(config) = tls_config {
+                let handshake_latency = base_latency + start.elapsed();
+
+                let res = if let Some(config) = tls_config {
                     let connector = TlsConnector::from(config);
                     let domain = ServerName::try_from(target.host.clone()).map_err(|_| {
                         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid DNS name")
@@ -192,18 +198,19 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
                 } else {
                     let mut stream = stream;
                     perform_http_get(&mut stream, &target).await
-                }
+                };
+                res.map(|_| handshake_latency)
             };
 
             match tokio::time::timeout(timeout, result).await {
-                Ok(Ok(_)) => {
+                Ok(Ok(handshake_latency)) => {
                     let latency = start.elapsed();
                     tracing::debug!(
                         backend = %info.name,
                         latency_ms = latency.as_millis() as u64,
                         "health check passed"
                     );
-                    pool.mark_healthy(index, latency);
+                    pool.mark_healthy(index, latency, Some(handshake_latency));
                 }
                 Ok(Err(e)) => {
                     tracing::debug!(
