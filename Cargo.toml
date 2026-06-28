@@ -1,6 +1,6 @@
 [package]
 name = "proxylb"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2024"
 description = "High-performance SOCKS5 proxy load balancer with Shadowsocks inbound support"
 

@@ -11,9 +11,9 @@
 ## 🛠️ 功能特性
 
 ### 协议与传输层
-- **入站:** SOCKS5 (TCP/UDS，可选认证与 TLS)、Shadowsocks (AEAD 加密)、HTTP (`CONNECT` 隧道与 `GET` 代理，可选 Basic Auth 和 TLS)、MTProto (FakeTLS，可用作 Telegram 代理)。
-- **出站:** 直连 (Direct)、SOCKS5h (TCP/UDS)、Shadowsocks。
-- **传输层:** 入站和出站均支持 TCP 和 Unix 域套接字 (UDS)。
+- **入站:** SOCKS5 (TCP/UDS/UDP，可选认证与 TLS)、Shadowsocks (TCP/UDP，AEAD 加密)、HTTP (`CONNECT` 隧道与 `GET` 代理，可选 Basic Auth 和 TLS)、MTProto (FakeTLS，可用作 Telegram 代理)。
+- **出站:** 直连 (Direct)、SOCKS5h (TCP/UDS/UDP)、Shadowsocks (TCP/UDP)。
+- **传输层:** 入站和出站均支持 TCP、UDP 和 Unix 域套接字 (UDS)。
 
 ### 路由与负载均衡
 - **层级路由:** 将特定的入站监听器绑定到嵌套策略组。
@@ -21,13 +21,15 @@
   - `failover` — 优先使用第一个健康的后端。
   - `urltest` — 路由到延迟最低的后端。
   - `loadbalance` — 路由到活跃连接数最少的后端。
+  - `hash` — 一致性哈希，确保相同请求固定路由到同一后端。
 - **全局兜底:** 未明确指定路由的入站会默认使用全局的 `failover_order` 进行流量转发。
 
 ### 运维控制
+- **Subcommand CLI:** 提供标准的子命令接口（如 `proxylb run -c config.yaml`）。
 - **零停机热重载:** 发送 `SIGHUP` 信号在不中断活动会话的情况下重载配置。
 - **网络状态感知:** 检测到链路或网关变更时自动触发重新探测。
-- **Web 仪表盘 & API:** 实时查看流量统计、后端延迟和活跃连接数。查阅 [RESTful API 接口文档](./restapi.md)。
-- **内置 AdBlock:** 在后台定期获取并刷新 AdGuard/Hosts 格式的过滤规则。
+- **内置 Web 仪表盘:** 零依赖的 React Web UI，直接编译打包进二进制文件中。支持 10 秒实时流量波形图、客户端追踪和后端延迟可视化。查阅 [RESTful API 接口文档](./restapi.md)。
+- **内置 AdBlock:** 在后台定期获取并刷新 AdGuard/Hosts 格式的过滤规则（默认关闭，以保证零开销纯代理转发）。
 
 ---
 
@@ -40,6 +42,7 @@ ProxyLB 为最大吞吐量和极低延迟而生：
 - **无锁热路径:** 使用原子操作和 `ArcSwap` 避免线程竞争。热路径上零策略计算，确保最高速度。
 - **独立 CPU 运行时:** 将转发线程与后台任务绑定到专属的 CPU 核心。
 - **jemalloc:** 采用适合高并发场景的 `jemalloc` 内存分配器。
+- **PGO (配置引导优化):** 内置 `make pgo` 优化流水线，根据实际工作负载生成极致性能的二进制文件。
 
 ### 基准测试
 
@@ -175,7 +178,7 @@ advanced:
 cargo build --release
 
 # 运行
-./target/release/proxylb -c config.yaml
+./target/release/proxylb run -c config.yaml
 
 # 热重载（不中断现有连接）
 kill -SIGHUP $(pgrep proxylb)
