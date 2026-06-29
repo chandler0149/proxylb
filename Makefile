@@ -16,12 +16,15 @@ all: arm64 amd64
 FEATURES := --features filter
 
 web:
-	@if ! command -v npm >/dev/null 2>&1; then \
-		echo "ERROR: npm is not installed. Please install Node.js to build the web UI."; \
+	@if command -v npm >/dev/null 2>&1; then \
+		echo "Building web UI..."; \
+		cd web && npm install && npm run build; \
+	elif [ -d "web/dist" ]; then \
+		echo "npm not found, but web/dist exists. Skipping web UI build."; \
+	else \
+		echo "ERROR: npm is required to build the web UI. Please install Node.js."; \
 		exit 1; \
 	fi
-	@echo "Building web UI..."
-	@cd web && npm install && npm run build
 
 release: web
 	$(CARGO) build --release $(FEATURES)

@@ -426,7 +426,7 @@ body {
 }
 
 .tree-node-wrapper > .card {
-  max-width: 420px;
+  max-width: 320px;
 }
 
 .tree-root > .tree-node-wrapper:first-child::before {
@@ -795,14 +795,14 @@ input:checked + .slider:before {
 
 .tree-group-children {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 1.5rem;
 }
 
 /* Standalone Backends and Groups Views Grid */
 .backends-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 1.5rem;
   margin-top: 1rem;
 }
@@ -843,6 +843,8 @@ input:checked + .slider:before {
 
 @media (max-width: 600px) {
   body { padding: 1.5rem 1rem; }
-  .tree-group-children, .backends-grid { grid-template-columns: 1fr; }
+  .tree-group-children, .backends-grid { grid-template-columns: 1fr; gap: 0.5rem; }
   .traffic-row { grid-template-columns: repeat(2, 1fr); }
+  .tree-group-card { padding: 0.5rem; }
+  .card { padding: 0.5rem; }
 }

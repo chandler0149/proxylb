@@ -460,15 +460,13 @@ impl BackendPool {
 
         let (groups, failover_order) =
             build_groups_and_failover_order(&entries, group_configs, failover_order_cfg);
-        let (cached_healthy, cached_unhealthy) =
+
+        let (cached_subgroups, cached_unhealthy) =
             calculate_candidates(&entries, &groups, &failover_order);
 
         let cached = Arc::new(ArcSwap::from_pointee(CachedCandidates {
-            strategy: crate::config::GroupStrategy::Failover,
-            hash_ring: Vec::new(),
-            wrr_choices: Vec::new(),
-            healthy: cached_healthy.clone(),
-            unhealthy: cached_unhealthy.clone(),
+            subgroups: cached_subgroups,
+            unhealthy: cached_unhealthy,
         }));
 
         let hot_paths = entries
@@ -493,10 +491,7 @@ impl BackendPool {
         let route_map = Arc::new(route_map);
         let route_caches = Arc::new(ArcSwap::from_pointee(vec![
             Arc::new(CachedCandidates {
-                strategy: crate::config::GroupStrategy::Failover,
-                hash_ring: Vec::new(),
-                wrr_choices: Vec::new(),
-                healthy: vec![],
+                subgroups: Vec::new(),
                 unhealthy: vec![]
             });
             route_map.len()
@@ -681,15 +676,13 @@ impl BackendPool {
 
         let (groups, failover_order) =
             build_groups_and_failover_order(&new_entries, group_configs, failover_order_cfg);
-        let (cached_healthy, cached_unhealthy) =
+
+        let (cached_subgroups, cached_unhealthy) =
             calculate_candidates(&new_entries, &groups, &failover_order);
 
         self.cached.store(Arc::new(CachedCandidates {
-            strategy: crate::config::GroupStrategy::Failover,
-            hash_ring: Vec::new(),
-            wrr_choices: Vec::new(),
-            healthy: cached_healthy.clone(),
-            unhealthy: cached_unhealthy.clone(),
+            subgroups: cached_subgroups,
+            unhealthy: cached_unhealthy,
         }));
 
         let hot_paths_vec = new_entries
@@ -756,11 +749,16 @@ impl BackendPool {
     pub async fn get_candidates(
         &self,
     ) -> (
-        Vec<(usize, Arc<BackendInfo>)>,
-        Vec<(usize, Arc<BackendInfo>)>,
+        Vec<(usize, u32, Arc<BackendInfo>)>,
+        Vec<(usize, u32, Arc<BackendInfo>)>,
     ) {
         let guard = self.cached.load();
-        (guard.healthy.clone(), guard.unhealthy.clone())
+        let h: Vec<_> = guard
+            .subgroups
+            .iter()
+            .flat_map(|sg| sg.healthy.clone())
+            .collect();
+        (h, guard.unhealthy.clone())
     }
 
     /// Get the array index for a given route name to use in O(1) lookups.
@@ -899,53 +897,27 @@ impl BackendPool {
         Ok(found)
     }
 
-    /// Recalculate candidates and cache them.
     pub async fn recalculate_candidates(&self) {
         let guard = self.inner.read().await;
-        let (ch, cu) = calculate_candidates(&guard.entries, &guard.groups, &guard.failover_order);
+        let (subgroups, cu) =
+            calculate_candidates(&guard.entries, &guard.groups, &guard.failover_order);
         self.cached.store(Arc::new(CachedCandidates {
-            strategy: crate::config::GroupStrategy::Failover,
-            hash_ring: Vec::new(),
-            wrr_choices: Vec::new(),
-            healthy: ch,
+            subgroups,
             unhealthy: cu,
         }));
 
-        let old_route_caches = self.route_caches.load();
         let mut new_route_caches = vec![
             Arc::new(CachedCandidates {
-                strategy: crate::config::GroupStrategy::Failover,
-                hash_ring: Vec::new(),
-                wrr_choices: Vec::new(),
-                healthy: vec![],
+                subgroups: Vec::new(),
                 unhealthy: vec![]
             });
             self.route_map.len()
         ];
         for (name, &idx) in self.route_map.iter() {
-            let (strategy, gh, gu) =
-                calculate_route_candidates(name, &guard.entries, &guard.groups);
-
-            let hash_ring = if strategy == crate::config::GroupStrategy::ConsistentHashing {
-                let old_cache = old_route_caches.get(idx);
-                let same_healthy = old_cache.map_or(false, |old| {
-                    old.healthy.len() == gh.len()
-                        && old.healthy.iter().zip(gh.iter()).all(|(a, b)| a.0 == b.0)
-                });
-                if same_healthy {
-                    old_cache.unwrap().hash_ring.clone()
-                } else {
-                    build_hash_ring(&gh)
-                }
-            } else {
-                Vec::new()
-            };
+            let (subgroups, gu) = calculate_route_candidates(name, &guard.entries, &guard.groups);
 
             new_route_caches[idx] = Arc::new(CachedCandidates {
-                strategy,
-                hash_ring,
-                wrr_choices: crate::scheduler::build_wrr_choices(&gh, &guard.entries),
-                healthy: gh,
+                subgroups,
                 unhealthy: gu,
             });
         }
@@ -964,7 +936,7 @@ impl BackendPool {
                 .find(|g| {
                     g.members
                         .iter()
-                        .any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
+                        .any(|m| matches!(m, GroupMember::Backend(idx, _) if *idx == i))
                 })
                 .map(|g| g.name.clone());
 
@@ -1006,7 +978,7 @@ impl BackendPool {
                 .find(|g| {
                     g.members
                         .iter()
-                        .any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
+                        .any(|m| matches!(m, GroupMember::Backend(idx, _) if *idx == i))
                 })
                 .map(|g| g.name.clone());
 
@@ -1053,8 +1025,8 @@ impl BackendPool {
                         let mut members = Vec::new();
                         for member in &group.members {
                             let member_target = match member {
-                                GroupMember::Backend(idx) => Target::Backend(*idx),
-                                GroupMember::Group(idx) => Target::Group(*idx),
+                                GroupMember::Backend(idx, _) => Target::Backend(*idx),
+                                GroupMember::Group(idx, _) => Target::Group(*idx),
                             };
                             if let Some(node) = build_tree_node(&member_target, groups, views) {
                                 members.push(node);
@@ -1268,6 +1240,8 @@ mod tests {
 
     fn make_cfg(addr: &str, name: &str) -> BackendConfig {
         BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "socks5".to_string(),
             address: Some(addr.to_string()),
             username: None,
@@ -1310,14 +1284,20 @@ mod tests {
         let g1 = GroupConfig {
             name: "group-urltest".to_string(),
             strategy: GroupStrategy::UrlTest,
-            members: vec!["b1".to_string(), "b2".to_string()],
+            members: vec![
+                crate::config::GroupMemberConfig::String("b1".to_string()),
+                crate::config::GroupMemberConfig::String("b2".to_string()),
+            ],
         };
 
         // Group 2 uses failover
         let g2 = GroupConfig {
             name: "group-failover".to_string(),
             strategy: GroupStrategy::Failover,
-            members: vec!["b2".to_string(), "b3".to_string()],
+            members: vec![
+                crate::config::GroupMemberConfig::String("b2".to_string()),
+                crate::config::GroupMemberConfig::String("b3".to_string()),
+            ],
         };
 
         let pool = new_test_pool(
@@ -1335,9 +1315,9 @@ mod tests {
         let (healthy, unhealthy) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 3);
         assert!(unhealthy.is_empty());
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
-        assert_eq!(healthy[2].1.name, "b3");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
+        assert_eq!(healthy[2].2.name, "b3");
 
         // Explicitly mark b3 unhealthy to test both passes.
         pool.mark_unhealthy(2, "connection error");
@@ -1346,23 +1326,23 @@ mod tests {
         let (healthy, unhealthy) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
         assert_eq!(unhealthy.len(), 1);
-        assert_eq!(unhealthy[0].1.name, "b3");
+        assert_eq!(unhealthy[0].2.name, "b3");
 
         // 2. Mark b1 healthy with 50ms latency, and b2 healthy with 20ms latency.
         // Since group-urltest contains [b1, b2], and is urltest strategy,
         // it should select b2 first (20ms) then b1 (50ms).
-        pool.mark_healthy(0, Duration::from_millis(50));
-        pool.mark_healthy(1, Duration::from_millis(20));
+        pool.mark_healthy(0, Duration::from_millis(50), None);
+        pool.mark_healthy(1, Duration::from_millis(20), None);
         pool.recalculate_candidates().await;
 
         let (healthy, unhealthy) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b2"); // b2 first because lower latency!
-        assert_eq!(healthy[1].1.name, "b1");
+        assert_eq!(healthy[0].2.name, "b2"); // b2 first because lower latency!
+        assert_eq!(healthy[1].2.name, "b1");
 
         // b3 is still unhealthy.
         assert_eq!(unhealthy.len(), 1);
-        assert_eq!(unhealthy[0].1.name, "b3");
+        assert_eq!(unhealthy[0].2.name, "b3");
 
         // 3. Mark b3 healthy too. Group 2 uses failover strategy.
         // Let's test failover order with a different pool where group-failover is first.
@@ -1374,22 +1354,25 @@ mod tests {
             &[GroupConfig {
                 name: "group-fo".to_string(),
                 strategy: GroupStrategy::Failover,
-                members: vec!["b2".to_string(), "b1".to_string()],
+                members: vec![
+                    crate::config::GroupMemberConfig::String("b2".to_string()),
+                    crate::config::GroupMemberConfig::String("b1".to_string()),
+                ],
             }],
             Some(&vec!["group-fo".to_string()]),
             None,
         )
         .unwrap();
 
-        pool_fo.mark_healthy(0, Duration::from_millis(10)); // b1: 10ms
-        pool_fo.mark_healthy(1, Duration::from_millis(100)); // b2: 100ms
+        pool_fo.mark_healthy(0, Duration::from_millis(10), None); // b1: 10ms
+        pool_fo.mark_healthy(1, Duration::from_millis(100), None); // b2: 100ms
         pool_fo.recalculate_candidates().await;
 
         // Since strategy is failover, it should keep configured order [b2, b1] regardless of latency!
         let (healthy, _) = pool_fo.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b2");
-        assert_eq!(healthy[1].1.name, "b1");
+        assert_eq!(healthy[0].2.name, "b2");
+        assert_eq!(healthy[1].2.name, "b1");
     }
 
     #[tokio::test]
@@ -1400,7 +1383,10 @@ mod tests {
         let g = GroupConfig {
             name: "group-lb".to_string(),
             strategy: GroupStrategy::LoadBalance,
-            members: vec!["b1".to_string(), "b2".to_string()],
+            members: vec![
+                crate::config::GroupMemberConfig::String("b1".to_string()),
+                crate::config::GroupMemberConfig::String("b2".to_string()),
+            ],
         };
 
         let pool =
@@ -1425,8 +1411,8 @@ mod tests {
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
         // b2 should be first because it has fewer historical connections (5 < 10)
-        assert_eq!(healthy[0].1.name, "b2");
-        assert_eq!(healthy[1].1.name, "b1");
+        assert_eq!(healthy[0].2.name, "b2");
+        assert_eq!(healthy[1].2.name, "b1");
 
         // Now simulate b2 also getting up to 10 connections, but b1 having fewer active connections
         {
@@ -1450,8 +1436,8 @@ mod tests {
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
         // b1 should be first because active connections 1 < 2 (since total_connections are equal)
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
     }
 
     #[tokio::test]
@@ -1464,14 +1450,14 @@ mod tests {
         let g1 = GroupConfig {
             name: "g-lb".to_string(),
             strategy: GroupStrategy::LoadBalance,
-            members: vec!["b1".to_string()],
+            members: vec![crate::config::GroupMemberConfig::String("b1".to_string())],
         };
 
         // g2 is failover (static)
         let g2 = GroupConfig {
             name: "g-fo".to_string(),
             strategy: GroupStrategy::Failover,
-            members: vec!["b2".to_string()],
+            members: vec![crate::config::GroupMemberConfig::String("b2".to_string())],
         };
 
         // b3 is standalone (not in any group)
@@ -1489,9 +1475,9 @@ mod tests {
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 3);
         // Order of healthy backends should be: b2 (from g-fo), b1 (from g-lb), b3 (standalone)
-        assert_eq!(healthy[0].1.name, "b2");
-        assert_eq!(healthy[1].1.name, "b1");
-        assert_eq!(healthy[2].1.name, "b3");
+        assert_eq!(healthy[0].2.name, "b2");
+        assert_eq!(healthy[1].2.name, "b1");
+        assert_eq!(healthy[2].2.name, "b3");
     }
 
     #[tokio::test]
@@ -1502,7 +1488,7 @@ mod tests {
         let g1 = GroupConfig {
             name: "group-1".to_string(),
             strategy: GroupStrategy::Failover,
-            members: vec!["b1".to_string()],
+            members: vec![crate::config::GroupMemberConfig::String("b1".to_string())],
         };
 
         let pool = new_test_pool(
@@ -1515,13 +1501,16 @@ mod tests {
 
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 1);
-        assert_eq!(healthy[0].1.name, "b1");
+        assert_eq!(healthy[0].2.name, "b1");
 
         // Reload with b2 added and b2 added to group-1
         let g1_new = GroupConfig {
             name: "group-1".to_string(),
             strategy: GroupStrategy::Failover,
-            members: vec!["b1".to_string(), "b2".to_string()],
+            members: vec![
+                crate::config::GroupMemberConfig::String("b1".to_string()),
+                crate::config::GroupMemberConfig::String("b2".to_string()),
+            ],
         };
 
         let (added, removed, kept) = pool
@@ -1540,8 +1529,8 @@ mod tests {
 
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
     }
 
     #[tokio::test]
@@ -1559,6 +1548,8 @@ mod tests {
 
         // Reload with b1 having updated pool_size and credentials
         let b1_updated = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "socks5".to_string(),
             address: Some("127.0.0.1:8081".to_string()),
             username: Some("new-user".to_string()),
@@ -1624,8 +1615,8 @@ mod tests {
         // 1. Initially, both should be enabled and in candidates list.
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
 
         // 2. Disable b1
         let found = pool.set_backend_enabled("b1", false).await.unwrap();
@@ -1634,7 +1625,7 @@ mod tests {
         // b1 should be removed from candidates immediately.
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 1);
-        assert_eq!(healthy[0].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b2");
 
         // 3. Enable b1 again
         let found = pool.set_backend_enabled("b1", true).await.unwrap();
@@ -1643,8 +1634,8 @@ mod tests {
         // b1 should return immediately.
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
 
         // 4. Try enabling/disabling a non-existent backend
         let found = pool
@@ -1658,6 +1649,8 @@ mod tests {
     fn test_uds_backend_endpoint_resolution() {
         // Test UDS resolution for socks5
         let cfg_s5 = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "socks5".to_string(),
             address: Some("unix:///tmp/s5.sock".to_string()),
             username: None,
@@ -1677,6 +1670,8 @@ mod tests {
 
         // Test UDS resolution for shadowsocks (ss)
         let cfg_ss = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "ss".to_string(),
             address: Some("unix:///tmp/ss.sock".to_string()),
             username: Some("chacha20-ietf-poly1305".to_string()),
@@ -1696,6 +1691,8 @@ mod tests {
 
         // Test legacy uds type
         let cfg_legacy = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "uds".to_string(),
             address: Some("/tmp/legacy.sock".to_string()),
             username: None,
@@ -1715,6 +1712,8 @@ mod tests {
 
         // Test TCP resolution
         let cfg_tcp = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "socks5".to_string(),
             address: Some("127.0.0.1:1080".to_string()),
             username: None,

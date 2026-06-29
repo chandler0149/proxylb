@@ -16,13 +16,14 @@ High-performance proxy load balancer written in Rust. Supports SOCKS5, Shadowsoc
 - **Transport Layer:** TCP, UDP, and Unix Domain Sockets (UDS) for both inbound and outbound.
 
 ### Routing & Load Balancing
-- **Hierarchical Routing:** Bind specific inbounds to nested backend groups.
+- **Hierarchical Routing:** Bind specific inbounds to nested backend groups; groups can reference each other.
 - **Routing Strategies:**
-  - `failover` — Uses the first healthy backend.
-  - `urltest` — Routes to the backend with the lowest latency.
+  - `failover` — Uses the first healthy backend in configured order.
+  - `urltest` — Routes to the backend with the lowest health-check latency.
   - `loadbalance` — Routes to the backend with the fewest active connections.
-  - `hash` — Consistent hashing for sticky backend routing.
-- **Global Fallback:** Any inbound without an explicit route uses the global `failover_order`.
+  - `consistent_hashing` — Consistent hashing for sticky domain-based routing; backend changes only remap a minimal set of keys.
+  - `weighted_round_robin` — Distributes traffic proportionally by weight using the Nginx smooth weighted round-robin algorithm. Supports per-member `weight` configuration.
+- **Global Fallback:** Any inbound without an explicit route uses the global `failover_order`. Internal group strategies are fully preserved (e.g., a WRR group inside `failover_order` still distributes by weight).
 
 ### Operations
 - **Subcommand CLI:** Use standard CLI subcommands (e.g., `proxylb run -c config.yaml`).
@@ -139,15 +140,24 @@ groups:
   # Sub-groups
   - name: "asia-group"
     strategy: "urltest"
-    backends: ["ss-hk-1"]
+    members: ["ss-hk-1"]
   - name: "us-fallback"
     strategy: "failover"
-    backends: ["socks-us-1", "direct-out"]
+    members: ["socks-us-1", "direct-out"]
   
-  # Nested group (incorporating other groups as backends)
+  # Weighted round robin group
+  - name: "weighted-group"
+    strategy: "weighted_round_robin"
+    members:
+      - name: "asia-group"
+        weight: 5
+      - name: "us-fallback"
+        weight: 1
+
+  # Nested group (incorporating other groups as members)
   - name: "telegram-group"
     strategy: "failover"
-    backends: ["asia-group", "us-fallback"]
+    members: ["asia-group", "us-fallback"]
 
 failover_order: ["asia-group", "us-fallback"]
 
