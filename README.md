@@ -16,13 +16,14 @@
 - **传输层:** 入站和出站均支持 TCP、UDP 和 Unix 域套接字 (UDS)。
 
 ### 路由与负载均衡
-- **层级路由:** 将特定的入站监听器绑定到嵌套策略组。
+- **层级路由:** 将特定的入站监听器绑定到嵌套策略组，策略组可相互引用。
 - **路由策略:**
-  - `failover` — 优先使用第一个健康的后端。
-  - `urltest` — 路由到延迟最低的后端。
+  - `failover` — 按配置顺序，优先使用第一个健康的后端。
+  - `urltest` — 路由到健康检查延迟最低的后端。
   - `loadbalance` — 路由到活跃连接数最少的后端。
-  - `hash` — 一致性哈希，确保相同请求固定路由到同一后端。
-- **全局兜底:** 未明确指定路由的入站会默认使用全局的 `failover_order` 进行流量转发。
+  - `consistent_hashing` — 一致性哈希，确保相同域名固定路由到同一后端；后端上下线时仅影响最小范围的重映射。
+  - `weighted_round_robin` — 按权重比例分配流量（Nginx 平滑加权轮询算法），支持为每个成员单独指定 `weight`。
+- **全局兜底:** 未明确指定路由的入站会默认使用全局的 `failover_order` 进行流量转发。内部策略组的调度策略会被完整保留（例如 `failover_order` 中引用的 WRR 组仍会按权重分配）。
 
 ### 运维控制
 - **Subcommand CLI:** 提供标准的子命令接口（如 `proxylb run -c config.yaml`）。
@@ -139,15 +140,24 @@ groups:
   # 子策略组
   - name: "asia-group"
     strategy: "urltest"
-    backends: ["ss-hk-1"]
+    members: ["ss-hk-1"]
   - name: "us-fallback"
     strategy: "failover"
-    backends: ["socks-us-1", "direct-out"]
+    members: ["socks-us-1", "direct-out"]
   
-  # 嵌套策略组 (支持将其它组作为 backend 引入)
+  # 带权重的轮询策略组
+  - name: "weighted-group"
+    strategy: "weighted_round_robin"
+    members:
+      - name: "asia-group"
+        weight: 5
+      - name: "us-fallback"
+        weight: 1
+
+  # 嵌套策略组 (支持将其它组作为 members 引入)
   - name: "telegram-group"
     strategy: "failover"
-    backends: ["asia-group", "us-fallback"]
+    members: ["asia-group", "us-fallback"]
 
 failover_order: ["asia-group", "us-fallback"]
 

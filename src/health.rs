@@ -16,10 +16,7 @@ use url::Url;
 
 use crate::backend::{BackendPool, PooledConn};
 use crate::config::HealthCheckConfig;
-use crate::outbound::{
-    BackendStream, TargetAddr, direct_connect, socks5h_connect, socks5h_connect_target,
-    ss_connect_fresh, ss_connect_pooled,
-};
+use crate::outbound::{BackendStream, TargetAddr};
 use std::sync::atomic::Ordering;
 
 /// Target for the health check probe.
@@ -109,8 +106,8 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
 
     let mut handles = Vec::with_capacity(backends.len());
 
-    for (index, info, _healthy, enabled) in backends {
-        if !enabled || info.force_healthy {
+    for (index, info, _healthy, _enabled) in backends {
+        if info.force_healthy {
             continue;
         }
         let pool = pool.clone();
@@ -118,122 +115,108 @@ async fn check_all_backends(pool: &BackendPool, target: &ProbeTarget, timeout: D
         let info = info.clone();
         let tls_config = tls_config.clone();
 
-        handles.push(tokio::spawn(async move {
-            let start = Instant::now();
-
-            let result = async {
-                let pc = pool.get_pooled_connection(index);
-                let mut base_latency = std::time::Duration::ZERO;
-
-                let stream: BackendStream = if info.is_direct() {
-                    // ── Direct backend health check ────────────────────────────────
-                    direct_connect(&target.addr, timeout, info.bind_interface.as_deref()).await?
-                } else if info.is_shadowsocks() {
-                    // ── Shadowsocks backend health check ───────────────────────────
-                    let ss_cfg = info.ss_config.as_ref().unwrap();
-                    let ss_ctx = info.ss_context.as_ref().unwrap().clone();
-
-                    match pc {
-                        Some(PooledConn {
-                            stream: Some(pooled),
-                            ref traffic,
-                        }) => {
-                            traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
-                            base_latency = pooled.base_latency;
-                            ss_connect_pooled(pooled, ss_cfg, ss_ctx, &target.addr)
-                        }
-                        Some(PooledConn {
-                            stream: None,
-                            ref traffic,
-                        }) => {
-                            traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
-                            ss_connect_fresh(&info, ss_cfg, ss_ctx, &target.addr, timeout).await?
-                        }
-                        None => {
-                            ss_connect_fresh(&info, ss_cfg, ss_ctx, &target.addr, timeout).await?
-                        }
-                    }
-                } else {
-                    // ── SOCKS5 backend health check ─────────────────────────────
-                    // Try the pool first: validates pooled connections are still alive.
-                    match pc {
-                        Some(PooledConn {
-                            stream: Some(pooled),
-                            ref traffic,
-                        }) => {
-                            base_latency = pooled.base_latency;
-                            match socks5h_connect_target(pooled, &target.addr).await {
-                                Ok(s) => {
-                                    traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
-                                    s
-                                }
-                                Err(_) => {
-                                    // Pooled connection was stale — retry fresh.
-                                    base_latency = std::time::Duration::ZERO;
-                                    traffic.pool_stale.fetch_add(1, Ordering::Relaxed);
-                                    socks5h_connect(&info, &target.addr, timeout).await?
-                                }
-                            }
-                        }
-                        Some(PooledConn {
-                            stream: None,
-                            ref traffic,
-                        }) => {
-                            traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
-                            socks5h_connect(&info, &target.addr, timeout).await?
-                        }
-                        None => socks5h_connect(&info, &target.addr, timeout).await?,
-                    }
-                };
-
-                let handshake_latency = base_latency + start.elapsed();
-
-                let res = if let Some(config) = tls_config {
-                    let connector = TlsConnector::from(config);
-                    let domain = ServerName::try_from(target.host.clone()).map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid DNS name")
-                    })?;
-                    let mut tls_stream = connector.connect(domain, stream).await?;
-                    perform_http_get(&mut tls_stream, &target).await
-                } else {
-                    let mut stream = stream;
-                    perform_http_get(&mut stream, &target).await
-                };
-                res.map(|_| handshake_latency)
-            };
-
-            match tokio::time::timeout(timeout, result).await {
-                Ok(Ok(handshake_latency)) => {
-                    let latency = start.elapsed();
-                    tracing::debug!(
-                        backend = %info.name,
-                        latency_ms = latency.as_millis() as u64,
-                        "health check passed"
-                    );
-                    pool.mark_healthy(index, latency, Some(handshake_latency));
-                }
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        backend = %info.name,
-                        error = %e,
-                        "health check failed"
-                    );
-                    pool.mark_unhealthy(index, &e.to_string());
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        backend = %info.name,
-                        "health check timed out"
-                    );
-                    pool.mark_unhealthy(index, "health check timed out");
-                }
-            }
-        }));
+        handles.push(tokio::spawn(check_single_backend(
+            pool, index, info, target, timeout, tls_config,
+        )));
     }
 
     // Wait for all checks to complete.
     for handle in handles {
         let _ = handle.await;
+    }
+}
+
+async fn check_single_backend(
+    pool: BackendPool,
+    index: usize,
+    info: Arc<crate::backend::BackendInfo>,
+    target: ProbeTarget,
+    timeout: Duration,
+    tls_config: Option<Arc<ClientConfig>>,
+) {
+    let start = Instant::now();
+
+    let result = async {
+        let pc = pool.get_pooled_connection(index);
+        let mut base_latency = std::time::Duration::ZERO;
+        let mut try_fresh = true;
+        let mut stream_res: std::io::Result<BackendStream> =
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "no pool"));
+
+        if let Some(PooledConn {
+            stream: Some(pooled),
+            ref traffic,
+        }) = pc
+        {
+            base_latency = pooled.base_latency;
+            match info.connect_target_pooled(pooled, &target.addr).await {
+                Ok(s) => {
+                    traffic.pool_hits.fetch_add(1, Ordering::Relaxed);
+                    try_fresh = false;
+                    stream_res = Ok(s);
+                }
+                Err(_) => {
+                    base_latency = std::time::Duration::ZERO;
+                    traffic.pool_stale.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        } else if let Some(PooledConn {
+            stream: None,
+            ref traffic,
+        }) = pc
+        {
+            if !info.is_direct() {
+                traffic.pool_misses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if try_fresh {
+            stream_res = info.connect_target_fresh(&target.addr, timeout).await;
+        }
+
+        let stream = stream_res?;
+
+        let handshake_latency = base_latency + start.elapsed();
+
+        let res = if let Some(config) = tls_config.clone() {
+            let connector = TlsConnector::from(config);
+            let domain = ServerName::try_from(target.host.clone()).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid DNS name")
+            })?;
+            let mut tls_stream = connector.connect(domain, stream).await?;
+            perform_http_get(&mut tls_stream, &target).await
+        } else {
+            let mut stream = stream;
+            perform_http_get(&mut stream, &target).await
+        };
+        res.map(|_| handshake_latency)
+    };
+
+    match tokio::time::timeout(timeout, result).await {
+        Ok(Ok(handshake_latency)) => {
+            let latency = start.elapsed();
+            tracing::debug!(
+                backend = %info.name,
+                latency_ms = latency.as_millis() as u64,
+                "health check passed"
+            );
+            pool.mark_healthy(index, latency, Some(handshake_latency));
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(
+                backend = %info.name,
+                error = %e,
+                "health check failed"
+            );
+            pool.mark_unhealthy(index, &e.to_string());
+        }
+        Err(_) => {
+            tracing::debug!(
+                backend = %info.name,
+                "health check timed out"
+            );
+            pool.mark_unhealthy(index, "health check timed out");
+        }
     }
 }
 

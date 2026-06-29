@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     #[allow(dead_code)]
     pub advanced: AdvancedConfig,
+    /// Directory for runtime data like the SQLite database.
+    pub run_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -142,6 +144,36 @@ impl Default for GroupStrategy {
     }
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum GroupMemberConfig {
+    String(String),
+    Struct {
+        name: String,
+        #[serde(default = "default_weight")]
+        weight: u32,
+    },
+}
+
+impl GroupMemberConfig {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::String(s) => s,
+            Self::Struct { name, .. } => name,
+        }
+    }
+    pub fn weight(&self) -> u32 {
+        match self {
+            Self::String(_) => 1,
+            Self::Struct { weight, .. } => *weight,
+        }
+    }
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct GroupConfig {
     pub name: String,
@@ -150,7 +182,7 @@ pub struct GroupConfig {
     /// Members can be backend names or other group names (nested groups).
     /// Accepts both `members` and legacy `backends` key in YAML.
     #[serde(alias = "backends")]
-    pub members: Vec<String>,
+    pub members: Vec<GroupMemberConfig>,
 }
 
 /// Inbound listener configuration.
@@ -267,6 +299,11 @@ fn default_filter_enabled() -> bool {
     true
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TcpConfig {
+    pub congestion: Option<String>,
+}
+
 /// A backend entry.
 ///
 /// If the backend `type` is "ss" or "shadowsocks", the backend is treated as
@@ -302,6 +339,9 @@ pub struct BackendConfig {
     /// Number of consecutive failures before marking the backend as unhealthy (default: 1).
     #[serde(default = "default_max_fails")]
     pub max_fails: u32,
+    /// TCP specific configuration.
+    #[serde(default)]
+    pub tcp: Option<TcpConfig>,
 }
 
 fn default_max_fails() -> u32 {
@@ -471,6 +511,14 @@ impl Config {
                         );
                     }
                 }
+                "anytls" => {
+                    if backend.address.is_none() {
+                        anyhow::bail!("{}: AnyTLS backend must specify 'address'", label);
+                    }
+                    if backend.password.is_none() {
+                        anyhow::bail!("{}: AnyTLS backend must specify 'password'", label);
+                    }
+                }
                 "direct" => {
                     if backend.address.is_some()
                         || backend.username.is_some()
@@ -504,14 +552,14 @@ impl Config {
             }
         }
 
-        // Second pass: validate that every member references a known backend or group.
         for group in &self.groups {
             for member in &group.members {
-                if !backend_names.contains(member) && !group_names.contains(member) {
+                let member_name = member.name();
+                if !backend_names.contains(member_name) && !group_names.contains(member_name) {
                     anyhow::bail!(
                         "group '{}' refers to non-existent member '{}' (must be a backend or group name)",
                         group.name,
-                        member
+                        member_name
                     );
                 }
             }
@@ -519,7 +567,7 @@ impl Config {
 
         // Detect cycles in nested group references using DFS (3-color algorithm).
         {
-            let group_map: std::collections::HashMap<&str, &[String]> = self
+            let group_map: std::collections::HashMap<&str, &[GroupMemberConfig]> = self
                 .groups
                 .iter()
                 .map(|g| (g.name.as_str(), g.members.as_slice()))
@@ -530,22 +578,23 @@ impl Config {
 
             fn dfs<'a>(
                 current: &'a str,
-                group_map: &std::collections::HashMap<&str, &'a [String]>,
+                group_map: &std::collections::HashMap<&str, &'a [GroupMemberConfig]>,
                 group_names: &std::collections::HashSet<String>,
                 state: &mut std::collections::HashMap<&'a str, u8>,
             ) -> Result<()> {
                 state.insert(current, 1);
                 if let Some(members) = group_map.get(current) {
                     for m in *members {
-                        if group_names.contains(m.as_str()) {
-                            let s = *state.get(m.as_str()).unwrap_or(&0);
+                        let m_name = m.name();
+                        if group_names.contains(m_name) {
+                            let s = *state.get(m_name).unwrap_or(&0);
                             if s == 1 {
                                 anyhow::bail!(
                                     "cycle detected in group hierarchy involving '{}'",
-                                    m
+                                    m_name
                                 );
                             } else if s == 0 {
-                                dfs(m.as_str(), group_map, group_names, state)?;
+                                dfs(m_name, group_map, group_names, state)?;
                             }
                         }
                     }
@@ -627,6 +676,8 @@ mod tests {
             inbounds: vec![],
             backends: vec![
                 BackendConfig {
+                    max_fails: 1,
+                    network: None,
                     backend_type: "socks5".to_string(),
                     address: Some("127.0.0.1:8081".to_string()),
                     name: Some("b1".to_string()),
@@ -639,6 +690,8 @@ mod tests {
                     force_healthy: false,
                 },
                 BackendConfig {
+                    max_fails: 1,
+                    network: None,
                     backend_type: "socks5".to_string(),
                     address: Some("127.0.0.1:8082".to_string()),
                     name: Some("b2".to_string()),
@@ -654,7 +707,7 @@ mod tests {
             groups: vec![GroupConfig {
                 name: "g1".to_string(),
                 strategy: GroupStrategy::UrlTest,
-                members: vec!["b1".to_string()],
+                members: vec![GroupMemberConfig::String("b1".to_string())],
             }],
             failover_order: Some(vec!["g1".to_string(), "b2".to_string()]),
             health_check: HealthCheckConfig::default(),
@@ -673,6 +726,8 @@ mod tests {
             inbound: InboundConfig::default(),
             inbounds: vec![],
             backends: vec![BackendConfig {
+                max_fails: 1,
+                network: None,
                 backend_type: "socks5".to_string(),
                 address: Some("127.0.0.1:8081".to_string()),
                 name: Some("b1".to_string()),
@@ -688,12 +743,12 @@ mod tests {
                 GroupConfig {
                     name: "g1".to_string(),
                     strategy: GroupStrategy::UrlTest,
-                    members: vec!["g2".to_string()],
+                    members: vec![GroupMemberConfig::String("g2".to_string())],
                 },
                 GroupConfig {
                     name: "g2".to_string(),
                     strategy: GroupStrategy::Failover,
-                    members: vec!["g1".to_string()],
+                    members: vec![GroupMemberConfig::String("g1".to_string())],
                 },
             ],
             failover_order: None,
@@ -719,6 +774,8 @@ mod tests {
             inbounds: vec![],
             backends: vec![
                 BackendConfig {
+                    max_fails: 1,
+                    network: None,
                     backend_type: "socks5".to_string(),
                     address: Some("127.0.0.1:8081".to_string()),
                     name: Some("b1".to_string()),
@@ -731,6 +788,8 @@ mod tests {
                     force_healthy: false,
                 },
                 BackendConfig {
+                    max_fails: 1,
+                    network: None,
                     backend_type: "socks5".to_string(),
                     address: Some("127.0.0.1:8082".to_string()),
                     name: Some("b2".to_string()),
@@ -747,12 +806,15 @@ mod tests {
                 GroupConfig {
                     name: "leaf".to_string(),
                     strategy: GroupStrategy::UrlTest,
-                    members: vec!["b1".to_string(), "b2".to_string()],
+                    members: vec![
+                        GroupMemberConfig::String("b1".to_string()),
+                        GroupMemberConfig::String("b2".to_string()),
+                    ],
                 },
                 GroupConfig {
                     name: "parent".to_string(),
                     strategy: GroupStrategy::Failover,
-                    members: vec!["leaf".to_string()],
+                    members: vec![GroupMemberConfig::String("leaf".to_string())],
                 },
             ],
             failover_order: Some(vec!["parent".to_string()]),

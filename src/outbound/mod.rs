@@ -2,11 +2,13 @@
 //!
 //! Submodules implement SOCKS5 client, Shadowsocks client, and Direct TCP outbounds.
 
+pub mod anytls;
 pub mod direct;
 pub mod shadowsocks;
 pub mod socks5;
 
 // Re-export key outbound client functions for clean top-level usage
+
 pub use direct::direct_connect;
 pub use shadowsocks::{ss_connect_fresh, ss_connect_pooled};
 pub use socks5::{socks5h_authenticate, socks5h_connect, socks5h_connect_target};
@@ -285,23 +287,41 @@ pub async fn tcp_connect_raw<A: tokio::net::ToSocketAddrs>(
     addr: A,
     bind_interface: Option<&str>,
     timeout: std::time::Duration,
+    congestion: Option<&str>,
 ) -> io::Result<TcpStream> {
     use std::os::unix::io::AsRawFd;
-    use tokio::net::TcpSocket;
 
     let addrs = tokio::net::lookup_host(addr).await?;
     let mut last_err = None;
 
     for socket_addr in addrs {
+        if bind_interface.is_none() && congestion.is_none() {
+            match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(socket_addr)).await {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(e)) => last_err = Some(e),
+                Err(_) => {
+                    last_err = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "connection timed out",
+                    ))
+                }
+            }
+            continue;
+        }
+
         let is_ipv6 = socket_addr.is_ipv6();
         let socket = match socket_addr {
-            SocketAddr::V4(_) => TcpSocket::new_v4()?,
-            SocketAddr::V6(_) => TcpSocket::new_v6()?,
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
         };
+        let fd = socket.as_raw_fd();
 
         if let Some(iface) = bind_interface {
-            let fd = socket.as_raw_fd();
             bind_socket_to_device(fd, iface, is_ipv6)?;
+        }
+
+        if let Some(algo) = congestion {
+            set_tcp_congestion(fd, algo);
         }
 
         match tokio::time::timeout(timeout, socket.connect(socket_addr)).await {
@@ -333,7 +353,13 @@ pub async fn connect_endpoint(
     let stream = match &info.endpoint {
         crate::backend::BackendEndpoint::Tcp { host, port } => {
             let addr = format!("{}:{}", host, port);
-            let tcp = tcp_connect_raw(&addr, bind_interface, timeout).await?;
+            let tcp = tcp_connect_raw(
+                &addr,
+                bind_interface,
+                timeout,
+                info.tcp_congestion.as_deref(),
+            )
+            .await?;
             tcp.set_nodelay(true)?;
             BackendStream::tcp(tcp)
         }
@@ -381,4 +407,38 @@ pub async fn connect_endpoint(
     } else {
         Ok(stream)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn set_tcp_congestion(fd: std::os::unix::io::RawFd, algo: &str) {
+    let algo_c = match std::ffi::CString::new(algo) {
+        Ok(c) => c,
+        Err(_) => {
+            tracing::warn!("invalid tcp congestion algorithm name: {}", algo);
+            return;
+        }
+    };
+    let res = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            algo_c.as_ptr() as *const libc::c_void,
+            algo_c.as_bytes().len() as libc::socklen_t,
+        )
+    };
+    if res != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!("failed to set tcp congestion to {}: {}", algo, err);
+    } else {
+        tracing::debug!("successfully set tcp congestion to {}", algo);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_tcp_congestion(_fd: std::os::unix::io::RawFd, algo: &str) {
+    tracing::warn!(
+        "TCP congestion control ({}) is only supported on Linux",
+        algo
+    );
 }

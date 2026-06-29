@@ -1,5 +1,6 @@
 # Exclude the local Rust build directory
 target/
+web/dist
 
 # Exclude local environment files or IDE settings
 .env

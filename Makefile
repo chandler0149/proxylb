@@ -16,8 +16,15 @@ all: arm64 amd64
 FEATURES := --features filter
 
 web:
-	@echo "Building web UI..."
-	@cd web && npm install && npm run build
+	@if command -v npm >/dev/null 2>&1; then \
+		echo "Building web UI..."; \
+		cd web && npm install && npm run build; \
+	elif [ -d "web/dist" ]; then \
+		echo "npm not found, but web/dist exists. Skipping web UI build."; \
+	else \
+		echo "ERROR: npm is required to build the web UI. Please install Node.js."; \
+		exit 1; \
+	fi
 
 release: web
 	$(CARGO) build --release $(FEATURES)
@@ -32,11 +39,11 @@ box: web
 	
 amd64: web
 	@echo "Building for AMD64..."
-	$(CARGO) build --target=$(AMD64_TARGET) --release
+	$(CARGO) build --target=$(AMD64_TARGET) --release $(FEATURES)
 
 ali: web
 	@echo "Building for AMD64..."
-	RUSTFLAGS="-C target-cpu=x86-64-v4" $(CARGO) build --target=$(AMD64_TARGET) --release
+	RUSTFLAGS="-C target-cpu=x86-64-v4" $(CARGO) build --target=$(AMD64_TARGET) --release $(FEATURES)
 
 docker:
 	docker build -t proxylb .

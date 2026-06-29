@@ -3,9 +3,17 @@
 //! Wraps `tokio::io::copy_bidirectional` with byte-count tracking and logging.
 //! If both streams are raw files/sockets on Linux, it utilizes zero-copy `splice`.
 
+use crossbeam_queue::ArrayQueue;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+static BUFFER_POOL: OnceLock<ArrayQueue<Box<[u8]>>> = OnceLock::new();
+const BUFFER_SIZE: usize = 65536;
+
+fn get_buffer_pool() -> &'static ArrayQueue<Box<[u8]>> {
+    BUFFER_POOL.get_or_init(|| ArrayQueue::new(1024))
+}
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
@@ -168,18 +176,30 @@ struct TransferState<'a> {
     pos: usize,
     cap: usize,
     amt: u64,
-    buf: Box<[u8]>,
+    buf: Option<Box<[u8]>>,
     counters: Vec<&'a AtomicU64>,
 }
 
+impl<'a> Drop for TransferState<'a> {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            let _ = get_buffer_pool().push(buf);
+        }
+    }
+}
+
 impl<'a> TransferState<'a> {
-    fn new(size: usize, counters: Vec<&'a AtomicU64>) -> Self {
+    fn new(counters: Vec<&'a AtomicU64>) -> Self {
+        let buf = get_buffer_pool()
+            .pop()
+            .unwrap_or_else(|| vec![0; BUFFER_SIZE].into_boxed_slice());
+
         Self {
             read_done: false,
             pos: 0,
             cap: 0,
             amt: 0,
-            buf: vec![0; size].into_boxed_slice(),
+            buf: Some(buf),
             counters,
         }
     }
@@ -198,7 +218,7 @@ where
     loop {
         // Read into buffer if empty
         if state.pos == state.cap && !state.read_done {
-            let mut buf = tokio::io::ReadBuf::new(&mut state.buf);
+            let mut buf = tokio::io::ReadBuf::new(state.buf.as_deref_mut().unwrap());
             match std::pin::Pin::new(&mut *r).poll_read(cx, &mut buf) {
                 std::task::Poll::Ready(Ok(())) => {
                     if buf.filled().is_empty() {
@@ -218,7 +238,8 @@ where
 
         // Write from buffer if it has data
         if state.pos < state.cap {
-            match std::pin::Pin::new(&mut *w).poll_write(cx, &state.buf[state.pos..state.cap]) {
+            let buf_slice = state.buf.as_deref().unwrap();
+            match std::pin::Pin::new(&mut *w).poll_write(cx, &buf_slice[state.pos..state.cap]) {
                 std::task::Poll::Ready(Ok(0)) => {
                     return std::task::Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::WriteZero,
@@ -318,8 +339,8 @@ where
     LargeBidirectionalCopy {
         a: client,
         b: backend,
-        a_to_b: TransferState::new(65536, up_counters), // 64KB buffer
-        b_to_a: TransferState::new(65536, down_counters), // 64KB buffer
+        a_to_b: TransferState::new(up_counters),
+        b_to_a: TransferState::new(down_counters),
     }
     .await
 }

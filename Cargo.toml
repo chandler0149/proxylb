@@ -1,6 +1,6 @@
 [package]
 name = "proxylb"
-version = "1.4.1"
+version = "1.4.3"
 edition = "2024"
 description = "High-performance SOCKS5 proxy load balancer with Shadowsocks inbound support"
 
@@ -61,16 +61,22 @@ rustls-pemfile = "2.2.0"
 base64 = "0.22.1"
 rcgen = "0.14.8"
 socket2 = { version = "0.6.4", features = ["all"] }
-rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 rustc-hash = { version = "2.1.2", optional = true }
 ahash = { version = "0.8.12", optional = true }
+
 tikv-jemallocator = "0.7"
 dashmap = "6.2.1"
 rand = "0.10.1"
+bytes = "1.12.0"
+sha2 = "0.11.0"
+md-5 = "0.11.0"
+env_logger = "0.11.11"
+crossbeam-queue = "0.3.11"
 
 [features]
 default = ["fast-hash"]
-filter = ["dep:rusqlite"]
+filter = []
 fast-hash = ["dep:rustc-hash"]
 ahash = ["dep:ahash"]
 
@@ -85,3 +91,6 @@ codegen-units = 1
 panic = 'abort'
 strip = true
 overflow-checks = false
+
+[dev-dependencies]
+env_logger = "0.11.11"

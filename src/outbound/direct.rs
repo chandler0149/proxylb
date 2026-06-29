@@ -15,7 +15,7 @@ pub async fn direct_connect(
 ) -> io::Result<BackendStream> {
     let tcp = match target {
         TargetAddr::Domain(host, port) => {
-            super::tcp_connect_raw((host.as_str(), *port), bind_interface, timeout)
+            super::tcp_connect_raw((host.as_str(), *port), bind_interface, timeout, None)
                 .await
                 .map_err(|e| {
                     io::Error::new(
@@ -24,7 +24,7 @@ pub async fn direct_connect(
                     )
                 })?
         }
-        TargetAddr::Ip(addr) => super::tcp_connect_raw(*addr, bind_interface, timeout)
+        TargetAddr::Ip(addr) => super::tcp_connect_raw(*addr, bind_interface, timeout, None)
             .await
             .map_err(|e| io::Error::new(e.kind(), format!("direct connect to {}: {}", addr, e)))?,
     };

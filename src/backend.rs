@@ -91,6 +91,8 @@ pub struct BackendInfo {
     pub force_healthy: bool,
     pub max_fails: u32,
     pub udp_enabled: bool,
+    pub anytls_manager: Option<Arc<crate::outbound::anytls::AnytlsManager>>,
+    pub tcp_congestion: Option<String>,
 }
 
 impl std::fmt::Debug for BackendInfo {
@@ -112,7 +114,7 @@ impl BackendInfo {
 
         let endpoint = match cfg.backend_type.as_str() {
             "direct" => BackendEndpoint::Direct,
-            "socks5" | "ss" | "shadowsocks" | "uds" => {
+            "socks5" | "ss" | "shadowsocks" | "uds" | "anytls" => {
                 let addr = cfg
                     .address
                     .as_ref()
@@ -222,6 +224,16 @@ impl BackendInfo {
 
         let server_name = cfg.tls.as_ref().and_then(|tls| tls.server_name.clone());
 
+        let anytls_manager = if cfg.backend_type == "anytls" {
+            let password = cfg.password.as_deref().unwrap_or("").to_string();
+            Some(Arc::new(crate::outbound::anytls::AnytlsManager::new(
+                password,
+                if pool_size > 0 { pool_size } else { 1 },
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             name,
             endpoint,
@@ -237,6 +249,8 @@ impl BackendInfo {
             force_healthy: cfg.force_healthy,
             max_fails: cfg.max_fails,
             udp_enabled: cfg.network.as_deref() == Some("tcp_udp"),
+            anytls_manager,
+            tcp_congestion: cfg.tcp.as_ref().and_then(|t| t.congestion.clone()),
         })
     }
 
@@ -250,9 +264,53 @@ impl BackendInfo {
         matches!(self.endpoint, BackendEndpoint::Direct)
     }
 
+    /// Returns `true` if this is an AnyTLS outbound backend.
+    pub fn is_anytls(&self) -> bool {
+        self.anytls_manager.is_some()
+    }
+
     /// Returns true if this backend requires SOCKS5 authentication.
     pub fn requires_auth(&self) -> bool {
         self.username.is_some() && self.password.is_some()
+    }
+
+    pub async fn connect_target_pooled(
+        &self,
+        stream: crate::outbound::BackendStream,
+        target: &crate::outbound::TargetAddr,
+    ) -> std::io::Result<crate::outbound::BackendStream> {
+        if self.is_shadowsocks() {
+            let ss_cfg = self.ss_config.as_ref().unwrap();
+            let ss_ctx = self.ss_context.as_ref().unwrap().clone();
+            Ok(crate::outbound::ss_connect_pooled(
+                stream, ss_cfg, ss_ctx, target,
+            ))
+        } else if self.is_anytls() {
+            crate::outbound::anytls::anytls_connect_target(stream, target).await
+        } else if self.is_direct() {
+            unreachable!("Direct backend should not have pooled streams")
+        } else {
+            crate::outbound::socks5h_connect_target(stream, target).await
+        }
+    }
+
+    pub async fn connect_target_fresh(
+        &self,
+        target: &crate::outbound::TargetAddr,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<crate::outbound::BackendStream> {
+        if self.is_direct() {
+            crate::outbound::direct_connect(target, timeout, self.bind_interface.as_deref()).await
+        } else if self.is_shadowsocks() {
+            let ss_cfg = self.ss_config.as_ref().unwrap();
+            let ss_ctx = self.ss_context.as_ref().unwrap().clone();
+            crate::outbound::ss_connect_fresh(self, ss_cfg, ss_ctx, target, timeout).await
+        } else if self.is_anytls() {
+            let s = crate::outbound::anytls::anytls_connect_fresh(self).await?;
+            crate::outbound::anytls::anytls_connect_target(s, target).await
+        } else {
+            crate::outbound::socks5h_connect(self, target, timeout).await
+        }
     }
 }
 
@@ -304,7 +362,6 @@ pub struct BackendEntry {
     pub pool_rx: flume::Receiver<BackendStream>,
     /// Cancels this entry's `refill_pool_task` when the backend is removed.
     pub cancel: CancellationToken,
-    pub enabled_tx: tokio::sync::watch::Sender<bool>,
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
 }
 
@@ -410,6 +467,7 @@ pub struct BackendPool {
     pub ancillary_handle: tokio::runtime::Handle,
     pub client_manager: crate::stats::ClientStatsManager,
     pub domain_manager: crate::stats::DomainStatsManager,
+    pub db_path: Option<String>,
 }
 
 impl BackendPool {
@@ -423,14 +481,48 @@ impl BackendPool {
         filter_config: &crate::config::FilterConfig,
         ancillary_handle: tokio::runtime::Handle,
         active_routes: std::collections::HashSet<String>,
+        db_path: Option<String>,
     ) -> anyhow::Result<Self> {
+        let mut persisted_states = std::collections::HashMap::new();
+
+        let mut db_conn = None;
+        if let Some(ref path) = db_path {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            db_conn = rusqlite::Connection::open(path).ok();
+        }
+
+        if let Some(conn) = db_conn {
+            let _ = conn.execute(
+                "CREATE TABLE IF NOT EXISTS backend_state (name TEXT PRIMARY KEY, enabled INTEGER)",
+                [],
+            );
+            if let Ok(mut stmt) = conn.prepare("SELECT name, enabled FROM backend_state") {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0))
+                }) {
+                    for row in rows.flatten() {
+                        persisted_states.insert(row.0, row.1);
+                    }
+                }
+            }
+        } else if db_path.is_some() {
+            tracing::warn!(
+                "Failed to open {} for reading backend states",
+                db_path.as_ref().unwrap()
+            );
+        }
+
         let mut entries = Vec::with_capacity(configs.len());
         for (i, cfg) in configs.iter().enumerate() {
             let info = BackendInfo::from_config(cfg, i, global_bind_interface)?;
             let cancel = CancellationToken::new();
             let (tx, rx) = flume::bounded(info.pool_size.max(1));
-            let initial_enabled = info.enabled.unwrap_or(true);
-            let (enabled_tx, enabled_signal) = tokio::sync::watch::channel(initial_enabled);
+            let initial_enabled = persisted_states
+                .get(&info.name)
+                .copied()
+                .unwrap_or_else(|| info.enabled.unwrap_or(true));
 
             let mut status = BackendStatus::default();
             status.enabled = initial_enabled;
@@ -442,7 +534,6 @@ impl BackendPool {
                 traffic: traffic.clone(),
                 pool_rx: rx.clone(),
                 cancel: cancel.clone(),
-                enabled_tx,
                 rt_chg_signal: rt_chg_signal.clone(),
             };
             entries.push(entry);
@@ -450,7 +541,6 @@ impl BackendPool {
             // Spawn refill task for this backend.
             ancillary_handle.spawn(refill_pool_task(
                 info,
-                enabled_signal,
                 tx,
                 rx,
                 cancel,
@@ -460,15 +550,13 @@ impl BackendPool {
 
         let (groups, failover_order) =
             build_groups_and_failover_order(&entries, group_configs, failover_order_cfg);
-        let (cached_healthy, cached_unhealthy) =
+
+        let (cached_subgroups, cached_unhealthy) =
             calculate_candidates(&entries, &groups, &failover_order);
 
         let cached = Arc::new(ArcSwap::from_pointee(CachedCandidates {
-            strategy: crate::config::GroupStrategy::Failover,
-            hash_ring: Vec::new(),
-            wrr_choices: Vec::new(),
-            healthy: cached_healthy.clone(),
-            unhealthy: cached_unhealthy.clone(),
+            subgroups: cached_subgroups,
+            unhealthy: cached_unhealthy,
         }));
 
         let hot_paths = entries
@@ -493,10 +581,7 @@ impl BackendPool {
         let route_map = Arc::new(route_map);
         let route_caches = Arc::new(ArcSwap::from_pointee(vec![
             Arc::new(CachedCandidates {
-                strategy: crate::config::GroupStrategy::Failover,
-                hash_ring: Vec::new(),
-                wrr_choices: Vec::new(),
-                healthy: vec![],
+                subgroups: Vec::new(),
                 unhealthy: vec![]
             });
             route_map.len()
@@ -516,11 +601,12 @@ impl BackendPool {
             rt_chg_signal,
             filter_manager: Arc::new(crate::filter::FilterManager::new(
                 &filter_config,
-                Some("proxylb.db"),
+                db_path.as_deref(),
             )),
             ancillary_handle,
             client_manager: crate::stats::ClientStatsManager::new(),
             domain_manager: crate::stats::DomainStatsManager::new(),
+            db_path,
         })
     }
 
@@ -581,6 +667,21 @@ impl BackendPool {
         failover_order_cfg: Option<&Vec<String>>,
         global_bind_interface: Option<&str>,
     ) -> anyhow::Result<(usize, usize, usize)> {
+        let mut persisted_states = std::collections::HashMap::new();
+        if let Some(ref path) = self.db_path {
+            if let Ok(conn) = rusqlite::Connection::open(path) {
+                if let Ok(mut stmt) = conn.prepare("SELECT name, enabled FROM backend_state") {
+                    if let Ok(rows) = stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0))
+                    }) {
+                        for row in rows.flatten() {
+                            persisted_states.insert(row.0, row.1);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut guard = self.inner.write().await;
 
         let mut new_entries: Vec<BackendEntry> = Vec::with_capacity(new_configs.len());
@@ -606,11 +707,7 @@ impl BackendPool {
                     || entry.info.pool_size != new_info.pool_size;
 
                 if let Some(new_enabled) = new_info.enabled {
-                    let _ = entry.enabled_tx.send(new_enabled);
                     entry.status.lock().enabled = new_enabled;
-                    if !new_enabled {
-                        while entry.pool_rx.try_recv().is_ok() {}
-                    }
                 }
 
                 entry.info = Arc::new(new_info.clone());
@@ -626,11 +723,9 @@ impl BackendPool {
                     entry.pool_rx = rx.clone();
                     entry.cancel = new_cancel.clone();
 
-                    let enabled_signal = entry.enabled_tx.subscribe();
                     // Spawn the new refill task with new configuration and channel
                     self.ancillary_handle.spawn(refill_pool_task(
                         new_info,
-                        enabled_signal,
                         tx,
                         rx,
                         new_cancel,
@@ -644,8 +739,11 @@ impl BackendPool {
                 // Brand-new backend.
                 let cancel = CancellationToken::new();
                 let (tx, rx) = flume::bounded(new_info.pool_size.max(1));
-                let initial_enabled = new_info.enabled.unwrap_or(true);
-                let (enabled_tx, enabled_signal) = tokio::sync::watch::channel(initial_enabled);
+
+                let initial_enabled = persisted_states
+                    .get(&new_info.name)
+                    .copied()
+                    .unwrap_or_else(|| new_info.enabled.unwrap_or(true));
 
                 let mut status = BackendStatus::default();
                 status.enabled = initial_enabled;
@@ -657,13 +755,11 @@ impl BackendPool {
                     traffic: traffic.clone(),
                     pool_rx: rx.clone(),
                     cancel: cancel.clone(),
-                    enabled_tx,
                     rt_chg_signal: self.rt_chg_signal.clone(),
                 };
                 new_entries.push(entry);
                 self.ancillary_handle.spawn(refill_pool_task(
                     new_info,
-                    enabled_signal,
                     tx,
                     rx,
                     cancel,
@@ -681,15 +777,13 @@ impl BackendPool {
 
         let (groups, failover_order) =
             build_groups_and_failover_order(&new_entries, group_configs, failover_order_cfg);
-        let (cached_healthy, cached_unhealthy) =
+
+        let (cached_subgroups, cached_unhealthy) =
             calculate_candidates(&new_entries, &groups, &failover_order);
 
         self.cached.store(Arc::new(CachedCandidates {
-            strategy: crate::config::GroupStrategy::Failover,
-            hash_ring: Vec::new(),
-            wrr_choices: Vec::new(),
-            healthy: cached_healthy.clone(),
-            unhealthy: cached_unhealthy.clone(),
+            subgroups: cached_subgroups,
+            unhealthy: cached_unhealthy,
         }));
 
         let hot_paths_vec = new_entries
@@ -756,11 +850,16 @@ impl BackendPool {
     pub async fn get_candidates(
         &self,
     ) -> (
-        Vec<(usize, Arc<BackendInfo>)>,
-        Vec<(usize, Arc<BackendInfo>)>,
+        Vec<(usize, u32, Arc<BackendInfo>)>,
+        Vec<(usize, u32, Arc<BackendInfo>)>,
     ) {
         let guard = self.cached.load();
-        (guard.healthy.clone(), guard.unhealthy.clone())
+        let h: Vec<_> = guard
+            .subgroups
+            .iter()
+            .flat_map(|sg| sg.healthy.clone())
+            .collect();
+        (h, guard.unhealthy.clone())
     }
 
     /// Get the array index for a given route name to use in O(1) lookups.
@@ -873,20 +972,31 @@ impl BackendPool {
                     break;
                 }
 
-                // Set the flag via the watch channel
-                let _ = entry.enabled_tx.send(enabled);
-
                 // Update the status for the health/candidate selection
                 let mut status = entry.status.lock();
                 status.enabled = enabled;
 
-                if !enabled {
-                    // Drain the connection pool immediately from the control thread.
-                    // This instantly unblocks any blocking `tx.send_async` in the refill task.
-                    while entry.pool_rx.try_recv().is_ok() {}
-                }
-
                 changed = true;
+
+                let name_clone = name.to_string();
+                let db_path_clone = self.db_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(path) = db_path_clone {
+                        if let Ok(conn) = rusqlite::Connection::open(&path) {
+                            let _ = conn.execute(
+                                "CREATE TABLE IF NOT EXISTS backend_state (name TEXT PRIMARY KEY, enabled INTEGER)",
+                                [],
+                            );
+                            if let Err(e) = conn.execute(
+                                "INSERT OR REPLACE INTO backend_state (name, enabled) VALUES (?1, ?2)",
+                                rusqlite::params![name_clone, if enabled { 1 } else { 0 }],
+                            ) {
+                                tracing::error!("Failed to save backend state for {}: {}", name_clone, e);
+                            }
+                        }
+                    }
+                });
+
                 break;
             }
         }
@@ -899,53 +1009,27 @@ impl BackendPool {
         Ok(found)
     }
 
-    /// Recalculate candidates and cache them.
     pub async fn recalculate_candidates(&self) {
         let guard = self.inner.read().await;
-        let (ch, cu) = calculate_candidates(&guard.entries, &guard.groups, &guard.failover_order);
+        let (subgroups, cu) =
+            calculate_candidates(&guard.entries, &guard.groups, &guard.failover_order);
         self.cached.store(Arc::new(CachedCandidates {
-            strategy: crate::config::GroupStrategy::Failover,
-            hash_ring: Vec::new(),
-            wrr_choices: Vec::new(),
-            healthy: ch,
+            subgroups,
             unhealthy: cu,
         }));
 
-        let old_route_caches = self.route_caches.load();
         let mut new_route_caches = vec![
             Arc::new(CachedCandidates {
-                strategy: crate::config::GroupStrategy::Failover,
-                hash_ring: Vec::new(),
-                wrr_choices: Vec::new(),
-                healthy: vec![],
+                subgroups: Vec::new(),
                 unhealthy: vec![]
             });
             self.route_map.len()
         ];
         for (name, &idx) in self.route_map.iter() {
-            let (strategy, gh, gu) =
-                calculate_route_candidates(name, &guard.entries, &guard.groups);
-
-            let hash_ring = if strategy == crate::config::GroupStrategy::ConsistentHashing {
-                let old_cache = old_route_caches.get(idx);
-                let same_healthy = old_cache.map_or(false, |old| {
-                    old.healthy.len() == gh.len()
-                        && old.healthy.iter().zip(gh.iter()).all(|(a, b)| a.0 == b.0)
-                });
-                if same_healthy {
-                    old_cache.unwrap().hash_ring.clone()
-                } else {
-                    build_hash_ring(&gh)
-                }
-            } else {
-                Vec::new()
-            };
+            let (subgroups, gu) = calculate_route_candidates(name, &guard.entries, &guard.groups);
 
             new_route_caches[idx] = Arc::new(CachedCandidates {
-                strategy,
-                hash_ring,
-                wrr_choices: crate::scheduler::build_wrr_choices(&gh, &guard.entries),
-                healthy: gh,
+                subgroups,
                 unhealthy: gu,
             });
         }
@@ -964,7 +1048,7 @@ impl BackendPool {
                 .find(|g| {
                     g.members
                         .iter()
-                        .any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
+                        .any(|m| matches!(m, GroupMember::Backend(idx, _) if *idx == i))
                 })
                 .map(|g| g.name.clone());
 
@@ -1006,7 +1090,7 @@ impl BackendPool {
                 .find(|g| {
                     g.members
                         .iter()
-                        .any(|m| matches!(m, GroupMember::Backend(idx) if *idx == i))
+                        .any(|m| matches!(m, GroupMember::Backend(idx, _) if *idx == i))
                 })
                 .map(|g| g.name.clone());
 
@@ -1053,8 +1137,8 @@ impl BackendPool {
                         let mut members = Vec::new();
                         for member in &group.members {
                             let member_target = match member {
-                                GroupMember::Backend(idx) => Target::Backend(*idx),
-                                GroupMember::Group(idx) => Target::Group(*idx),
+                                GroupMember::Backend(idx, _) => Target::Backend(*idx),
+                                GroupMember::Group(idx, _) => Target::Group(*idx),
                             };
                             if let Some(node) = build_tree_node(&member_target, groups, views) {
                                 members.push(node);
@@ -1152,10 +1236,16 @@ fn drain_pool(rx: &flume::Receiver<BackendStream>) {
 #[inline]
 async fn allocate_backend_resource(info: &BackendInfo) -> std::io::Result<BackendStream> {
     let start = std::time::Instant::now();
-    let connect = crate::outbound::connect_endpoint(info, Duration::from_secs(10)).await;
+
+    let connect = if info.is_anytls() {
+        crate::outbound::anytls::anytls_connect_fresh(info).await
+    } else {
+        crate::outbound::connect_endpoint(info, std::time::Duration::from_secs(10)).await
+    };
+
     let mut stream = match connect {
         Err(e) => return Err(e),
-        Ok(stream) if info.is_shadowsocks() => stream,
+        Ok(stream) if info.is_anytls() || info.is_shadowsocks() => stream,
         Ok(stream) => crate::outbound::socks5h_authenticate(stream, info).await?,
     };
     stream.base_latency = start.elapsed();
@@ -1180,7 +1270,6 @@ async fn allocate_backend_resource(info: &BackendInfo) -> std::io::Result<Backen
 
 async fn refill_pool_task(
     info: BackendInfo,
-    mut enabled_signal: tokio::sync::watch::Receiver<bool>,
     tx: flume::Sender<BackendStream>,
     rx: flume::Receiver<BackendStream>,
     cancel: CancellationToken,
@@ -1196,7 +1285,7 @@ async fn refill_pool_task(
 
     loop {
         // Maintain concurrent connection attempts
-        while join_set.len() < target && pending_stream.is_none() && *enabled_signal.borrow() {
+        while join_set.len() < target && pending_stream.is_none() {
             let info = info.clone();
             join_set.spawn(async move {
                 let res = allocate_backend_resource(&info).await;
@@ -1207,25 +1296,9 @@ async fn refill_pool_task(
             });
         }
 
-        if !*enabled_signal.borrow() {
-            drain_pool(&rx);
-            join_set.abort_all();
-            pending_stream = None;
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return,
-                res = enabled_signal.changed() => if res.is_err() { return; },
-                res = rt_chg_signal.changed() => if res.is_err() { return; },
-            }
-            continue;
-        }
-
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            res = enabled_signal.changed() => {
-                if res.is_err() { return; }
-            }
             res = rt_chg_signal.changed() => {
                 if res.is_err() { return; }
                 drain_pool(&rx);
@@ -1268,6 +1341,8 @@ mod tests {
 
     fn make_cfg(addr: &str, name: &str) -> BackendConfig {
         BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "socks5".to_string(),
             address: Some(addr.to_string()),
             username: None,
@@ -1310,14 +1385,20 @@ mod tests {
         let g1 = GroupConfig {
             name: "group-urltest".to_string(),
             strategy: GroupStrategy::UrlTest,
-            members: vec!["b1".to_string(), "b2".to_string()],
+            members: vec![
+                crate::config::GroupMemberConfig::String("b1".to_string()),
+                crate::config::GroupMemberConfig::String("b2".to_string()),
+            ],
         };
 
         // Group 2 uses failover
         let g2 = GroupConfig {
             name: "group-failover".to_string(),
             strategy: GroupStrategy::Failover,
-            members: vec!["b2".to_string(), "b3".to_string()],
+            members: vec![
+                crate::config::GroupMemberConfig::String("b2".to_string()),
+                crate::config::GroupMemberConfig::String("b3".to_string()),
+            ],
         };
 
         let pool = new_test_pool(
@@ -1335,9 +1416,9 @@ mod tests {
         let (healthy, unhealthy) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 3);
         assert!(unhealthy.is_empty());
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
-        assert_eq!(healthy[2].1.name, "b3");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
+        assert_eq!(healthy[2].2.name, "b3");
 
         // Explicitly mark b3 unhealthy to test both passes.
         pool.mark_unhealthy(2, "connection error");
@@ -1346,23 +1427,23 @@ mod tests {
         let (healthy, unhealthy) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
         assert_eq!(unhealthy.len(), 1);
-        assert_eq!(unhealthy[0].1.name, "b3");
+        assert_eq!(unhealthy[0].2.name, "b3");
 
         // 2. Mark b1 healthy with 50ms latency, and b2 healthy with 20ms latency.
         // Since group-urltest contains [b1, b2], and is urltest strategy,
         // it should select b2 first (20ms) then b1 (50ms).
-        pool.mark_healthy(0, Duration::from_millis(50));
-        pool.mark_healthy(1, Duration::from_millis(20));
+        pool.mark_healthy(0, Duration::from_millis(50), None);
+        pool.mark_healthy(1, Duration::from_millis(20), None);
         pool.recalculate_candidates().await;
 
         let (healthy, unhealthy) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b2"); // b2 first because lower latency!
-        assert_eq!(healthy[1].1.name, "b1");
+        assert_eq!(healthy[0].2.name, "b2"); // b2 first because lower latency!
+        assert_eq!(healthy[1].2.name, "b1");
 
         // b3 is still unhealthy.
         assert_eq!(unhealthy.len(), 1);
-        assert_eq!(unhealthy[0].1.name, "b3");
+        assert_eq!(unhealthy[0].2.name, "b3");
 
         // 3. Mark b3 healthy too. Group 2 uses failover strategy.
         // Let's test failover order with a different pool where group-failover is first.
@@ -1374,22 +1455,25 @@ mod tests {
             &[GroupConfig {
                 name: "group-fo".to_string(),
                 strategy: GroupStrategy::Failover,
-                members: vec!["b2".to_string(), "b1".to_string()],
+                members: vec![
+                    crate::config::GroupMemberConfig::String("b2".to_string()),
+                    crate::config::GroupMemberConfig::String("b1".to_string()),
+                ],
             }],
             Some(&vec!["group-fo".to_string()]),
             None,
         )
         .unwrap();
 
-        pool_fo.mark_healthy(0, Duration::from_millis(10)); // b1: 10ms
-        pool_fo.mark_healthy(1, Duration::from_millis(100)); // b2: 100ms
+        pool_fo.mark_healthy(0, Duration::from_millis(10), None); // b1: 10ms
+        pool_fo.mark_healthy(1, Duration::from_millis(100), None); // b2: 100ms
         pool_fo.recalculate_candidates().await;
 
         // Since strategy is failover, it should keep configured order [b2, b1] regardless of latency!
         let (healthy, _) = pool_fo.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b2");
-        assert_eq!(healthy[1].1.name, "b1");
+        assert_eq!(healthy[0].2.name, "b2");
+        assert_eq!(healthy[1].2.name, "b1");
     }
 
     #[tokio::test]
@@ -1400,7 +1484,10 @@ mod tests {
         let g = GroupConfig {
             name: "group-lb".to_string(),
             strategy: GroupStrategy::LoadBalance,
-            members: vec!["b1".to_string(), "b2".to_string()],
+            members: vec![
+                crate::config::GroupMemberConfig::String("b1".to_string()),
+                crate::config::GroupMemberConfig::String("b2".to_string()),
+            ],
         };
 
         let pool =
@@ -1425,8 +1512,8 @@ mod tests {
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
         // b2 should be first because it has fewer historical connections (5 < 10)
-        assert_eq!(healthy[0].1.name, "b2");
-        assert_eq!(healthy[1].1.name, "b1");
+        assert_eq!(healthy[0].2.name, "b2");
+        assert_eq!(healthy[1].2.name, "b1");
 
         // Now simulate b2 also getting up to 10 connections, but b1 having fewer active connections
         {
@@ -1450,8 +1537,8 @@ mod tests {
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
         // b1 should be first because active connections 1 < 2 (since total_connections are equal)
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
     }
 
     #[tokio::test]
@@ -1464,14 +1551,14 @@ mod tests {
         let g1 = GroupConfig {
             name: "g-lb".to_string(),
             strategy: GroupStrategy::LoadBalance,
-            members: vec!["b1".to_string()],
+            members: vec![crate::config::GroupMemberConfig::String("b1".to_string())],
         };
 
         // g2 is failover (static)
         let g2 = GroupConfig {
             name: "g-fo".to_string(),
             strategy: GroupStrategy::Failover,
-            members: vec!["b2".to_string()],
+            members: vec![crate::config::GroupMemberConfig::String("b2".to_string())],
         };
 
         // b3 is standalone (not in any group)
@@ -1489,9 +1576,9 @@ mod tests {
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 3);
         // Order of healthy backends should be: b2 (from g-fo), b1 (from g-lb), b3 (standalone)
-        assert_eq!(healthy[0].1.name, "b2");
-        assert_eq!(healthy[1].1.name, "b1");
-        assert_eq!(healthy[2].1.name, "b3");
+        assert_eq!(healthy[0].2.name, "b2");
+        assert_eq!(healthy[1].2.name, "b1");
+        assert_eq!(healthy[2].2.name, "b3");
     }
 
     #[tokio::test]
@@ -1502,7 +1589,7 @@ mod tests {
         let g1 = GroupConfig {
             name: "group-1".to_string(),
             strategy: GroupStrategy::Failover,
-            members: vec!["b1".to_string()],
+            members: vec![crate::config::GroupMemberConfig::String("b1".to_string())],
         };
 
         let pool = new_test_pool(
@@ -1515,13 +1602,16 @@ mod tests {
 
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 1);
-        assert_eq!(healthy[0].1.name, "b1");
+        assert_eq!(healthy[0].2.name, "b1");
 
         // Reload with b2 added and b2 added to group-1
         let g1_new = GroupConfig {
             name: "group-1".to_string(),
             strategy: GroupStrategy::Failover,
-            members: vec!["b1".to_string(), "b2".to_string()],
+            members: vec![
+                crate::config::GroupMemberConfig::String("b1".to_string()),
+                crate::config::GroupMemberConfig::String("b2".to_string()),
+            ],
         };
 
         let (added, removed, kept) = pool
@@ -1540,8 +1630,8 @@ mod tests {
 
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
     }
 
     #[tokio::test]
@@ -1559,6 +1649,8 @@ mod tests {
 
         // Reload with b1 having updated pool_size and credentials
         let b1_updated = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "socks5".to_string(),
             address: Some("127.0.0.1:8081".to_string()),
             username: Some("new-user".to_string()),
@@ -1624,8 +1716,8 @@ mod tests {
         // 1. Initially, both should be enabled and in candidates list.
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
 
         // 2. Disable b1
         let found = pool.set_backend_enabled("b1", false).await.unwrap();
@@ -1634,7 +1726,7 @@ mod tests {
         // b1 should be removed from candidates immediately.
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 1);
-        assert_eq!(healthy[0].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b2");
 
         // 3. Enable b1 again
         let found = pool.set_backend_enabled("b1", true).await.unwrap();
@@ -1643,8 +1735,8 @@ mod tests {
         // b1 should return immediately.
         let (healthy, _) = pool.get_candidates().await;
         assert_eq!(healthy.len(), 2);
-        assert_eq!(healthy[0].1.name, "b1");
-        assert_eq!(healthy[1].1.name, "b2");
+        assert_eq!(healthy[0].2.name, "b1");
+        assert_eq!(healthy[1].2.name, "b2");
 
         // 4. Try enabling/disabling a non-existent backend
         let found = pool
@@ -1658,6 +1750,8 @@ mod tests {
     fn test_uds_backend_endpoint_resolution() {
         // Test UDS resolution for socks5
         let cfg_s5 = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "socks5".to_string(),
             address: Some("unix:///tmp/s5.sock".to_string()),
             username: None,
@@ -1677,6 +1771,8 @@ mod tests {
 
         // Test UDS resolution for shadowsocks (ss)
         let cfg_ss = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "ss".to_string(),
             address: Some("unix:///tmp/ss.sock".to_string()),
             username: Some("chacha20-ietf-poly1305".to_string()),
@@ -1696,6 +1792,8 @@ mod tests {
 
         // Test legacy uds type
         let cfg_legacy = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "uds".to_string(),
             address: Some("/tmp/legacy.sock".to_string()),
             username: None,
@@ -1715,6 +1813,8 @@ mod tests {
 
         // Test TCP resolution
         let cfg_tcp = BackendConfig {
+            max_fails: 1,
+            network: None,
             backend_type: "socks5".to_string(),
             address: Some("127.0.0.1:1080".to_string()),
             username: None,
