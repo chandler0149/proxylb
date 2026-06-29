@@ -193,6 +193,18 @@ pub fn extract_parent_domain_str(host: &str) -> &str {
     host // single-label or two-label domain — return as-is
 }
 
+/// Hash the routing key for consistent-hashing without heap allocation.
+fn hash_target_for_ch(target: &TargetAddr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match target {
+        TargetAddr::Ip(addr) => addr.ip().hash(&mut hasher),
+        TargetAddr::Domain(host, _) => extract_parent_domain_str(host).hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// Extract parent domain as an owned String (used by stats path, not the routing hot path).
 pub fn extract_parent_domain(target: &TargetAddr) -> String {
     match target {
         TargetAddr::Ip(addr) => addr.ip().to_string(),
@@ -200,61 +212,85 @@ pub fn extract_parent_domain(target: &TargetAddr) -> String {
     }
 }
 
-pub fn get_candidate_iterator(
-    candidates: &std::sync::Arc<crate::scheduler::CachedCandidates>,
-    target: &TargetAddr,
-) -> Vec<(usize, std::sync::Arc<crate::backend::BackendInfo>)> {
+/// Compute the rotation start position for a subgroup (0 = no rotation).
+fn compute_start(sg: &crate::scheduler::SubGroupCache, target: &TargetAddr) -> usize {
     use std::sync::atomic::Ordering;
-    let healthy = &candidates.healthy;
+    let len = sg.healthy.len();
+    if len == 0 {
+        return 0;
+    }
 
-    if candidates.strategy == crate::config::GroupStrategy::ConsistentHashing
-        && !healthy.is_empty()
-        && !candidates.hash_ring.is_empty()
-    {
-        let parent_domain = extract_parent_domain(target);
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&parent_domain, &mut hasher);
-        let target_hash = std::hash::Hasher::finish(&hasher);
-
-        let idx = match candidates
-            .hash_ring
-            .binary_search_by_key(&target_hash, |(h, _)| *h)
-        {
-            Ok(idx) => idx,
-            Err(idx) => {
-                if idx == candidates.hash_ring.len() {
-                    0
-                } else {
-                    idx
+    match sg.strategy {
+        crate::config::GroupStrategy::ConsistentHashing if !sg.hash_ring.is_empty() => {
+            let h = hash_target_for_ch(target);
+            let idx = match sg.hash_ring.binary_search_by_key(&h, |(k, _)| *k) {
+                Ok(i) => i,
+                Err(i) => {
+                    if i == sg.hash_ring.len() {
+                        0
+                    } else {
+                        i
+                    }
                 }
-            }
-        };
-
-        let array_idx = candidates.hash_ring[idx].1;
-
-        healthy[array_idx..]
-            .iter()
-            .chain(healthy[..array_idx].iter())
-            .cloned()
-            .collect()
-    } else if candidates.strategy == crate::config::GroupStrategy::WeightedRoundRobin
-        && !healthy.is_empty()
-        && !candidates.wrr_choices.is_empty()
-    {
-        let count = WRR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let idx = count % candidates.wrr_choices.len();
-        let target_backend_idx = candidates.wrr_choices[idx];
-
-        let mut result = Vec::with_capacity(healthy.len());
-        if let Some(pos) = healthy.iter().position(|(i, _)| *i == target_backend_idx) {
-            result.extend(healthy[pos..].iter().cloned());
-            result.extend(healthy[..pos].iter().cloned());
-        } else {
-            result.extend(healthy.iter().cloned());
+            };
+            sg.hash_ring[idx].1 % len
         }
-        result
-    } else {
-        healthy.clone()
+        crate::config::GroupStrategy::WeightedRoundRobin if !sg.wrr_choices.is_empty() => {
+            let count = WRR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            sg.wrr_choices[count % sg.wrr_choices.len()]
+        }
+        _ => 0,
+    }
+}
+
+const MAX_INLINE_SUBGROUPS: usize = 16;
+
+/// Zero-allocation iterator over candidates. Borrows from `CachedCandidates`
+/// and yields `&(backend_idx, weight, Arc<BackendInfo>)` references — no
+/// `Arc::clone()` per connection.
+pub struct CandidateIter<'a> {
+    subgroups: &'a [crate::scheduler::SubGroupCache],
+    starts: [usize; MAX_INLINE_SUBGROUPS],
+    sg_idx: usize,
+    offset: usize,
+}
+
+impl<'a> CandidateIter<'a> {
+    pub fn new(candidates: &'a crate::scheduler::CachedCandidates, target: &TargetAddr) -> Self {
+        let count = candidates.subgroups.len().min(MAX_INLINE_SUBGROUPS);
+        let mut starts = [0usize; MAX_INLINE_SUBGROUPS];
+        for i in 0..count {
+            starts[i] = compute_start(&candidates.subgroups[i], target);
+        }
+        CandidateIter {
+            subgroups: &candidates.subgroups[..count],
+            starts,
+            sg_idx: 0,
+            offset: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for CandidateIter<'a> {
+    type Item = &'a (usize, u32, Arc<crate::backend::BackendInfo>);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.sg_idx >= self.subgroups.len() {
+                return None;
+            }
+            let sg = &self.subgroups[self.sg_idx];
+            let len = sg.healthy.len();
+            if len == 0 || self.offset >= len {
+                self.sg_idx += 1;
+                self.offset = 0;
+                continue;
+            }
+            let pos = (self.starts[self.sg_idx] + self.offset) % len;
+            self.offset += 1;
+            return Some(&sg.healthy[pos]);
+        }
     }
 }
 
@@ -285,10 +321,10 @@ pub async fn route_and_connect(
     let mut backend_stream: Option<crate::outbound::BackendStream> = None;
     let mut chosen_traffic: Option<Arc<crate::backend::TrafficCounters>> = None;
 
-    let iterator = get_candidate_iterator(&candidates, target);
+    let iter = CandidateIter::new(&candidates, target);
 
     // First pass: try healthy backends.
-    for (index, info) in &iterator {
+    for (index, _, info) in iter {
         // Lock-free cache lookup: yields both the pooled stream (if any) and the traffic Arc.
         let pc = pool.get_pooled_connection(*index);
         let (pool_stream, traffic) = match pc {
@@ -374,7 +410,7 @@ pub async fn route_and_connect(
 
     // Second pass: try unhealthy backends as last resort.
     if backend_stream.is_none() {
-        for (index, info) in unhealthy {
+        for (index, _, info) in unhealthy {
             let result: std::io::Result<BackendStream> = if info.is_direct() {
                 direct_connect(target, backend_timeout, info.bind_interface.as_deref()).await
             } else if info.is_shadowsocks() {
@@ -417,9 +453,9 @@ pub async fn route_and_connect_udp(
 
     let backend_timeout = Duration::from_secs(10);
     let candidates = pool.get_route_candidates(route_idx);
-    let iterator = get_candidate_iterator(&candidates, target);
+    let iter = CandidateIter::new(&candidates, target);
 
-    for (index, info) in &iterator {
+    for (index, _, info) in iter {
         if !info.udp_enabled {
             continue;
         }

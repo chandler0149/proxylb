@@ -497,7 +497,7 @@ function App() {
 
       return (
         <div key={`tree-${item.name}-${index}`} className="tree-node-wrapper">
-          <div className="card group-card">
+          <div className="tree-group-card">
             <div className="card-header" style={{ alignItems: 'center' }}>
               <div className="card-name" style={{ fontSize: '1.15rem' }}>
                 <span>📂 Group: {item.name}</span>

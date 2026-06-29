@@ -149,7 +149,7 @@ backends:
 #   urltest              - Pick the healthy member with lowest latency.
 #   failover             - Try members in order; fall back to next if current is down.
 #   loadbalance          - Distribute connections by least active connections.
-#   weighted_round_robin - Distribute connections proportional to inverse historical bandwidth.
+#   weighted_round_robin - Distribute connections proportional to weight.
 #   consistent_hashing   - Route to same backend based on destination domain hash.
 #
 # Members can be backend names OR other group names (nested groups).
@@ -192,13 +192,15 @@ groups:
       - "eu-west-1"
       - "eu-central-1"
 
-  # Weighted Round Robin Strategy: Distributes traffic proportionally, penalizing nodes
-  # with high historical bandwidth usage. Best for bulk file downloads to spread data caps.
+  # Weighted Round Robin Strategy: Distributes traffic proportionally based on the `weight`
+  # property of each member (defaults to 1). Higher weight = more traffic.
   - name: "region-ap"
     strategy: "weighted_round_robin"
     members:
-      - "ap-east-1"
-      - "ap-southeast-1"
+      - name: "ap-east-1"
+        weight: 5
+      - name: "ap-southeast-1"
+        weight: 1
 
   # LoadBalance Strategy: Distributes new connections to the node with the fewest active
   # connections. Best for long-lived protocols (e.g., websockets, SSH) to keep server loads even.

@@ -8,8 +8,8 @@ use crate::config::{GroupConfig, GroupStrategy};
 
 #[derive(Debug, Clone)]
 pub enum GroupMember {
-    Backend(usize),
-    Group(usize),
+    Backend(usize, u32),
+    Group(usize, u32),
 }
 
 #[derive(Debug, Clone)]
@@ -26,8 +26,8 @@ impl Group {
         let mut result = Vec::new();
         for member in &self.members {
             match member {
-                GroupMember::Backend(idx) => result.push(*idx),
-                GroupMember::Group(g_idx) => {
+                GroupMember::Backend(idx, _) => result.push(*idx),
+                GroupMember::Group(g_idx, _) => {
                     if let Some(nested) = all_groups.get(*g_idx) {
                         result.extend(nested.flatten_backend_indices(all_groups));
                     }
@@ -44,9 +44,9 @@ pub enum Target {
     Group(usize),
 }
 
-pub fn build_hash_ring(healthy: &[(usize, Arc<BackendInfo>)]) -> Vec<(u64, usize)> {
+pub fn build_hash_ring(healthy: &[(usize, u32, Arc<BackendInfo>)]) -> Vec<(u64, usize)> {
     let mut ring = Vec::new();
-    for (i, (_, info)) in healthy.iter().enumerate() {
+    for (i, (_, _, info)) in healthy.iter().enumerate() {
         for v in 0..160 {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&info.name, &mut hasher);
@@ -58,12 +58,16 @@ pub fn build_hash_ring(healthy: &[(usize, Arc<BackendInfo>)]) -> Vec<(u64, usize
     ring
 }
 
-pub struct CachedCandidates {
+pub struct SubGroupCache {
     pub strategy: crate::config::GroupStrategy,
     pub hash_ring: Vec<(u64, usize)>,
     pub wrr_choices: Vec<usize>,
-    pub healthy: Vec<(usize, Arc<BackendInfo>)>,
-    pub unhealthy: Vec<(usize, Arc<BackendInfo>)>,
+    pub healthy: Vec<(usize, u32, Arc<BackendInfo>)>,
+}
+
+pub struct CachedCandidates {
+    pub subgroups: Vec<SubGroupCache>,
+    pub unhealthy: Vec<(usize, u32, Arc<BackendInfo>)>,
 }
 
 pub fn build_groups_and_failover_order(
@@ -82,11 +86,13 @@ pub fn build_groups_and_failover_order(
     let mut groups = Vec::with_capacity(group_configs.len());
     for gc in group_configs {
         let mut members = Vec::new();
-        for member_name in &gc.members {
-            if let Some(&g_idx) = group_name_to_idx.get(member_name.as_str()) {
-                members.push(GroupMember::Group(g_idx));
-            } else if let Some(pos) = entries.iter().position(|e| e.info.name == *member_name) {
-                members.push(GroupMember::Backend(pos));
+        for member_cfg in &gc.members {
+            let member_name = member_cfg.name();
+            let member_weight = member_cfg.weight();
+            if let Some(&g_idx) = group_name_to_idx.get(member_name) {
+                members.push(GroupMember::Group(g_idx, member_weight));
+            } else if let Some(pos) = entries.iter().position(|e| e.info.name == member_name) {
+                members.push(GroupMember::Backend(pos, member_weight));
             }
         }
         groups.push(Group {
@@ -114,9 +120,9 @@ pub fn build_groups_and_failover_order(
             }
         }
 
-        // 2. Groups with strategy UrlTest or LoadBalance
+        // 2. Groups with other strategies (UrlTest, LoadBalance, ConsistentHashing, WeightedRoundRobin)
         for (i, g) in groups.iter().enumerate() {
-            if g.strategy == GroupStrategy::UrlTest || g.strategy == GroupStrategy::LoadBalance {
+            if g.strategy != GroupStrategy::Failover {
                 failover_order.push(Target::Group(i));
             }
         }
@@ -139,129 +145,171 @@ pub fn build_groups_and_failover_order(
     (groups, failover_order)
 }
 
+pub struct RawSubGroup {
+    pub strategy: GroupStrategy,
+    pub members: Vec<(usize, u32)>,
+}
+
 /// Recursively collect backend candidates from a group, returning ordered blocks of indices.
 pub fn collect_group_candidates_recursive(
     group: &Group,
     entries: &[BackendEntry],
     groups: &[Group],
-) -> (Vec<usize>, Vec<usize>) {
-    let mut member_results = Vec::new();
+    parent_weight: u32,
+) -> (Vec<RawSubGroup>, Vec<(usize, u32)>) {
+    let mut healthy_subgroups = Vec::new();
+    let mut unhealthy = Vec::new();
 
     for member in &group.members {
-        let (h, u) = match member {
-            GroupMember::Backend(idx) => {
+        match member {
+            GroupMember::Backend(idx, weight) => {
+                let effective_weight = weight * parent_weight;
                 if let Some(entry) = entries.get(*idx) {
                     let status = entry.status.lock();
                     if status.enabled {
                         if status.healthy {
-                            (vec![*idx], vec![])
+                            healthy_subgroups.push(RawSubGroup {
+                                strategy: GroupStrategy::Failover,
+                                members: vec![(*idx, effective_weight)],
+                            });
                         } else {
-                            (vec![], vec![*idx])
+                            unhealthy.push((*idx, effective_weight));
                         }
-                    } else {
-                        (vec![], vec![])
                     }
-                } else {
-                    (vec![], vec![])
                 }
             }
-            GroupMember::Group(g_idx) => {
+            GroupMember::Group(g_idx, weight) => {
+                let effective_weight = weight * parent_weight;
                 if let Some(nested) = groups.get(*g_idx) {
-                    collect_group_candidates_recursive(nested, entries, groups)
-                } else {
-                    (vec![], vec![])
+                    let (mut gh, mut gu) = collect_group_candidates_recursive(
+                        nested,
+                        entries,
+                        groups,
+                        effective_weight,
+                    );
+                    healthy_subgroups.append(&mut gh);
+                    unhealthy.append(&mut gu);
                 }
             }
-        };
-        member_results.push((h, u));
+        }
     }
 
-    let mut sorted_healthy: Vec<_> = member_results.iter().map(|(h, _)| h.clone()).collect();
-    apply_strategy_sort_nested(&group.strategy, entries, &mut sorted_healthy);
-
-    let mut sorted_unhealthy: Vec<_> = member_results.iter().map(|(_, u)| u.clone()).collect();
-    apply_strategy_sort_nested(&group.strategy, entries, &mut sorted_unhealthy);
-
-    let flat_h = sorted_healthy.into_iter().flatten().collect();
-    let flat_u = sorted_unhealthy.into_iter().flatten().collect();
-
-    (flat_h, flat_u)
-}
-
-pub fn apply_strategy_sort_nested(
-    strategy: &GroupStrategy,
-    entries: &[BackendEntry],
-    blocks: &mut Vec<Vec<usize>>,
-) {
-    match strategy {
+    match group.strategy {
+        GroupStrategy::Failover => (healthy_subgroups, unhealthy),
         GroupStrategy::UrlTest => {
-            blocks.sort_by_key(|block| {
-                block
-                    .first()
-                    .and_then(|&idx| entries.get(idx).and_then(|e| e.status.lock().last_latency))
+            let mut flat: Vec<(usize, u32)> = healthy_subgroups
+                .into_iter()
+                .flat_map(|sg| sg.members)
+                .collect();
+            flat.sort_by_key(|&(idx, _)| {
+                entries
+                    .get(idx)
+                    .and_then(|e| e.status.lock().last_latency)
                     .unwrap_or(Duration::MAX)
             });
-        }
-        GroupStrategy::Failover
-        | GroupStrategy::ConsistentHashing
-        | GroupStrategy::WeightedRoundRobin => {
-            // Keep configured order
+            (
+                vec![RawSubGroup {
+                    strategy: GroupStrategy::Failover,
+                    members: flat,
+                }],
+                unhealthy,
+            )
         }
         GroupStrategy::LoadBalance => {
-            blocks.sort_by_key(|block| {
-                if let Some(&idx) = block.first() {
-                    if let Some(entry) = entries.get(idx) {
-                        let tc = &entry.traffic;
-                        return (
-                            tc.total_connections.load(Ordering::Relaxed),
-                            tc.active_connections.load(Ordering::Relaxed),
-                        );
-                    }
+            let mut flat: Vec<(usize, u32)> = healthy_subgroups
+                .into_iter()
+                .flat_map(|sg| sg.members)
+                .collect();
+            flat.sort_by_key(|&(idx, _)| {
+                if let Some(entry) = entries.get(idx) {
+                    let tc = &entry.traffic;
+                    (
+                        tc.total_connections.load(Ordering::Relaxed),
+                        tc.active_connections.load(Ordering::Relaxed),
+                    )
+                } else {
+                    (u64::MAX, i64::MAX)
                 }
-                (u64::MAX, i64::MAX)
             });
+            (
+                vec![RawSubGroup {
+                    strategy: GroupStrategy::Failover,
+                    members: flat,
+                }],
+                unhealthy,
+            )
+        }
+        GroupStrategy::WeightedRoundRobin | GroupStrategy::ConsistentHashing => {
+            let flat: Vec<(usize, u32)> = healthy_subgroups
+                .into_iter()
+                .flat_map(|sg| sg.members)
+                .collect();
+            (
+                vec![RawSubGroup {
+                    strategy: group.strategy,
+                    members: flat,
+                }],
+                unhealthy,
+            )
         }
     }
 }
 
-pub fn deduplicate_candidates(
-    raw_h: Vec<usize>,
-    raw_u: Vec<usize>,
+pub fn deduplicate_subgroups(
+    raw_h: Vec<RawSubGroup>,
+    raw_u: Vec<(usize, u32)>,
     entries: &[BackendEntry],
-) -> (
-    Vec<(usize, Arc<BackendInfo>)>,
-    Vec<(usize, Arc<BackendInfo>)>,
-) {
-    let mut h = Vec::new();
-    let mut u = Vec::new();
+) -> (Vec<SubGroupCache>, Vec<(usize, u32, Arc<BackendInfo>)>) {
     let mut added_h = std::collections::HashSet::new();
     let mut added_u = std::collections::HashSet::new();
 
-    for idx in raw_h {
-        if added_h.insert(idx) {
-            if let Some(entry) = entries.get(idx) {
-                h.push((idx, Arc::clone(&entry.info)));
+    let mut subgroups = Vec::new();
+    for sg in raw_h {
+        let mut h = Vec::new();
+        for (idx, weight) in sg.members {
+            if added_h.insert(idx) {
+                if let Some(entry) = entries.get(idx) {
+                    h.push((idx, weight, Arc::clone(&entry.info)));
+                }
             }
         }
+        if !h.is_empty() {
+            let wrr_choices = if sg.strategy == GroupStrategy::WeightedRoundRobin {
+                build_wrr_choices(&h, entries)
+            } else {
+                Vec::new()
+            };
+            let hash_ring = if sg.strategy == GroupStrategy::ConsistentHashing {
+                build_hash_ring(&h)
+            } else {
+                Vec::new()
+            };
+            subgroups.push(SubGroupCache {
+                strategy: sg.strategy,
+                wrr_choices,
+                hash_ring,
+                healthy: h,
+            });
+        }
     }
-    for idx in raw_u {
+
+    let mut u = Vec::new();
+    for (idx, weight) in raw_u {
         if !added_h.contains(&idx) && added_u.insert(idx) {
             if let Some(entry) = entries.get(idx) {
-                u.push((idx, Arc::clone(&entry.info)));
+                u.push((idx, weight, Arc::clone(&entry.info)));
             }
         }
     }
-    (h, u)
+
+    (subgroups, u)
 }
 
 pub fn calculate_candidates(
     entries: &[BackendEntry],
     groups: &[Group],
     failover_order: &[Target],
-) -> (
-    Vec<(usize, Arc<BackendInfo>)>,
-    Vec<(usize, Arc<BackendInfo>)>,
-) {
+) -> (Vec<SubGroupCache>, Vec<(usize, u32, Arc<BackendInfo>)>) {
     let mut raw_h = Vec::new();
     let mut raw_u = Vec::new();
 
@@ -272,16 +320,19 @@ pub fn calculate_candidates(
                     let status = entry.status.lock();
                     if status.enabled {
                         if status.healthy {
-                            raw_h.push(*idx);
+                            raw_h.push(RawSubGroup {
+                                strategy: GroupStrategy::Failover,
+                                members: vec![(*idx, 1)],
+                            });
                         } else {
-                            raw_u.push(*idx);
+                            raw_u.push((*idx, 1));
                         }
                     }
                 }
             }
             Target::Group(g_idx) => {
                 if let Some(group) = groups.get(*g_idx) {
-                    let (gh, gu) = collect_group_candidates_recursive(group, entries, groups);
+                    let (gh, gu) = collect_group_candidates_recursive(group, entries, groups, 1);
                     raw_h.extend(gh);
                     raw_u.extend(gu);
                 }
@@ -289,7 +340,7 @@ pub fn calculate_candidates(
         }
     }
 
-    deduplicate_candidates(raw_h, raw_u, entries)
+    deduplicate_subgroups(raw_h, raw_u, entries)
 }
 
 /// Calculate candidates for a specific route target (group or backend name).
@@ -297,15 +348,11 @@ pub fn calculate_route_candidates(
     route: &str,
     entries: &[BackendEntry],
     groups: &[Group],
-) -> (
-    crate::config::GroupStrategy,
-    Vec<(usize, Arc<BackendInfo>)>,
-    Vec<(usize, Arc<BackendInfo>)>,
-) {
+) -> (Vec<SubGroupCache>, Vec<(usize, u32, Arc<BackendInfo>)>) {
     if let Some(group) = groups.iter().find(|g| g.name == route) {
-        let (raw_h, raw_u) = collect_group_candidates_recursive(group, entries, groups);
-        let (h, u) = deduplicate_candidates(raw_h, raw_u, entries);
-        return (group.strategy, h, u);
+        let (raw_h, raw_u) = collect_group_candidates_recursive(group, entries, groups, 1);
+        let (h, u) = deduplicate_subgroups(raw_h, raw_u, entries);
+        return (h, u);
     }
 
     if let Some(idx) = entries.iter().position(|e| e.info.name == route) {
@@ -313,88 +360,78 @@ pub fn calculate_route_candidates(
             let status = entry.status.lock();
             if status.enabled {
                 if status.healthy {
-                    return (
-                        crate::config::GroupStrategy::Failover,
-                        vec![(idx, Arc::clone(&entry.info))],
+                    let (h, u) = deduplicate_subgroups(
+                        vec![RawSubGroup {
+                            strategy: GroupStrategy::Failover,
+                            members: vec![(idx, 1)],
+                        }],
                         vec![],
+                        entries,
                     );
+                    return (h, u);
                 } else {
-                    return (
-                        crate::config::GroupStrategy::Failover,
-                        vec![],
-                        vec![(idx, Arc::clone(&entry.info))],
-                    );
+                    let (h, u) = deduplicate_subgroups(vec![], vec![(idx, 1)], entries);
+                    return (h, u);
                 }
             }
         }
     }
 
-    (crate::config::GroupStrategy::Failover, vec![], vec![])
+    (vec![], vec![])
 }
 
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// Build the WRR selection table.
+///
+/// Returns an array of **positions in the `healthy` slice** (not backend pool
+/// indices). This lets the hot-path rotate the healthy array in O(1) without
+/// a linear search.  Weights are GCD-reduced so the table is as small as
+/// possible (e.g. weights 300:600 → 1:2 → 3 entries instead of 900).
 pub fn build_wrr_choices(
-    healthy: &[(usize, Arc<BackendInfo>)],
-    entries: &[BackendEntry],
+    healthy: &[(usize, u32, Arc<BackendInfo>)],
+    _entries: &[BackendEntry],
 ) -> Vec<usize> {
     if healthy.is_empty() {
         return vec![];
     }
 
-    let mut costs = Vec::with_capacity(healthy.len());
-    let mut max_cost = 0u64;
-
-    for (idx, _) in healthy {
-        let cost = if let Some(e) = entries.get(*idx) {
-            e.traffic.bytes_down.load(Ordering::Relaxed)
-                + e.traffic.bytes_up.load(Ordering::Relaxed)
-        } else {
-            0
-        };
-        costs.push((*idx, cost));
-        if cost > max_cost {
-            max_cost = cost;
+    // Collect raw weights and GCD-reduce.
+    let mut raw: Vec<i64> = healthy.iter().map(|(_, w, _)| *w as i64).collect();
+    let g = raw.iter().fold(0u64, |acc, &w| gcd(acc, w as u64));
+    if g > 1 {
+        for w in &mut raw {
+            *w /= g as i64;
         }
     }
 
-    // Weight = (max_cost - cost) + baseline
-    let baseline = max_cost / 10 + 1;
-    let mut weights = Vec::with_capacity(costs.len());
-    let mut total_weight = 0u64;
+    let total: i64 = raw.iter().sum();
 
-    for (idx, cost) in costs {
-        let weight = (max_cost - cost) + baseline;
-        weights.push((idx, weight));
-        total_weight += weight;
+    if total == 0 {
+        // All weights zero — simple round-robin over positions.
+        return (0..healthy.len()).collect();
     }
 
-    let mut wrr_choices = Vec::with_capacity(100);
-    if total_weight == 0 {
-        for (idx, _) in healthy {
-            wrr_choices.push(*idx);
-        }
-        return wrr_choices;
-    }
+    // Nginx smooth WRR — store healthy-array *positions*, not backend indices.
+    let n = total as usize;
+    let mut cw = vec![0i64; raw.len()];
+    let mut choices = Vec::with_capacity(n);
 
-    for (idx, weight) in &weights {
-        let slots = ((*weight as f64 / total_weight as f64) * 100.0).round() as usize;
-        for _ in 0..slots {
-            if wrr_choices.len() < 100 {
-                wrr_choices.push(*idx);
+    for _ in 0..n {
+        let mut best = 0;
+        let mut max = i64::MIN;
+        for i in 0..raw.len() {
+            cw[i] += raw[i];
+            if cw[i] > max {
+                max = cw[i];
+                best = i;
             }
         }
+        choices.push(best); // position in healthy[], not backend pool index
+        cw[best] -= total;
     }
 
-    while wrr_choices.len() < 100 {
-        if let Some(&(idx, _)) = weights.first() {
-            wrr_choices.push(idx);
-        } else {
-            break;
-        }
-    }
-
-    // Randomize the distribution so it's smooth
-    use rand::seq::SliceRandom;
-    wrr_choices.shuffle(&mut rand::rng());
-
-    wrr_choices
+    choices
 }
