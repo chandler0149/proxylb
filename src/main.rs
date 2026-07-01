@@ -90,6 +90,9 @@ fn main() -> anyhow::Result<()> {
     tracing::info!("ProxyLB starting...");
     tracing::info!(backends = config.backends.len(), "configuration loaded");
 
+    #[cfg(unix)]
+    maximize_fd_limit();
+
     // Launch the fd-closer thread before the worker runtime so it is ready
     // as soon as the first connection closes.  Pin it to the first ancillary
     // core when one is configured so it stays off the forwarding cores.
@@ -135,13 +138,50 @@ fn main() -> anyhow::Result<()> {
     let ancillary_runtime = ancillary_builder.build()?;
     let ancillary_handle = ancillary_runtime.handle().clone();
 
-    ancillary_runtime
-        .block_on(main_async(config, args, worker_cores, ancillary_handle))
-        .ok();
+    if let Err(e) =
+        ancillary_runtime.block_on(main_async(config, args, worker_cores, ancillary_handle))
+    {
+        tracing::error!("main_async failed: {:?}", e);
+        return Err(e);
+    }
 
     tracing::info!("waiting for ancillary tasks to finish...");
     ancillary_runtime.shutdown_timeout(std::time::Duration::from_secs(5));
     Ok(())
+}
+
+#[cfg(unix)]
+fn maximize_fd_limit() {
+    unsafe {
+        let mut lim = std::mem::zeroed::<libc::rlimit>();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+            let old_limit = lim.rlim_cur;
+            let mut target = lim.rlim_max;
+
+            // On macOS, rlim_max can sometimes be RLIM_INFINITY or artificially restricted by launchd.
+            // Attempt to set to rlim_max, and if that fails, fall back to 10240, then 4096.
+            if target == libc::RLIM_INFINITY {
+                target = 65536;
+            }
+
+            lim.rlim_cur = target;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+                tracing::info!("Raised open file limit from {} to {}", old_limit, target);
+            } else {
+                lim.rlim_cur = 10240.min(target);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+                    tracing::info!("Raised open file limit from {} to {}", old_limit, 10240);
+                } else {
+                    lim.rlim_cur = 4096.min(target);
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+                        tracing::info!("Raised open file limit from {} to {}", old_limit, 4096);
+                    } else {
+                        tracing::warn!("Failed to raise open file limit (current: {})", old_limit);
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn main_async(
@@ -168,6 +208,14 @@ async fn main_async(
         }
     }
 
+    let db_path = config
+        .run_dir
+        .as_deref()
+        .unwrap_or("/var/lib")
+        .trim_end_matches('/')
+        .to_string()
+        + "/proxylb.db";
+
     // Initialize backend pool.
     let pool = backend::BackendPool::new(
         &config.backends,
@@ -178,6 +226,7 @@ async fn main_async(
         &config.filter,
         ancillary_handle.clone(),
         active_routes,
+        Some(db_path),
     )?;
 
     let mut ancillary_handles = Vec::new();
@@ -323,9 +372,11 @@ async fn main_async(
                                 network,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
-                                    let mgr = std::sync::Arc::new(
-                                        crate::filter::FilterManager::new(f, None),
-                                    );
+                                    let mgr =
+                                        std::sync::Arc::new(crate::filter::FilterManager::new(
+                                            f,
+                                            Some("/var/lib/proxylb.db"),
+                                        ));
                                     let cancel_for_filter = cancel_clone.clone();
                                     let pool_for_filter = inbound_pool.clone();
                                     let f_clone = f.clone();
@@ -378,9 +429,11 @@ async fn main_async(
                                 network,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
-                                    let mgr = std::sync::Arc::new(
-                                        crate::filter::FilterManager::new(f, None),
-                                    );
+                                    let mgr =
+                                        std::sync::Arc::new(crate::filter::FilterManager::new(
+                                            f,
+                                            Some("/var/lib/proxylb.db"),
+                                        ));
                                     let cancel_for_filter = cancel_clone.clone();
                                     let pool_for_filter = inbound_pool.clone();
                                     let f_clone = f.clone();
@@ -433,9 +486,11 @@ async fn main_async(
                                 route,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
-                                    let mgr = std::sync::Arc::new(
-                                        crate::filter::FilterManager::new(f, None),
-                                    );
+                                    let mgr =
+                                        std::sync::Arc::new(crate::filter::FilterManager::new(
+                                            f,
+                                            Some("/var/lib/proxylb.db"),
+                                        ));
                                     let cancel_for_filter = cancel_clone.clone();
                                     let pool_for_filter = inbound_pool.clone();
                                     let f_clone = f.clone();
@@ -485,9 +540,11 @@ async fn main_async(
                                 route,
                             } => {
                                 let local_filter_manager = filter.as_ref().map(|f| {
-                                    let mgr = std::sync::Arc::new(
-                                        crate::filter::FilterManager::new(f, None),
-                                    );
+                                    let mgr =
+                                        std::sync::Arc::new(crate::filter::FilterManager::new(
+                                            f,
+                                            Some("/var/lib/proxylb.db"),
+                                        ));
                                     let cancel_for_filter = cancel_clone.clone();
                                     let pool_for_filter = inbound_pool.clone();
                                     let f_clone = f.clone();

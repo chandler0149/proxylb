@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     #[allow(dead_code)]
     pub advanced: AdvancedConfig,
+    /// Directory for runtime data like the SQLite database.
+    pub run_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -297,6 +299,11 @@ fn default_filter_enabled() -> bool {
     true
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TcpConfig {
+    pub congestion: Option<String>,
+}
+
 /// A backend entry.
 ///
 /// If the backend `type` is "ss" or "shadowsocks", the backend is treated as
@@ -332,6 +339,9 @@ pub struct BackendConfig {
     /// Number of consecutive failures before marking the backend as unhealthy (default: 1).
     #[serde(default = "default_max_fails")]
     pub max_fails: u32,
+    /// TCP specific configuration.
+    #[serde(default)]
+    pub tcp: Option<TcpConfig>,
 }
 
 fn default_max_fails() -> u32 {
@@ -499,6 +509,14 @@ impl Config {
                             "{}: Shadowsocks backend must specify cipher method in 'username' and password in 'password'",
                             label
                         );
+                    }
+                }
+                "anytls" => {
+                    if backend.address.is_none() {
+                        anyhow::bail!("{}: AnyTLS backend must specify 'address'", label);
+                    }
+                    if backend.password.is_none() {
+                        anyhow::bail!("{}: AnyTLS backend must specify 'password'", label);
                     }
                 }
                 "direct" => {

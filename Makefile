@@ -39,11 +39,11 @@ box: web
 	
 amd64: web
 	@echo "Building for AMD64..."
-	$(CARGO) build --target=$(AMD64_TARGET) --release
+	$(CARGO) build --target=$(AMD64_TARGET) --release $(FEATURES)
 
 ali: web
 	@echo "Building for AMD64..."
-	RUSTFLAGS="-C target-cpu=x86-64-v4" $(CARGO) build --target=$(AMD64_TARGET) --release
+	RUSTFLAGS="-C target-cpu=x86-64-v4" $(CARGO) build --target=$(AMD64_TARGET) --release $(FEATURES)
 
 docker:
 	docker build -t proxylb .

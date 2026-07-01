@@ -143,6 +143,15 @@ backends:
       insecure: false
     pool_size: 5
 
+  - type: anytls
+    address: "anytls-server.example.com:443"
+    name: "anytls-backend-1"
+    password: "my-anytls-password"
+    pool_size: 8
+    tls:
+      server_name: "anytls-server.example.com"
+      insecure: false
+
 
 # Backend groups
 # Strategy options:

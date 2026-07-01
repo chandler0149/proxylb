@@ -9,8 +9,9 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, UnixListener};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) static WRR_COUNTER: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    pub(crate) static LOCAL_WRR_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // ─── Unified listener abstraction ────────────────────────────────────────────
 
@@ -164,7 +165,9 @@ where
             biased;
             _ = cancel.cancelled() => break,
             res = listener.accept() => match res {
-                Ok((stream, client_id)) => { tokio::spawn(on_accept(stream, client_id)); }
+                Ok((stream, client_id)) => {
+                    tokio::spawn(on_accept(stream, client_id));
+                }
                 Err(e) => { tracing::warn!(error = %e, "{protocol} accept error"); }
             }
         }
@@ -196,7 +199,11 @@ pub fn extract_parent_domain_str(host: &str) -> &str {
 /// Hash the routing key for consistent-hashing without heap allocation.
 fn hash_target_for_ch(target: &TargetAddr) -> u64 {
     use std::hash::{Hash, Hasher};
+    #[cfg(feature = "fast-hash")]
+    let mut hasher = rustc_hash::FxHasher::default();
+    #[cfg(not(feature = "fast-hash"))]
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
     match target {
         TargetAddr::Ip(addr) => addr.ip().hash(&mut hasher),
         TargetAddr::Domain(host, _) => extract_parent_domain_str(host).hash(&mut hasher),
@@ -214,7 +221,6 @@ pub fn extract_parent_domain(target: &TargetAddr) -> String {
 
 /// Compute the rotation start position for a subgroup (0 = no rotation).
 fn compute_start(sg: &crate::scheduler::SubGroupCache, target: &TargetAddr) -> usize {
-    use std::sync::atomic::Ordering;
     let len = sg.healthy.len();
     if len == 0 {
         return 0;
@@ -236,7 +242,11 @@ fn compute_start(sg: &crate::scheduler::SubGroupCache, target: &TargetAddr) -> u
             sg.hash_ring[idx].1 % len
         }
         crate::config::GroupStrategy::WeightedRoundRobin if !sg.wrr_choices.is_empty() => {
-            let count = WRR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let count = LOCAL_WRR_COUNTER.with(|c| {
+                let v = c.get();
+                c.set(v.wrapping_add(1));
+                v
+            });
             sg.wrr_choices[count % sg.wrr_choices.len()]
         }
         _ => 0,
@@ -305,10 +315,7 @@ pub async fn route_and_connect(
     ),
     anyhow::Error,
 > {
-    use crate::outbound::{
-        BackendStream, direct_connect, socks5h_connect, socks5h_connect_target, ss_connect_fresh,
-        ss_connect_pooled,
-    };
+    use crate::outbound::BackendStream;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -332,67 +339,41 @@ pub async fn route_and_connect(
             None => (None, None), // OOB — never happens
         };
 
-        let conn_res: std::io::Result<BackendStream> = if info.is_direct() {
-            // ── Direct backend ─────────────────────────────────────────────
-            if let Some(ref tc) = traffic {
-                tc.pool_misses.fetch_add(1, Ordering::Relaxed);
-            }
-            direct_connect(target, backend_timeout, info.bind_interface.as_deref()).await
-        } else if info.is_shadowsocks() {
-            // ── Shadowsocks backend ────────────────────────────────────────
-            let ss_cfg = info.ss_config.as_ref().unwrap();
-            let ss_ctx = info.ss_context.as_ref().unwrap().clone();
+        let mut try_fresh = true;
+        let mut conn_res: std::io::Result<BackendStream> =
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "no pool"));
 
-            match pool_stream {
-                Some(stream) => {
-                    // Pool hit: wrap the pre-established stream.
-                    tracing::debug!(backend = %info.name, "SS: using pooled connection");
+        if let Some(stream) = pool_stream {
+            match info.connect_target_pooled(stream, target).await {
+                Ok(s) => {
+                    tracing::debug!(backend = %info.name, "using pooled connection");
                     if let Some(ref tc) = traffic {
                         tc.pool_hits.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(ss_connect_pooled(stream, ss_cfg, ss_ctx, target))
+                    try_fresh = false;
+                    conn_res = Ok(s);
                 }
-                None => {
-                    // Pool miss: open a fresh connection.
+                Err(e) => {
+                    tracing::debug!(
+                        backend = %info.name,
+                        error = %e,
+                        "pooled connection was stale, retrying with fresh connection"
+                    );
                     if let Some(ref tc) = traffic {
-                        tc.pool_misses.fetch_add(1, Ordering::Relaxed);
+                        tc.pool_stale.fetch_add(1, Ordering::Relaxed);
                     }
-                    ss_connect_fresh(info, ss_cfg, ss_ctx, target, backend_timeout).await
+                    // try_fresh remains true
                 }
             }
-        } else {
-            // ── SOCKS5 backend ─────────────────────────────────────────
-            match pool_stream {
-                Some(stream) => {
-                    tracing::debug!(backend = %info.name, "using pooled connection");
-                    match socks5h_connect_target(stream, target).await {
-                        Ok(s) => {
-                            if let Some(ref tc) = traffic {
-                                tc.pool_hits.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Ok(s)
-                        }
-                        Err(e) => {
-                            if let Some(ref tc) = traffic {
-                                tc.pool_stale.fetch_add(1, Ordering::Relaxed);
-                            }
-                            tracing::debug!(
-                                backend = %info.name,
-                                error = %e,
-                                "pooled connection was stale, retrying with fresh connection"
-                            );
-                            socks5h_connect(info, target, backend_timeout).await
-                        }
-                    }
-                }
-                None => {
-                    if let Some(ref tc) = traffic {
-                        tc.pool_misses.fetch_add(1, Ordering::Relaxed);
-                    }
-                    socks5h_connect(info, target, backend_timeout).await
-                }
+        } else if !info.is_direct() {
+            if let Some(ref tc) = traffic {
+                tc.pool_misses.fetch_add(1, Ordering::Relaxed);
             }
-        };
+        }
+
+        if try_fresh {
+            conn_res = info.connect_target_fresh(target, backend_timeout).await;
+        }
 
         match conn_res {
             Ok(stream) => {
@@ -411,15 +392,7 @@ pub async fn route_and_connect(
     // Second pass: try unhealthy backends as last resort.
     if backend_stream.is_none() {
         for (index, _, info) in unhealthy {
-            let result: std::io::Result<BackendStream> = if info.is_direct() {
-                direct_connect(target, backend_timeout, info.bind_interface.as_deref()).await
-            } else if info.is_shadowsocks() {
-                let ss_cfg = info.ss_config.as_ref().unwrap();
-                let ss_ctx = info.ss_context.as_ref().unwrap().clone();
-                ss_connect_fresh(info, ss_cfg, ss_ctx, target, backend_timeout).await
-            } else {
-                socks5h_connect(info, target, backend_timeout).await
-            };
+            let result = info.connect_target_fresh(target, backend_timeout).await;
 
             if let Ok(stream) = result {
                 tracing::debug!(backend = %info.name, target = %target, "connected through unhealthy backend (fallback)");

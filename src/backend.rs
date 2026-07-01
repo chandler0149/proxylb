@@ -91,6 +91,8 @@ pub struct BackendInfo {
     pub force_healthy: bool,
     pub max_fails: u32,
     pub udp_enabled: bool,
+    pub anytls_manager: Option<Arc<crate::outbound::anytls::AnytlsManager>>,
+    pub tcp_congestion: Option<String>,
 }
 
 impl std::fmt::Debug for BackendInfo {
@@ -112,7 +114,7 @@ impl BackendInfo {
 
         let endpoint = match cfg.backend_type.as_str() {
             "direct" => BackendEndpoint::Direct,
-            "socks5" | "ss" | "shadowsocks" | "uds" => {
+            "socks5" | "ss" | "shadowsocks" | "uds" | "anytls" => {
                 let addr = cfg
                     .address
                     .as_ref()
@@ -222,6 +224,16 @@ impl BackendInfo {
 
         let server_name = cfg.tls.as_ref().and_then(|tls| tls.server_name.clone());
 
+        let anytls_manager = if cfg.backend_type == "anytls" {
+            let password = cfg.password.as_deref().unwrap_or("").to_string();
+            Some(Arc::new(crate::outbound::anytls::AnytlsManager::new(
+                password,
+                if pool_size > 0 { pool_size } else { 1 },
+            )))
+        } else {
+            None
+        };
+
         Ok(Self {
             name,
             endpoint,
@@ -237,6 +249,8 @@ impl BackendInfo {
             force_healthy: cfg.force_healthy,
             max_fails: cfg.max_fails,
             udp_enabled: cfg.network.as_deref() == Some("tcp_udp"),
+            anytls_manager,
+            tcp_congestion: cfg.tcp.as_ref().and_then(|t| t.congestion.clone()),
         })
     }
 
@@ -250,9 +264,53 @@ impl BackendInfo {
         matches!(self.endpoint, BackendEndpoint::Direct)
     }
 
+    /// Returns `true` if this is an AnyTLS outbound backend.
+    pub fn is_anytls(&self) -> bool {
+        self.anytls_manager.is_some()
+    }
+
     /// Returns true if this backend requires SOCKS5 authentication.
     pub fn requires_auth(&self) -> bool {
         self.username.is_some() && self.password.is_some()
+    }
+
+    pub async fn connect_target_pooled(
+        &self,
+        stream: crate::outbound::BackendStream,
+        target: &crate::outbound::TargetAddr,
+    ) -> std::io::Result<crate::outbound::BackendStream> {
+        if self.is_shadowsocks() {
+            let ss_cfg = self.ss_config.as_ref().unwrap();
+            let ss_ctx = self.ss_context.as_ref().unwrap().clone();
+            Ok(crate::outbound::ss_connect_pooled(
+                stream, ss_cfg, ss_ctx, target,
+            ))
+        } else if self.is_anytls() {
+            crate::outbound::anytls::anytls_connect_target(stream, target).await
+        } else if self.is_direct() {
+            unreachable!("Direct backend should not have pooled streams")
+        } else {
+            crate::outbound::socks5h_connect_target(stream, target).await
+        }
+    }
+
+    pub async fn connect_target_fresh(
+        &self,
+        target: &crate::outbound::TargetAddr,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<crate::outbound::BackendStream> {
+        if self.is_direct() {
+            crate::outbound::direct_connect(target, timeout, self.bind_interface.as_deref()).await
+        } else if self.is_shadowsocks() {
+            let ss_cfg = self.ss_config.as_ref().unwrap();
+            let ss_ctx = self.ss_context.as_ref().unwrap().clone();
+            crate::outbound::ss_connect_fresh(self, ss_cfg, ss_ctx, target, timeout).await
+        } else if self.is_anytls() {
+            let s = crate::outbound::anytls::anytls_connect_fresh(self).await?;
+            crate::outbound::anytls::anytls_connect_target(s, target).await
+        } else {
+            crate::outbound::socks5h_connect(self, target, timeout).await
+        }
     }
 }
 
@@ -304,7 +362,6 @@ pub struct BackendEntry {
     pub pool_rx: flume::Receiver<BackendStream>,
     /// Cancels this entry's `refill_pool_task` when the backend is removed.
     pub cancel: CancellationToken,
-    pub enabled_tx: tokio::sync::watch::Sender<bool>,
     pub rt_chg_signal: tokio::sync::watch::Receiver<u64>,
 }
 
@@ -410,6 +467,7 @@ pub struct BackendPool {
     pub ancillary_handle: tokio::runtime::Handle,
     pub client_manager: crate::stats::ClientStatsManager,
     pub domain_manager: crate::stats::DomainStatsManager,
+    pub db_path: Option<String>,
 }
 
 impl BackendPool {
@@ -423,14 +481,48 @@ impl BackendPool {
         filter_config: &crate::config::FilterConfig,
         ancillary_handle: tokio::runtime::Handle,
         active_routes: std::collections::HashSet<String>,
+        db_path: Option<String>,
     ) -> anyhow::Result<Self> {
+        let mut persisted_states = std::collections::HashMap::new();
+
+        let mut db_conn = None;
+        if let Some(ref path) = db_path {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            db_conn = rusqlite::Connection::open(path).ok();
+        }
+
+        if let Some(conn) = db_conn {
+            let _ = conn.execute(
+                "CREATE TABLE IF NOT EXISTS backend_state (name TEXT PRIMARY KEY, enabled INTEGER)",
+                [],
+            );
+            if let Ok(mut stmt) = conn.prepare("SELECT name, enabled FROM backend_state") {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0))
+                }) {
+                    for row in rows.flatten() {
+                        persisted_states.insert(row.0, row.1);
+                    }
+                }
+            }
+        } else if db_path.is_some() {
+            tracing::warn!(
+                "Failed to open {} for reading backend states",
+                db_path.as_ref().unwrap()
+            );
+        }
+
         let mut entries = Vec::with_capacity(configs.len());
         for (i, cfg) in configs.iter().enumerate() {
             let info = BackendInfo::from_config(cfg, i, global_bind_interface)?;
             let cancel = CancellationToken::new();
             let (tx, rx) = flume::bounded(info.pool_size.max(1));
-            let initial_enabled = info.enabled.unwrap_or(true);
-            let (enabled_tx, enabled_signal) = tokio::sync::watch::channel(initial_enabled);
+            let initial_enabled = persisted_states
+                .get(&info.name)
+                .copied()
+                .unwrap_or_else(|| info.enabled.unwrap_or(true));
 
             let mut status = BackendStatus::default();
             status.enabled = initial_enabled;
@@ -442,7 +534,6 @@ impl BackendPool {
                 traffic: traffic.clone(),
                 pool_rx: rx.clone(),
                 cancel: cancel.clone(),
-                enabled_tx,
                 rt_chg_signal: rt_chg_signal.clone(),
             };
             entries.push(entry);
@@ -450,7 +541,6 @@ impl BackendPool {
             // Spawn refill task for this backend.
             ancillary_handle.spawn(refill_pool_task(
                 info,
-                enabled_signal,
                 tx,
                 rx,
                 cancel,
@@ -511,11 +601,12 @@ impl BackendPool {
             rt_chg_signal,
             filter_manager: Arc::new(crate::filter::FilterManager::new(
                 &filter_config,
-                Some("proxylb.db"),
+                db_path.as_deref(),
             )),
             ancillary_handle,
             client_manager: crate::stats::ClientStatsManager::new(),
             domain_manager: crate::stats::DomainStatsManager::new(),
+            db_path,
         })
     }
 
@@ -576,6 +667,21 @@ impl BackendPool {
         failover_order_cfg: Option<&Vec<String>>,
         global_bind_interface: Option<&str>,
     ) -> anyhow::Result<(usize, usize, usize)> {
+        let mut persisted_states = std::collections::HashMap::new();
+        if let Some(ref path) = self.db_path {
+            if let Ok(conn) = rusqlite::Connection::open(path) {
+                if let Ok(mut stmt) = conn.prepare("SELECT name, enabled FROM backend_state") {
+                    if let Ok(rows) = stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)? != 0))
+                    }) {
+                        for row in rows.flatten() {
+                            persisted_states.insert(row.0, row.1);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut guard = self.inner.write().await;
 
         let mut new_entries: Vec<BackendEntry> = Vec::with_capacity(new_configs.len());
@@ -601,11 +707,7 @@ impl BackendPool {
                     || entry.info.pool_size != new_info.pool_size;
 
                 if let Some(new_enabled) = new_info.enabled {
-                    let _ = entry.enabled_tx.send(new_enabled);
                     entry.status.lock().enabled = new_enabled;
-                    if !new_enabled {
-                        while entry.pool_rx.try_recv().is_ok() {}
-                    }
                 }
 
                 entry.info = Arc::new(new_info.clone());
@@ -621,11 +723,9 @@ impl BackendPool {
                     entry.pool_rx = rx.clone();
                     entry.cancel = new_cancel.clone();
 
-                    let enabled_signal = entry.enabled_tx.subscribe();
                     // Spawn the new refill task with new configuration and channel
                     self.ancillary_handle.spawn(refill_pool_task(
                         new_info,
-                        enabled_signal,
                         tx,
                         rx,
                         new_cancel,
@@ -639,8 +739,11 @@ impl BackendPool {
                 // Brand-new backend.
                 let cancel = CancellationToken::new();
                 let (tx, rx) = flume::bounded(new_info.pool_size.max(1));
-                let initial_enabled = new_info.enabled.unwrap_or(true);
-                let (enabled_tx, enabled_signal) = tokio::sync::watch::channel(initial_enabled);
+
+                let initial_enabled = persisted_states
+                    .get(&new_info.name)
+                    .copied()
+                    .unwrap_or_else(|| new_info.enabled.unwrap_or(true));
 
                 let mut status = BackendStatus::default();
                 status.enabled = initial_enabled;
@@ -652,13 +755,11 @@ impl BackendPool {
                     traffic: traffic.clone(),
                     pool_rx: rx.clone(),
                     cancel: cancel.clone(),
-                    enabled_tx,
                     rt_chg_signal: self.rt_chg_signal.clone(),
                 };
                 new_entries.push(entry);
                 self.ancillary_handle.spawn(refill_pool_task(
                     new_info,
-                    enabled_signal,
                     tx,
                     rx,
                     cancel,
@@ -871,20 +972,31 @@ impl BackendPool {
                     break;
                 }
 
-                // Set the flag via the watch channel
-                let _ = entry.enabled_tx.send(enabled);
-
                 // Update the status for the health/candidate selection
                 let mut status = entry.status.lock();
                 status.enabled = enabled;
 
-                if !enabled {
-                    // Drain the connection pool immediately from the control thread.
-                    // This instantly unblocks any blocking `tx.send_async` in the refill task.
-                    while entry.pool_rx.try_recv().is_ok() {}
-                }
-
                 changed = true;
+
+                let name_clone = name.to_string();
+                let db_path_clone = self.db_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(path) = db_path_clone {
+                        if let Ok(conn) = rusqlite::Connection::open(&path) {
+                            let _ = conn.execute(
+                                "CREATE TABLE IF NOT EXISTS backend_state (name TEXT PRIMARY KEY, enabled INTEGER)",
+                                [],
+                            );
+                            if let Err(e) = conn.execute(
+                                "INSERT OR REPLACE INTO backend_state (name, enabled) VALUES (?1, ?2)",
+                                rusqlite::params![name_clone, if enabled { 1 } else { 0 }],
+                            ) {
+                                tracing::error!("Failed to save backend state for {}: {}", name_clone, e);
+                            }
+                        }
+                    }
+                });
+
                 break;
             }
         }
@@ -1124,10 +1236,16 @@ fn drain_pool(rx: &flume::Receiver<BackendStream>) {
 #[inline]
 async fn allocate_backend_resource(info: &BackendInfo) -> std::io::Result<BackendStream> {
     let start = std::time::Instant::now();
-    let connect = crate::outbound::connect_endpoint(info, Duration::from_secs(10)).await;
+
+    let connect = if info.is_anytls() {
+        crate::outbound::anytls::anytls_connect_fresh(info).await
+    } else {
+        crate::outbound::connect_endpoint(info, std::time::Duration::from_secs(10)).await
+    };
+
     let mut stream = match connect {
         Err(e) => return Err(e),
-        Ok(stream) if info.is_shadowsocks() => stream,
+        Ok(stream) if info.is_anytls() || info.is_shadowsocks() => stream,
         Ok(stream) => crate::outbound::socks5h_authenticate(stream, info).await?,
     };
     stream.base_latency = start.elapsed();
@@ -1152,7 +1270,6 @@ async fn allocate_backend_resource(info: &BackendInfo) -> std::io::Result<Backen
 
 async fn refill_pool_task(
     info: BackendInfo,
-    mut enabled_signal: tokio::sync::watch::Receiver<bool>,
     tx: flume::Sender<BackendStream>,
     rx: flume::Receiver<BackendStream>,
     cancel: CancellationToken,
@@ -1168,7 +1285,7 @@ async fn refill_pool_task(
 
     loop {
         // Maintain concurrent connection attempts
-        while join_set.len() < target && pending_stream.is_none() && *enabled_signal.borrow() {
+        while join_set.len() < target && pending_stream.is_none() {
             let info = info.clone();
             join_set.spawn(async move {
                 let res = allocate_backend_resource(&info).await;
@@ -1179,25 +1296,9 @@ async fn refill_pool_task(
             });
         }
 
-        if !*enabled_signal.borrow() {
-            drain_pool(&rx);
-            join_set.abort_all();
-            pending_stream = None;
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return,
-                res = enabled_signal.changed() => if res.is_err() { return; },
-                res = rt_chg_signal.changed() => if res.is_err() { return; },
-            }
-            continue;
-        }
-
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            res = enabled_signal.changed() => {
-                if res.is_err() { return; }
-            }
             res = rt_chg_signal.changed() => {
                 if res.is_err() { return; }
                 drain_pool(&rx);
